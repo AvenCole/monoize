@@ -36,6 +36,7 @@ D5. While the watchdog is armed, the repository operator MUST be able to disarm 
 D6. `./deploy.sh cancel-watchdog` MUST:
 
 - terminate the currently armed watchdog process if it is still running;
+- terminate any timer child process owned by that watchdog so no orphaned rollback timer remains;
 - remove the armed deploy identifier and metadata files;
 - leave the current deployed binary unchanged.
 

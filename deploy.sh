@@ -33,7 +33,13 @@ cancel_watchdog() {
     if [ -f "$WATCHDOG_PID_FILE" ]; then
         local pid
         pid="$(cat "$WATCHDOG_PID_FILE")"
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        if [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] && kill -0 "$pid" 2>/dev/null; then
+            local child_pid
+            while read -r child_pid; do
+                if [[ "$child_pid" =~ ^[0-9]+$ ]] && [ "$child_pid" -gt 1 ]; then
+                    kill "$child_pid" 2>/dev/null || true
+                fi
+            done < <(pgrep -P "$pid" 2>/dev/null || true)
             kill "$pid" 2>/dev/null || true
         fi
     fi
