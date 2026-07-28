@@ -163,3 +163,9 @@ DB20. All SQL statements MUST be compatible with both SQLite and PostgreSQL. Spe
 - Use `TEXT`, `INTEGER`, `REAL`, `BLOB` logical types only. Logical `REAL` MUST map to SQLite `REAL` and PostgreSQL `DOUBLE PRECISION`; PostgreSQL `REAL`/`FLOAT4` MUST NOT back a Rust `f64` field.
 
 DB21. Request-log storage MUST use a single canonical table schema across SQLite and PostgreSQL. PostgreSQL-specific shadow columns for type-specialized mirrors are forbidden. If an older PostgreSQL database still contains such shadow columns, migrations MUST remove them while preserving canonical data.
+
+## 11. Settings Mutation Ordering
+
+DB22. The process MUST serialize dashboard settings updates from the initial `get_all()` read through database writes, the final `get_all()` read, and publication to `monoize_runtime`.
+
+DB23. A settings update MUST read its base state after every earlier settings update in the same process has published its runtime snapshot. An earlier update's snapshot MUST NOT overwrite a later update's snapshot.

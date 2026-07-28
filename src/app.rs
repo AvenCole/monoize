@@ -23,7 +23,7 @@ use dashmap::DashMap;
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Once, OnceLock};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -48,6 +48,9 @@ pub struct AppState {
     pub monoize_runtime: Arc<tokio::sync::RwLock<MonoizeRuntimeConfig>>,
     pub channel_health: Arc<Mutex<HashMap<String, ChannelHealthState>>>,
     pub channel_affinity: Arc<Mutex<HashMap<String, ChannelAffinityBinding>>>,
+    pub routing_config_revision: Arc<AtomicU64>,
+    pub settings_update_lock: Arc<Mutex<()>>,
+    pub model_registry_update_lock: Arc<Mutex<()>>,
     pub model_registry_store: ModelRegistryStore,
     pub billing_rate_store: BillingRateStore,
     pub transform_registry: Arc<TransformRegistry>,
@@ -243,6 +246,9 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         .max(1);
     let channel_health = Arc::new(Mutex::new(HashMap::new()));
     let channel_affinity = Arc::new(Mutex::new(HashMap::new()));
+    let routing_config_revision = Arc::new(AtomicU64::new(0));
+    let settings_update_lock = Arc::new(Mutex::new(()));
+    let model_registry_update_lock = Arc::new(Mutex::new(()));
     let transform_registry = Arc::new(crate::transforms::registry());
     let image_transform_cache = Arc::new(ImageTransformCache::from_env().await.map_err(|err| {
         AppError::new(
@@ -264,12 +270,14 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
     request_capture.spawn_cleanup_task(monoize_runtime.clone());
     let probe_runtime = monoize_runtime.clone();
     let probe_health = channel_health.clone();
+    let probe_routing_config_revision = routing_config_revision.clone();
     let probe_user_store = user_store.clone();
     let probe_model_registry_store = model_registry_store.clone();
     let probe_settings_store = settings_store.clone();
     tokio::spawn(async move {
         loop {
             sleep(std::time::Duration::from_secs(1)).await;
+            let routing_config_revision = probe_routing_config_revision.load(Ordering::Acquire);
             let providers = match probe_store.list_providers().await {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -402,6 +410,11 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                     );
 
                     let mut guard = probe_health.lock().await;
+                    if probe_routing_config_revision.load(Ordering::Acquire)
+                        != routing_config_revision
+                    {
+                        continue;
+                    }
                     if ok {
                         if provider.per_model_circuit_break {
                             let keys = channel_health_keys(&guard, &channel.id);
@@ -475,6 +488,9 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         monoize_runtime,
         channel_health,
         channel_affinity,
+        routing_config_revision,
+        settings_update_lock,
+        model_registry_update_lock,
         model_registry_store,
         billing_rate_store,
         transform_registry,

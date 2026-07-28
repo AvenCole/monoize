@@ -14,7 +14,7 @@ An API key row has:
 - `id: string`
 - `user_id: string`
 - `name: string`
-- `key_prefix: string` (first 12 characters of the full key)
+- `key_prefix: string` (first 12 characters of the full key; display only and never an authentication or cache identity)
 - `key_hash: string` (reserved; currently not used for runtime validation)
 - `key: string` (the full key, stored for display)
 - `created_at: RFC3339 string`
@@ -177,6 +177,8 @@ TM-TF-10. The dashboard transform registry consumed by the API key editor MUST c
 - **Response:** `{ "success": true }`
 
 TM-DEL-1. A successful API key delete MUST invalidate in-memory API key cache entries for the deleted key id before returning the response.
+
+TM-DEL-2. A successful user delete MUST remove every cascaded API key id from the in-memory API-key name cache before returning the response.
 
 ### 2.6 Batch delete API keys
 

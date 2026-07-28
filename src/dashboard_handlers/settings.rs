@@ -62,6 +62,7 @@ pub async fn update_settings(
     Json(body): Json<UpdateSettingsRequest>,
 ) -> AppResult<impl IntoResponse> {
     require_admin(&headers, &state).await?;
+    let _update_guard = state.settings_update_lock.lock().await;
 
     let settings_store = &state.settings_store;
 

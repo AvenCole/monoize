@@ -32,15 +32,16 @@ AKP1. Monoize MUST attempt database API key validation first **only** if:
 
 AKP2. If AKP1 holds, Monoize MUST:
 
-1. Set `key_prefix = token[0..12]` (first 12 characters).
-2. Look up an API key row by `key_prefix`.
+1. Look up an API key row by complete-token equality against the stored full key.
+2. Use the complete token as the in-memory authentication-cache identity. The first 12 characters MUST NOT identify a cache entry.
 3. If no row exists, treat the token as invalid.
 4. If a row exists, Monoize MUST validate the token as follows:
    - `enabled` MUST be true.
    - `expires_at` MUST be null or a future timestamp.
    - the stored full key value MUST equal the full token.
    - the referenced user MUST exist and have `enabled` true.
-   - if an in-memory cache entry for the same `key_prefix` exists but fails cache-side validation, Monoize MUST invalidate that cache entry and continue with the database validation path in the same request.
+   - if an in-memory cache entry for the same complete token exists but fails cache-side validation, Monoize MUST invalidate that cache entry and continue with the database validation path in the same request.
+   - if cache invalidation occurs after the database read but before cache publication, Monoize MUST discard that result and repeat database validation.
 5. If validation succeeds:
    - Monoize MUST update `last_used_at` to the current time.
    - Monoize MUST authenticate the request with `tenant_id = user.id`.

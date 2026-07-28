@@ -710,6 +710,7 @@ struct MonoizeAttempt {
     affinity_key_hash: Option<String>,
     affinity_hit: Option<bool>,
     affinity_target: Option<String>,
+    routing_config_revision: u64,
 }
 
 fn reasoning_envelope_provider_type(provider_type: ProviderType) -> &'static str {

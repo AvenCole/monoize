@@ -74,32 +74,35 @@ DPT-RL10. Between `push` and the next `flush`, request log entries exist only in
 
 ### 4.1 State
 
-DPT-AK1. `ApiKeyCache` MUST hold a `DashMap<String, CachedApiKeyEntry>` keyed by the API key prefix (first 12 characters of the key string).
+DPT-AK1. `ApiKeyCache` MUST hold a `DashMap<String, CachedApiKeyEntry>` keyed by the complete API key string. The first 12 characters MUST NOT be used as a cache identity.
 
 DPT-AK2. Each `CachedApiKeyEntry` MUST contain:
 - `api_key: ApiKey` (the full API key record)
 - `user: User` (the owning user record)
 - `cached_at: Instant` (wall-clock timestamp at insertion)
+- `generation: u64` (the cache invalidation generation observed before the database read)
 
 DPT-AK3. The TTL (as configured in `UserStore::new`) MUST be 60 seconds.
 
 ### 4.2 Lookup
 
-DPT-AK4. `get(prefix)` MUST return `Some((ApiKey, User))` if and only if:
-1. An entry exists for the given prefix, AND
+DPT-AK4. `get(key)` MUST return `Some((ApiKey, User))` if and only if:
+1. An entry exists for the complete key, AND
 2. `cached_at.elapsed() <= ttl`.
 
 DPT-AK5. If an entry exists but `cached_at.elapsed() > ttl`, the cache MUST remove the entry only if the currently stored entry is still expired at removal time (conditional remove), and then return `None`.
 
 ### 4.3 Security Invariant
 
-DPT-AK6. A cache hit MUST NOT bypass full-key plaintext verification. The caller (`validate_api_key`) MUST still compare `key != cached_key.key` (plaintext equality) on every cache-hit path to prevent prefix-collision attacks.
+DPT-AK6. A cache hit MUST NOT bypass full-key plaintext verification. The caller (`validate_api_key`) MUST still compare the supplied complete key with `cached_key.key` on every cache-hit path.
 
 DPT-AK7. A cache hit MUST additionally verify that `cached_key.enabled == true`, `cached_user.enabled == true`, and the key is not expired (`expires_at > now` or `expires_at` is None). If any check fails, the entry MUST be invalidated and the caller MUST fall through to the database path.
 
 ### 4.4 Insertion
 
-DPT-AK8. `insert(prefix, api_key, user)` MUST store the entry with `cached_at = Instant::now()`.
+DPT-AK8. A cache-miss database read MUST capture the current invalidation generation before reading. The result MUST be inserted only while that generation remains current.
+
+DPT-AK8a. After insertion, the cache MUST read the generation again. If it changed, the cache MUST conditionally remove the entry whose stored generation equals the stale generation and report insertion failure. The caller MUST repeat database validation instead of returning that stale result.
 
 ### 4.5 Invalidation
 
@@ -107,8 +110,10 @@ DPT-AK9. The following invalidation methods MUST exist:
 - `invalidate_by_key_id(key_id)`: Remove all entries where `entry.api_key.id == key_id`.
 - `invalidate_by_user_id(user_id)`: Remove all entries where `entry.api_key.user_id == user_id`.
 - `invalidate_by_key_ids(key_ids)`: Remove all entries where `entry.api_key.id` is in `key_ids`.
-- `invalidate_by_prefix(prefix)`: Remove the entry for the given key prefix.
+- `invalidate(key)`: Remove the entry for the complete API key.
 - `invalidate_all()`: Clear the entire cache.
+
+DPT-AK9a. Every explicit invalidation MUST increment the cache generation before removing entries. A database result read before that increment MUST NOT be published afterward.
 
 DPT-AK10. Invalidation MUST be called on the following mutation paths:
 
@@ -136,6 +141,7 @@ DPT-BC1. `BalanceCache` MUST hold a `DashMap<String, CachedBalanceEntry>` keyed 
 DPT-BC2. Each `CachedBalanceEntry` MUST contain:
 - `balance: UserBalance`
 - `cached_at: Instant`
+- `generation: u64`
 
 DPT-BC3. The TTL (as configured in `UserStore::new`) MUST be 30 seconds.
 
@@ -149,13 +155,17 @@ DPT-BC5. If an entry exists but `cached_at.elapsed() > ttl`, the cache MUST remo
 
 ### 5.3 Insertion
 
-DPT-BC6. `get_user_balance(user_id)` MUST check the cache first. On cache miss, it MUST query the database and insert the result into the cache before returning.
+DPT-BC6. `get_user_balance(user_id)` MUST check the cache first. On cache miss, it MUST capture the current invalidation generation, query the database, and insert the result only while that generation remains current.
+
+DPT-BC6a. After insertion, the cache MUST read the generation again. If it changed, the cache MUST conditionally remove the entry whose stored generation equals the stale generation and `get_user_balance` MUST repeat the database read.
 
 ### 5.4 Invalidation
 
 DPT-BC7. The following invalidation methods MUST exist:
 - `invalidate(user_id)`: Remove the entry for the given user_id.
 - `invalidate_all()`: Clear the entire cache.
+
+DPT-BC7a. Every explicit invalidation MUST increment the cache generation before removing entries. A database result read before that increment MUST NOT be published afterward.
 
 DPT-BC8. Invalidation MUST be called on the following mutation paths:
 
@@ -171,7 +181,7 @@ DPT-BC9. `update_user` MUST invalidate the balance cache only when `balance_nano
 
 ### 5.5 Staleness Bound
 
-DPT-BC10. The maximum staleness of a cached balance is bounded by the TTL (30 seconds). A user who receives a deposit or is charged will see the updated balance within at most 30 seconds, or immediately if the cache is explicitly invalidated by a mutation on the same process.
+DPT-BC10. After a balance mutation commits and its same-process invalidation completes, later cache reads MUST NOT return a value read before that invalidation. The TTL remains 30 seconds for changes made outside this process.
 
 DPT-BC11. `BalanceCache` MUST provide a background eviction task that periodically removes expired entries using `retain`.
 
@@ -203,10 +213,10 @@ DPT-US4. `flush_all_batchers()` MUST be called in two shutdown paths:
 
 DPT-US5. `validate_api_key(key)` MUST follow this execution path:
 1. If `key.len() < 12`, return `None`.
-2. Extract `prefix = key[..12]`.
-3. Check `ApiKeyCache::get(prefix)`.
-4. On cache hit: verify `enabled`, `user.enabled`, `expires_at`, and `key != cached_key.key` (plaintext equality). If all pass, call `last_used_batcher.record(...)` and return the cached result. If any check fails, invalidate the cache entry and MUST immediately revalidate via the database path in the same call; cache validation failure alone MUST NOT produce an authentication error response.
-5. On cache miss: query DB for API key by prefix, verify enabled/expired/key-equality/user, call `last_used_batcher.record(...)`, insert into `ApiKeyCache`, and return.
+2. Check `ApiKeyCache::get(key)` using the complete key.
+3. On cache hit: verify `enabled`, `user.enabled`, `expires_at`, and `key != cached_key.key` (plaintext equality). If all pass, call `last_used_batcher.record(...)` and return the cached result. If any check fails, invalidate the cache entry and MUST immediately revalidate via the database path in the same call; cache validation failure alone MUST NOT produce an authentication error response.
+4. On cache miss: capture the cache generation, query the database by complete key equality, verify enabled/expired/key-equality/user, and insert into `ApiKeyCache` only if the generation remains current.
+5. If publication fails because the generation changed, repeat step 2. Otherwise call `last_used_batcher.record(...)` and return.
 
 ### 6.4 Request Log Integration
 

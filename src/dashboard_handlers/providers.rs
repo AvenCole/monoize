@@ -15,6 +15,7 @@ use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 
 fn apply_channel_runtime(channel: &mut MonoizeChannel, health: &ChannelHealthState) {
     let now = chrono::Utc::now().timestamp();
@@ -79,6 +80,22 @@ async fn prune_provider_channel_health(state: &AppState, channel_ids: &[String])
                 || channel_key.starts_with(&format!("{channel_id}::"))
         })
     });
+}
+
+async fn prune_provider_channel_affinity(state: &AppState, channel_ids: &[String]) {
+    if channel_ids.is_empty() {
+        return;
+    }
+    let ids: HashSet<&str> = channel_ids.iter().map(String::as_str).collect();
+    state
+        .channel_affinity
+        .lock()
+        .await
+        .retain(|_, binding| !ids.contains(binding.channel_id.as_str()));
+}
+
+fn advance_routing_config_revision(state: &AppState) {
+    state.routing_config_revision.fetch_add(1, Ordering::AcqRel);
 }
 
 pub(super) fn provider_pricing_model<'a>(
@@ -341,6 +358,7 @@ pub async fn create_provider(
         .await
         .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
 
+    advance_routing_config_revision(&state);
     state
         .name_caches
         .providers
@@ -404,12 +422,17 @@ pub async fn update_provider(
         .filter(|ch| !next_channel_ids.contains(ch.id.as_str()))
         .map(|ch| ch.id.clone())
         .collect();
-    prune_provider_channel_health(&state, &removed_channel_ids).await;
-    if !provider.circuit_breaker_enabled {
-        let all_channel_ids: Vec<String> =
-            provider.channels.iter().map(|ch| ch.id.clone()).collect();
-        prune_provider_channel_health(&state, &all_channel_ids).await;
-    }
+    let affected_channel_ids: Vec<String> = prev_provider
+        .channels
+        .iter()
+        .chain(provider.channels.iter())
+        .map(|channel| channel.id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    advance_routing_config_revision(&state);
+    prune_provider_channel_health(&state, &affected_channel_ids).await;
+    prune_provider_channel_affinity(&state, &affected_channel_ids).await;
     for id in &removed_channel_ids {
         state.name_caches.channels.remove(id);
     }
@@ -450,7 +473,9 @@ pub async fn delete_provider(
         .iter()
         .map(|ch| ch.id.clone())
         .collect();
+    advance_routing_config_revision(&state);
     prune_provider_channel_health(&state, &removed_channel_ids).await;
+    prune_provider_channel_affinity(&state, &removed_channel_ids).await;
     for id in &removed_channel_ids {
         state.name_caches.channels.remove(id);
     }
@@ -471,6 +496,7 @@ pub async fn reorder_providers(
         .await
         .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
 
+    advance_routing_config_revision(&state);
     Ok(Json(json!({ "success": true })))
 }
 
@@ -716,6 +742,7 @@ pub async fn test_channel(
     body: Option<Json<TestChannelRequest>>,
 ) -> AppResult<impl IntoResponse> {
     require_admin(&headers, &state).await?;
+    let routing_config_revision = state.routing_config_revision.load(Ordering::Acquire);
 
     let provider = state
         .monoize_store
@@ -800,29 +827,31 @@ pub async fn test_channel(
     if ok {
         let now = chrono::Utc::now().timestamp();
         let mut health = state.channel_health.lock().await;
-        let prefix = format!("{channel_id}::");
-        let keys: Vec<String> = health
-            .keys()
-            .filter(|key| key.as_str() == channel_id || key.starts_with(&prefix))
-            .cloned()
-            .collect();
-        if keys.is_empty() {
-            let entry = health
-                .entry(health_key(&channel_id, None))
-                .or_insert_with(ChannelHealthState::new);
-            entry.healthy = true;
-            entry.cooldown_until = None;
-            entry.last_success_at = Some(now);
-            entry.probe_success_count = 0;
-            entry.last_probe_at = None;
-        } else {
-            for key in keys {
-                if let Some(entry) = health.get_mut(&key) {
-                    entry.healthy = true;
-                    entry.cooldown_until = None;
-                    entry.last_success_at = Some(now);
-                    entry.probe_success_count = 0;
-                    entry.last_probe_at = None;
+        if state.routing_config_revision.load(Ordering::Acquire) == routing_config_revision {
+            let prefix = format!("{channel_id}::");
+            let keys: Vec<String> = health
+                .keys()
+                .filter(|key| key.as_str() == channel_id || key.starts_with(&prefix))
+                .cloned()
+                .collect();
+            if keys.is_empty() {
+                let entry = health
+                    .entry(health_key(&channel_id, None))
+                    .or_insert_with(ChannelHealthState::new);
+                entry.healthy = true;
+                entry.cooldown_until = None;
+                entry.last_success_at = Some(now);
+                entry.probe_success_count = 0;
+                entry.last_probe_at = None;
+            } else {
+                for key in keys {
+                    if let Some(entry) = health.get_mut(&key) {
+                        entry.healthy = true;
+                        entry.cooldown_until = None;
+                        entry.last_success_at = Some(now);
+                        entry.probe_success_count = 0;
+                        entry.last_probe_at = None;
+                    }
                 }
             }
         }

@@ -144,6 +144,7 @@ When `ModelRegistry` is refreshed after startup or model mutations:
 
 1. Load all enabled records from `model_registry_records`.
 2. Replace the in-memory cache with exactly the loaded set.
+3. Serialize each model-record mutation through completion of steps 1 and 2. A snapshot loaded by an earlier mutation MUST NOT replace the snapshot published by a later mutation.
 
 ## Dashboard API Endpoints
 
@@ -259,3 +260,4 @@ After any mutating operation (create, update, delete), the `ModelRegistry` in-me
 3. capabilities_json must be valid JSON parseable into ModelCapabilities.
 4. Active in-memory model registry content is exactly the set of enabled rows in `model_registry_records`.
 5. Disabled models (enabled=0) are excluded from the active model registry but remain in the database.
+6. When a mutating dashboard response returns, the active in-memory registry reflects that mutation and every model mutation that completed before it.

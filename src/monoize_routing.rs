@@ -299,6 +299,7 @@ pub struct ChannelAffinityBinding {
 }
 
 pub const CHANNEL_AFFINITY_IDLE_TTL_SECONDS: i64 = 30 * 60;
+pub const CHANNEL_AFFINITY_MAX_ENTRIES: usize = 4096;
 
 impl ChannelHealthState {
     pub fn new() -> Self {

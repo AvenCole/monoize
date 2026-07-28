@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -284,14 +287,15 @@ struct CachedApiKeyEntry {
     api_key: ApiKey,
     user: User,
     cached_at: Instant,
+    generation: u64,
 }
 
-/// Caches successful `validate_api_key` results keyed by key prefix (first 12 chars).
+/// Caches successful `validate_api_key` results keyed by the complete API key.
 /// Entries expire after `ttl`. Mutations to api_keys table must call `invalidate_*`.
 #[derive(Debug, Clone)]
 pub struct ApiKeyCache {
-    // Keyed by key_prefix (12 chars)
     cache: Arc<DashMap<String, CachedApiKeyEntry>>,
+    generation: Arc<AtomicU64>,
     ttl: Duration,
 }
 
@@ -308,56 +312,87 @@ impl ApiKeyCache {
     pub fn new(ttl: Duration) -> Self {
         Self {
             cache: Arc::new(DashMap::new()),
+            generation: Arc::new(AtomicU64::new(0)),
             ttl,
         }
     }
 
-    pub fn get(&self, prefix: &str) -> Option<(ApiKey, User)> {
-        let entry = self.cache.get(prefix)?;
+    pub fn get(&self, key: &str) -> Option<(ApiKey, User)> {
+        let entry = self.cache.get(key)?;
         if entry.cached_at.elapsed() > self.ttl {
             drop(entry);
             self.cache
-                .remove_if(prefix, |_, v| v.cached_at.elapsed() > self.ttl);
+                .remove_if(key, |_, v| v.cached_at.elapsed() > self.ttl);
             return None;
         }
         Some((entry.api_key.clone(), entry.user.clone()))
     }
 
-    pub fn insert(&self, prefix: String, api_key: ApiKey, user: User) {
+    pub(crate) fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn insert_if_current(
+        &self,
+        key: String,
+        generation: u64,
+        api_key: ApiKey,
+        user: User,
+    ) -> bool {
+        if self.current_generation() != generation {
+            return false;
+        }
+        let cache_key = key.clone();
         self.cache.insert(
-            prefix,
+            key,
             CachedApiKeyEntry {
                 api_key,
                 user,
                 cached_at: Instant::now(),
+                generation,
             },
         );
+        if self.current_generation() == generation {
+            return true;
+        }
+        self.cache
+            .remove_if(&cache_key, |_, entry| entry.generation == generation);
+        false
+    }
+
+    fn begin_invalidation(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Invalidate a single key by its ID (scans all entries).
     pub fn invalidate_by_key_id(&self, key_id: &str) {
+        self.begin_invalidation();
         self.cache.retain(|_, v| v.api_key.id != key_id);
     }
 
     /// Invalidate all keys belonging to a user.
     pub fn invalidate_by_user_id(&self, user_id: &str) {
+        self.begin_invalidation();
         self.cache.retain(|_, v| v.api_key.user_id != user_id);
     }
 
     /// Invalidate entries matching any of the given key IDs.
     pub fn invalidate_by_key_ids(&self, key_ids: &[String]) {
+        self.begin_invalidation();
         let key_id_set: std::collections::HashSet<&str> =
             key_ids.iter().map(String::as_str).collect();
         self.cache
             .retain(|_, v| !key_id_set.contains(v.api_key.id.as_str()));
     }
 
-    pub fn invalidate_by_prefix(&self, prefix: &str) {
-        self.cache.remove(prefix);
+    pub fn invalidate(&self, key: &str) {
+        self.begin_invalidation();
+        self.cache.remove(key);
     }
 
     /// Remove all entries.
     pub fn invalidate_all(&self) {
+        self.begin_invalidation();
         self.cache.clear();
     }
 
@@ -382,6 +417,7 @@ impl ApiKeyCache {
 struct CachedBalanceEntry {
     balance: UserBalance,
     cached_at: Instant,
+    generation: u64,
 }
 
 /// Caches `get_user_balance` results keyed by user_id.
@@ -389,6 +425,7 @@ struct CachedBalanceEntry {
 #[derive(Debug, Clone)]
 pub struct BalanceCache {
     cache: Arc<DashMap<String, CachedBalanceEntry>>,
+    generation: Arc<AtomicU64>,
     ttl: Duration,
 }
 
@@ -396,6 +433,7 @@ impl BalanceCache {
     pub fn new(ttl: Duration) -> Self {
         Self {
             cache: Arc::new(DashMap::new()),
+            generation: Arc::new(AtomicU64::new(0)),
             ttl,
         }
     }
@@ -411,21 +449,43 @@ impl BalanceCache {
         Some(entry.balance.clone())
     }
 
-    pub fn insert(&self, user_id: String, balance: UserBalance) {
+    pub(crate) fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn insert_if_current(
+        &self,
+        user_id: String,
+        generation: u64,
+        balance: UserBalance,
+    ) -> bool {
+        if self.current_generation() != generation {
+            return false;
+        }
+        let cache_key = user_id.clone();
         self.cache.insert(
             user_id,
             CachedBalanceEntry {
                 balance,
                 cached_at: Instant::now(),
+                generation,
             },
         );
+        if self.current_generation() == generation {
+            return true;
+        }
+        self.cache
+            .remove_if(&cache_key, |_, entry| entry.generation == generation);
+        false
     }
 
     pub fn invalidate(&self, user_id: &str) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.cache.remove(user_id);
     }
 
     pub fn invalidate_all(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.cache.clear();
     }
 

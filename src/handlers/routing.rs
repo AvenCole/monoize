@@ -1,5 +1,6 @@
 use super::*;
 use crate::settings::BUILTIN_REASONING_EFFORT_SUFFIXES;
+use std::sync::atomic::Ordering;
 
 pub(crate) fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
@@ -163,14 +164,22 @@ pub(super) async fn build_monoize_attempts_for_provider_type(
     auth: &crate::auth::AuthResult,
     required_provider_type: Option<ProviderType>,
 ) -> AppResult<Vec<MonoizeAttempt>> {
+    let routing_config_revision = state.routing_config_revision.load(Ordering::Acquire);
     let providers =
         state.monoize_store.list_providers().await.map_err(|e| {
             AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "provider_store_error", e)
         })?;
     let mut attempts = Vec::new();
     for provider in providers {
-        collect_provider_attempts(state, urp, &auth.effective_groups, &provider, &mut attempts)
-            .await;
+        collect_provider_attempts(
+            state,
+            urp,
+            &auth.effective_groups,
+            &provider,
+            routing_config_revision,
+            &mut attempts,
+        )
+        .await;
     }
     if let Some(required_provider_type) = required_provider_type {
         attempts.retain(|attempt| attempt.provider_type == required_provider_type);
@@ -309,11 +318,16 @@ async fn apply_channel_affinity(
     let now = now_ts();
     let binding = {
         let mut guard = state.channel_affinity.lock().await;
-        guard.retain(|_, binding| {
-            now.saturating_sub(binding.updated_at)
-                <= crate::monoize_routing::CHANNEL_AFFINITY_IDLE_TTL_SECONDS
-        });
-        guard.get(&key).cloned()
+        match guard.get(&key).cloned() {
+            Some(binding)
+                if now.saturating_sub(binding.updated_at)
+                    > crate::monoize_routing::CHANNEL_AFFINITY_IDLE_TTL_SECONDS =>
+            {
+                guard.remove(&key);
+                None
+            }
+            binding => binding,
+        }
     };
 
     let mut bound_target = None;
@@ -348,12 +362,30 @@ async fn apply_channel_affinity(
     Ok(attempts)
 }
 
+fn insert_channel_affinity(
+    cache: &mut std::collections::HashMap<String, crate::monoize_routing::ChannelAffinityBinding>,
+    key: String,
+    binding: crate::monoize_routing::ChannelAffinityBinding,
+) {
+    if !cache.contains_key(&key)
+        && cache.len() >= crate::monoize_routing::CHANNEL_AFFINITY_MAX_ENTRIES
+        && let Some(evicted_key) = cache.keys().next().cloned()
+    {
+        cache.remove(&evicted_key);
+    }
+    cache.insert(key, binding);
+}
+
 pub(super) async fn refresh_channel_affinity(state: &AppState, attempt: &MonoizeAttempt) {
     let Some(key) = attempt.affinity_key.as_ref() else {
         return;
     };
     let mut guard = state.channel_affinity.lock().await;
-    guard.insert(
+    if state.routing_config_revision.load(Ordering::Acquire) != attempt.routing_config_revision {
+        return;
+    }
+    insert_channel_affinity(
+        &mut guard,
         key.clone(),
         crate::monoize_routing::ChannelAffinityBinding {
             provider_id: attempt.provider_id.clone(),
@@ -377,7 +409,12 @@ pub(super) async fn refresh_response_id_affinity(
     let Some(key) = response_id_affinity_key(logical_model, response_id, auth) else {
         return;
     };
-    state.channel_affinity.lock().await.insert(
+    let mut guard = state.channel_affinity.lock().await;
+    if state.routing_config_revision.load(Ordering::Acquire) != attempt.routing_config_revision {
+        return;
+    }
+    insert_channel_affinity(
+        &mut guard,
         key,
         crate::monoize_routing::ChannelAffinityBinding {
             provider_id: attempt.provider_id.clone(),
@@ -391,7 +428,10 @@ pub(super) async fn clear_channel_affinity(state: &AppState, attempt: &MonoizeAt
     let Some(key) = attempt.affinity_key.as_ref() else {
         return;
     };
-    state.channel_affinity.lock().await.remove(key);
+    let mut guard = state.channel_affinity.lock().await;
+    if state.routing_config_revision.load(Ordering::Acquire) == attempt.routing_config_revision {
+        guard.remove(key);
+    }
 }
 
 pub(super) async fn collect_provider_attempts(
@@ -399,6 +439,7 @@ pub(super) async fn collect_provider_attempts(
     urp: &UrpRequest,
     effective_groups: &Option<Vec<String>>,
     provider: &crate::monoize_routing::MonoizeProvider,
+    routing_config_revision: u64,
     out: &mut Vec<MonoizeAttempt>,
 ) {
     if !provider.enabled {
@@ -506,6 +547,7 @@ pub(super) async fn collect_provider_attempts(
             affinity_key_hash: None,
             affinity_hit: None,
             affinity_target: None,
+            routing_config_revision,
         });
     }
 }
@@ -768,6 +810,9 @@ pub(super) fn prune_passive_samples(
 pub(super) async fn mark_channel_success(state: &AppState, attempt: &MonoizeAttempt) {
     let now = now_ts();
     let mut health = state.channel_health.lock().await;
+    if state.routing_config_revision.load(Ordering::Acquire) != attempt.routing_config_revision {
+        return;
+    }
     let key = health_key(&attempt.channel_id, attempt_health_model(attempt));
     let entry = health
         .entry(key)
@@ -804,6 +849,9 @@ pub(super) async fn mark_channel_retryable_failure(
     }
     let now = now_ts();
     let mut health = state.channel_health.lock().await;
+    if state.routing_config_revision.load(Ordering::Acquire) != attempt.routing_config_revision {
+        return;
+    }
     let key = health_key(&attempt.channel_id, attempt_health_model(attempt));
     let entry = health
         .entry(key)

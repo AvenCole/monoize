@@ -232,6 +232,12 @@ AFF-10. Successful non-stream requests MUST write or refresh affinity after succ
 
 AFF-11. After a successful `type=responses` attempt, Monoize MUST write an additional affinity binding keyed by authenticated tenant, logical model, and the non-empty upstream response id. A subsequent Responses request that sends that id as `previous_response_id` MUST resolve the additional binding under AFF-7 through AFF-9. A successful Responses stream MUST write this binding only after successful terminal completion.
 
+AFF-12. The process-local affinity map MUST contain at most 4096 bindings. Inserting a new key at capacity MUST evict one existing binding before insertion.
+
+AFF-13. Lookup MUST inspect only the requested binding. It MUST remove that binding when expired and MUST NOT scan the complete affinity map on each request.
+
+AFF-14. A provider update or delete MUST remove affinity bindings for every channel in the affected provider. An upstream attempt created before the completed provider mutation MUST NOT write or refresh affinity afterward.
+
 ## 6. Health Check
 
 ### 6.1 Health State Keying
@@ -243,6 +249,10 @@ HSK-1a. When `provider.circuit_breaker_enabled == false`, health state MAY still
 HSK-2. When `provider.per_model_circuit_break == true`, health state MUST be keyed by `(channel_id, logical_model)` where `logical_model` is the request model after any API-key pre-redirect rules have been applied and before provider-model redirect is resolved. A circuit break for model A on channel X MUST NOT affect model B on the same channel.
 
 HSK-3. Eligibility filtering (RTA-3) MUST use the appropriate health key when determining whether a channel is healthy for a given request model.
+
+HSK-4. A provider update MUST remove runtime health state for every channel in both the pre-update and post-update provider. A provider delete MUST remove runtime health state for every deleted channel.
+
+HSK-5. Each upstream attempt and active probe MUST capture the routing-configuration revision used to create it. After a provider create, update, delete, or reorder increments that revision, an attempt or probe with an older revision MUST NOT create or update channel health state.
 
 ### 6.2 Passive
 

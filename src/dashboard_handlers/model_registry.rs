@@ -52,6 +52,7 @@ pub async fn create_model(
     Json(body): Json<CreateModelInput>,
 ) -> AppResult<impl IntoResponse> {
     require_admin(&headers, &state).await?;
+    let _update_guard = state.model_registry_update_lock.lock().await;
 
     let model_registry_store = &state.model_registry_store;
 
@@ -63,12 +64,12 @@ pub async fn create_model(
         }
     })?;
 
-    if model.enabled {
-        state
-            .model_registry
-            .merge_db_records(vec![model.clone()])
-            .await;
-    }
+    let all_enabled = model_registry_store
+        .list_enabled_models()
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+
+    state.model_registry.replace_db_records(all_enabled).await;
 
     Ok((StatusCode::CREATED, Json(model)))
 }
@@ -80,6 +81,7 @@ pub async fn update_model(
     Json(body): Json<UpdateModelInput>,
 ) -> AppResult<impl IntoResponse> {
     require_admin(&headers, &state).await?;
+    let _update_guard = state.model_registry_update_lock.lock().await;
 
     let model_registry_store = &state.model_registry_store;
 
@@ -112,6 +114,7 @@ pub async fn delete_model(
     Path(model_id): Path<String>,
 ) -> AppResult<impl IntoResponse> {
     require_admin(&headers, &state).await?;
+    let _update_guard = state.model_registry_update_lock.lock().await;
 
     let model_registry_store = &state.model_registry_store;
 

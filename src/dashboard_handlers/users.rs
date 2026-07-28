@@ -310,11 +310,14 @@ pub async fn delete_user(
         ));
     }
 
-    user_store
+    let api_key_ids = user_store
         .delete_user(&user_id)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
     state.name_caches.users.remove(&user_id);
+    for api_key_id in api_key_ids {
+        state.name_caches.api_keys.remove(&api_key_id);
+    }
     Ok(Json(json!({ "success": true })))
 }

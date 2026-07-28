@@ -147,7 +147,9 @@ All endpoints require an authenticated dashboard admin session.
 - Response: updated provider
 - Errors: `404 not_found`, `400 invalid_request`
 
-CP-UPD-1. After update, runtime health entries for removed channel ids MUST be removed.
+CP-UPD-1. After update, runtime health and affinity entries for every channel id in the pre-update or post-update provider MUST be removed.
+
+CP-UPD-2. After update completes, in-flight work created from an older provider configuration MUST NOT recreate the removed runtime health or affinity entries.
 
 ### 3.5 Delete provider
 
@@ -155,7 +157,9 @@ CP-UPD-1. After update, runtime health entries for removed channel ids MUST be r
 - Response: `{ "success": true }`
 - Errors: `404 not_found`
 
-CP-DEL-1. After delete, runtime health entries for all deleted provider channel ids MUST be removed.
+CP-DEL-1. After delete, runtime health and affinity entries for all deleted provider channel ids MUST be removed.
+
+CP-DEL-2. After delete completes, in-flight work created before deletion MUST NOT recreate runtime health or affinity entries for a deleted channel.
 
 ### 3.6 Reorder providers
 

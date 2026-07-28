@@ -516,6 +516,8 @@ FL52. REST request-log responses MUST compute enriched fields by query-time join
 
 FL52a. SSE request-log events MUST use in-memory ID-to-name caches for the enriched fields: `provider_name`, `channel_name`, `username`, and `api_key_name`. The server MUST NOT perform database JOINs at SSE event delivery time. If a cache miss occurs for a given ID in an SSE event, the enriched field MUST be null (not omitted), and the client MUST render the raw ID as fallback display text where applicable (per FL9 for channel, analogous for others).
 
+FL52b. After a user deletion cascades to that user's API keys, the server MUST remove the deleted user id and all cascaded API key ids from the corresponding in-memory name caches before returning the delete response.
+
 ### 6.9 No server-side filtering on SSE
 
 FL53. The SSE endpoint `GET /api/dashboard/request-logs/stream` MUST NOT accept any filter query parameters (`model`, `status`, `api_key_id`, `username`, `search`, `time_from`, `time_to`). The server pushes all user-visible logs (per FL47 permission rules). The client MUST apply active UI filters locally to determine which SSE-delivered rows to display.
