@@ -529,7 +529,7 @@ fn merge_output_node(accumulated: &Node, terminal: &Node) -> Result<Node, String
                 left_encrypted,
                 right_encrypted,
             )?,
-            summary: merge_optional_string_field("reasoning.summary", left_summary, right_summary)?,
+            summary: merge_terminal_reasoning_summary(left_summary, right_summary),
             source: right_source.clone().or_else(|| left_source.clone()),
             extra_body: merge_extra_body(left_extra, right_extra),
         }),
@@ -626,6 +626,17 @@ fn merge_optional_string_field(
         (_, Some(right)) if !right.is_empty() => Ok(Some(right.to_string())),
         _ => Ok(None),
     }
+}
+
+fn merge_terminal_reasoning_summary(
+    accumulated: &Option<String>,
+    terminal: &Option<String>,
+) -> Option<String> {
+    terminal
+        .as_deref()
+        .filter(|summary| !summary.is_empty())
+        .or_else(|| accumulated.as_deref().filter(|summary| !summary.is_empty()))
+        .map(str::to_string)
 }
 
 fn merge_optional_value_field(

@@ -157,7 +157,7 @@ async fn responses_streaming_completed_snapshot_merges_reasoning_slot_once() {
 }
 
 #[tokio::test]
-async fn responses_streaming_reasoning_done_snapshot_reconciles_completed_summary() {
+async fn responses_streaming_terminal_summary_snapshot_overrides_streamed_summary() {
     let ctx = setup().await;
     let req = Request::builder()
         .method("POST")
@@ -183,14 +183,14 @@ async fn responses_streaming_reasoning_done_snapshot_reconciles_completed_summar
 
     assert!(
         !frames.iter().any(|(event, _)| event == "response.failed"),
-        "full reasoning done snapshots must reconcile before terminal comparison: {text}"
+        "terminal reasoning summary must override streamed summary without failing: {text}"
     );
     let summary_done = frames
         .iter()
         .find(|(event, _)| event == "response.reasoning_summary_text.done")
         .map(|(_, payload)| payload)
         .unwrap_or_else(|| panic!("missing summary done event: {text}"));
-    assert_eq!(summary_done["text"], json!("final summary"));
+    assert_eq!(summary_done["text"], json!("item summary"));
 
     let reasoning_done = frames
         .iter()
@@ -202,7 +202,7 @@ async fn responses_streaming_reasoning_done_snapshot_reconciles_completed_summar
         .unwrap_or_else(|| panic!("missing reasoning output item: {text}"));
     assert_eq!(
         reasoning_done["summary"],
-        json!([{ "type": "summary_text", "text": "final summary" }])
+        json!([{ "type": "summary_text", "text": "item summary" }])
     );
 
     let completed = frames
@@ -212,7 +212,7 @@ async fn responses_streaming_reasoning_done_snapshot_reconciles_completed_summar
         .unwrap_or_else(|| panic!("missing response.completed: {text}"));
     assert_eq!(
         completed["response"]["output"][0]["summary"],
-        json!([{ "type": "summary_text", "text": "final summary" }])
+        json!([{ "type": "summary_text", "text": "terminal summary" }])
     );
     assert!(text.trim_end().ends_with("data: [DONE]"));
 }

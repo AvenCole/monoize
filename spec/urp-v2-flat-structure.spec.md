@@ -455,7 +455,7 @@ SACC-3. For `NodeDelta::Reasoning.content`, terminal `Reasoning.content` is the 
 
 SACC-4. For `NodeDelta::Reasoning.summary`, terminal `Reasoning.summary` is the ordered concatenation of all non-null `summary` fragments for that `node_index`.
 
-SACC-4a. When a source protocol emits a later non-empty full-field done snapshot for `Reasoning.summary`, that snapshot replaces the delta concatenation for `NodeDone.node` and `ResponseDone.output`. A full-item done snapshot MAY also replace other non-empty reasoning fields. An empty done-snapshot field MUST NOT erase a non-empty accumulated field.
+SACC-4a. When a source protocol emits a later non-empty full-field done snapshot for `Reasoning.summary`, that snapshot replaces the delta concatenation for `NodeDone.node` and `ResponseDone.output`. A full-item done snapshot MAY also replace other non-empty reasoning fields. A non-empty terminal response-object summary is the final authoritative `ResponseDone.output` presentation and replaces any different accumulated summary without creating a terminal conflict. An empty done-snapshot or terminal-response field MUST NOT erase a non-empty accumulated field.
 
 SACC-5. If a streamed `Reasoning.encrypted` payload is emitted incrementally and each delta `encrypted` value is a string, terminal `Reasoning.encrypted` is the ordered concatenation of those string fragments.
 

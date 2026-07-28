@@ -368,6 +368,35 @@ mod tests {
     }
 
     #[test]
+    fn terminal_reasoning_summary_overrides_accumulated_presentation() {
+        let accumulated = Node::Reasoning {
+            id: Some("rs_1".to_string()),
+            content: None,
+            encrypted: Some(json!("same_sig")),
+            summary: Some("item summary".to_string()),
+            source: None,
+            extra_body: HashMap::new(),
+        };
+        let terminal = Node::Reasoning {
+            id: Some("rs_1".to_string()),
+            content: None,
+            encrypted: Some(json!("same_sig")),
+            summary: Some("terminal summary".to_string()),
+            source: None,
+            extra_body: HashMap::new(),
+        };
+
+        let merged = merge_output_node(&accumulated, &terminal).expect("summary is presentation");
+        assert!(matches!(
+            merged,
+            Node::Reasoning {
+                summary: Some(summary),
+                ..
+            } if summary == "terminal summary"
+        ));
+    }
+
+    #[test]
     fn completed_snapshot_omitted_reasoning_does_not_position_conflict_with_message() {
         let accumulated = vec![
             AccumulatedOutputEntry {

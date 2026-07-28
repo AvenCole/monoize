@@ -1498,7 +1498,7 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                                         "output_index": 0,
                                         "item_id": "rs_mock",
                                         "summary_index": 0,
-                                        "text": "final summary"
+                                        "text": "done summary"
                                     })
                                     .to_string(),
                                 ),
@@ -1514,7 +1514,7 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                                         "summary_index": 0,
                                         "part": {
                                             "type": "summary_text",
-                                            "text": "final summary"
+                                            "text": "done summary"
                                         }
                                     })
                                     .to_string(),
@@ -1530,7 +1530,7 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                                         "id": "rs_mock",
                                         "summary": [{
                                             "type": "summary_text",
-                                            "text": "final summary"
+                                            "text": "item summary"
                                         }],
                                         "content": [],
                                         "encrypted_content": "mock_sig",
@@ -1555,7 +1555,7 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                                             "id": "rs_mock",
                                             "summary": [{
                                                 "type": "summary_text",
-                                                "text": "final summary"
+                                                "text": "terminal summary"
                                             }],
                                             "content": [],
                                             "encrypted_content": "mock_sig",
