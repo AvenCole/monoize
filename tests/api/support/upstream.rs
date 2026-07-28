@@ -1442,6 +1442,135 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                     return Sse::new(stream).into_response();
                 }
                 if body.get("stream_mode").and_then(|v| v.as_str())
+                    == Some("reasoning_summary_done_snapshot")
+                {
+                    let stream = futures_util::stream::iter(vec![
+                        Ok::<_, Infallible>(
+                            Event::default().event("response.output_item.added").data(
+                                json!({
+                                    "type": "response.output_item.added",
+                                    "output_index": 0,
+                                    "item": {
+                                        "type": "reasoning",
+                                        "id": "rs_mock",
+                                        "summary": [],
+                                        "content": [],
+                                        "status": "in_progress"
+                                    }
+                                })
+                                .to_string(),
+                            ),
+                        ),
+                        Ok::<_, Infallible>(
+                            Event::default()
+                                .event("response.reasoning_summary_part.added")
+                                .data(
+                                    json!({
+                                        "type": "response.reasoning_summary_part.added",
+                                        "output_index": 0,
+                                        "item_id": "rs_mock",
+                                        "summary_index": 0,
+                                        "part": { "type": "summary_text", "text": "" }
+                                    })
+                                    .to_string(),
+                                ),
+                        ),
+                        Ok::<_, Infallible>(
+                            Event::default()
+                                .event("response.reasoning_summary_text.delta")
+                                .data(
+                                    json!({
+                                        "type": "response.reasoning_summary_text.delta",
+                                        "output_index": 0,
+                                        "item_id": "rs_mock",
+                                        "summary_index": 0,
+                                        "delta": "provisional summary"
+                                    })
+                                    .to_string(),
+                                ),
+                        ),
+                        Ok::<_, Infallible>(
+                            Event::default()
+                                .event("response.reasoning_summary_text.done")
+                                .data(
+                                    json!({
+                                        "type": "response.reasoning_summary_text.done",
+                                        "output_index": 0,
+                                        "item_id": "rs_mock",
+                                        "summary_index": 0,
+                                        "text": "final summary"
+                                    })
+                                    .to_string(),
+                                ),
+                        ),
+                        Ok::<_, Infallible>(
+                            Event::default()
+                                .event("response.reasoning_summary_part.done")
+                                .data(
+                                    json!({
+                                        "type": "response.reasoning_summary_part.done",
+                                        "output_index": 0,
+                                        "item_id": "rs_mock",
+                                        "summary_index": 0,
+                                        "part": {
+                                            "type": "summary_text",
+                                            "text": "final summary"
+                                        }
+                                    })
+                                    .to_string(),
+                                ),
+                        ),
+                        Ok::<_, Infallible>(
+                            Event::default().event("response.output_item.done").data(
+                                json!({
+                                    "type": "response.output_item.done",
+                                    "output_index": 0,
+                                    "item": {
+                                        "type": "reasoning",
+                                        "id": "rs_mock",
+                                        "summary": [{
+                                            "type": "summary_text",
+                                            "text": "final summary"
+                                        }],
+                                        "content": [],
+                                        "encrypted_content": "mock_sig",
+                                        "status": "completed"
+                                    }
+                                })
+                                .to_string(),
+                            ),
+                        ),
+                        Ok::<_, Infallible>(
+                            Event::default().event("response.completed").data(
+                                json!({
+                                    "type": "response.completed",
+                                    "response": {
+                                        "id": "resp_mock",
+                                        "object": "response",
+                                        "created_at": 0,
+                                        "model": model,
+                                        "status": "completed",
+                                        "output": [{
+                                            "type": "reasoning",
+                                            "id": "rs_mock",
+                                            "summary": [{
+                                                "type": "summary_text",
+                                                "text": "final summary"
+                                            }],
+                                            "content": [],
+                                            "encrypted_content": "mock_sig",
+                                            "status": "completed"
+                                        }]
+                                    }
+                                })
+                                .to_string(),
+                            ),
+                        ),
+                        Ok::<_, Infallible>(Event::default().data("[DONE]")),
+                    ]);
+                    return Sse::new(stream).into_response();
+                }
+                if body.get("stream_mode").and_then(|v| v.as_str())
                     == Some("reasoning_completed_conflict")
                 {
                     let stream = futures_util::stream::iter(vec![

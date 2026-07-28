@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_done_snapshot_does_not_overwrite_summary_delta() {
+    fn reasoning_added_snapshot_does_not_overwrite_summary_delta() {
         let mut slot = AccumulatedReasoningSlot::default();
         append_reasoning_summary_delta(&mut slot, Some(0), "streamed summary");
         merge_reasoning_item_snapshot(
@@ -342,6 +342,29 @@ mod tests {
         );
 
         assert_eq!(slot.summary_text().as_deref(), Some("streamed summary"));
+    }
+
+    #[test]
+    fn reasoning_done_snapshots_replace_delta_accumulation() {
+        let mut slot = AccumulatedReasoningSlot::default();
+        append_reasoning_summary_delta(&mut slot, Some(0), "provisional summary");
+        complete_reasoning_summary(&mut slot, Some(0), "done summary");
+        assert_eq!(slot.summary_text().as_deref(), Some("done summary"));
+
+        merge_reasoning_item_snapshot(
+            &mut slot,
+            &json!({
+                "type": "reasoning",
+                "summary": [{
+                    "type": "summary_text",
+                    "text": "item summary"
+                }]
+            }),
+            true,
+        );
+
+        assert!(slot.summary_parts.is_empty());
+        assert_eq!(slot.summary_text().as_deref(), Some("item summary"));
     }
 
     #[test]

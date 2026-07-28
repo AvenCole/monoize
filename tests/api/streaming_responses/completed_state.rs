@@ -157,6 +157,67 @@ async fn responses_streaming_completed_snapshot_merges_reasoning_slot_once() {
 }
 
 #[tokio::test]
+async fn responses_streaming_reasoning_done_snapshot_reconciles_completed_summary() {
+    let ctx = setup().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, ctx.auth_header.clone())
+        .body(Body::from(
+            json!({
+                "model":"gpt-5-mini",
+                "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"summary correction"}]}],
+                "tools":[{ "type":"function","name":"tool_a","parameters":{ "type":"object","additionalProperties":true }}],
+                "stream": true,
+                "stream_mode": "reasoning_summary_done_snapshot"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = ctx.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let frames = parse_responses_sse_json(&text);
+
+    assert!(
+        !frames.iter().any(|(event, _)| event == "response.failed"),
+        "full reasoning done snapshots must reconcile before terminal comparison: {text}"
+    );
+    let summary_done = frames
+        .iter()
+        .find(|(event, _)| event == "response.reasoning_summary_text.done")
+        .map(|(_, payload)| payload)
+        .unwrap_or_else(|| panic!("missing summary done event: {text}"));
+    assert_eq!(summary_done["text"], json!("final summary"));
+
+    let reasoning_done = frames
+        .iter()
+        .find(|(event, payload)| {
+            event == "response.output_item.done"
+                && payload["item"]["type"].as_str() == Some("reasoning")
+        })
+        .map(|(_, payload)| &payload["item"])
+        .unwrap_or_else(|| panic!("missing reasoning output item: {text}"));
+    assert_eq!(
+        reasoning_done["summary"],
+        json!([{ "type": "summary_text", "text": "final summary" }])
+    );
+
+    let completed = frames
+        .iter()
+        .find(|(event, _)| event == "response.completed")
+        .map(|(_, payload)| payload)
+        .unwrap_or_else(|| panic!("missing response.completed: {text}"));
+    assert_eq!(
+        completed["response"]["output"][0]["summary"],
+        json!([{ "type": "summary_text", "text": "final summary" }])
+    );
+    assert!(text.trim_end().ends_with("data: [DONE]"));
+}
+
+#[tokio::test]
 async fn responses_streaming_completed_snapshot_conflict_fails_stream() {
     let ctx = setup().await;
     let req = Request::builder()

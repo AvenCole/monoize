@@ -462,7 +462,7 @@ pub(crate) async fn stream_responses_to_urp_events(
             } else if item.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
                 if let Some(idx) = data_val.get("output_index").and_then(|v| v.as_u64()) {
                     let slot = reasoning_slot_for_item(&mut reasoning_by_output_index, idx, item);
-                    merge_reasoning_item_snapshot(slot, item, false);
+                    merge_reasoning_item_snapshot(slot, item, true);
                 }
             } else if item.get("type").and_then(|v| v.as_str()) == Some("message")
                 && !saw_text_delta

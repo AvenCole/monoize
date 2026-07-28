@@ -129,11 +129,9 @@ fn complete_reasoning_summary(
         return;
     }
     if let Some(summary_index) = summary_index {
-        let part = slot.summary_parts.entry(summary_index).or_default();
-        if part.is_empty() {
-            *part = summary.to_string();
-        }
-    } else if slot.summary.is_empty() {
+        slot.summary_parts
+            .insert(summary_index, summary.to_string());
+    } else {
         slot.summary = summary.to_string();
     }
 }
@@ -147,10 +145,13 @@ fn merge_reasoning_item_snapshot(
     if !text.is_empty() && (overwrite_terminal_fields || slot.content.is_empty()) {
         slot.content = text;
     }
-    if !summary.is_empty()
-        && (overwrite_terminal_fields || (slot.summary.is_empty() && slot.summary_parts.is_empty()))
-    {
-        slot.summary = summary;
+    if !summary.is_empty() {
+        if overwrite_terminal_fields {
+            slot.summary_parts.clear();
+            slot.summary = summary;
+        } else if slot.summary.is_empty() && slot.summary_parts.is_empty() {
+            slot.summary = summary;
+        }
     }
     if !encrypted.is_empty() && (overwrite_terminal_fields || slot.encrypted.is_none()) {
         slot.encrypted = Some(Value::String(encrypted));
