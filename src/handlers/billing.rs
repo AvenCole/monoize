@@ -827,6 +827,10 @@ fn add_modality_token_lines(
             None,
         );
     }
+    // Zero tokens need no modality breakdown — charge is 0 regardless of rates.
+    if fallback_quantity == 0 && breakdown.is_none() {
+        return Ok(0);
+    }
     let Some(breakdown) = breakdown else {
         return Err(format!(
             "modality-specific rate for {} requires usage modality breakdown",
