@@ -37,7 +37,10 @@ fn decode_anthropic_thinking_block(bobj: &Map<String, Value>) -> Option<Node> {
         None => (None, None),
     };
     let mut extra_body = split_extra(bobj, &["type", "thinking", "signature"]);
-    if thinking.is_some() && id.is_none() {
+    // Mark as downstream-only when we have a summary but no encrypted content to pass back.
+    // When signature IS present (even without mz sigil), it's encrypted reasoning that can
+    // be round-tripped — not a mere presentation artifact.
+    if thinking.is_some() && id.is_none() && encrypted.is_none() {
         extra_body.insert(
             REASONING_DOWNSTREAM_ONLY_PRESENTATION_EXTRA_KEY.to_string(),
             Value::Bool(true),
@@ -1399,6 +1402,66 @@ mod tests {
         assert_eq!(
             responses["input"][0]["encrypted_content"],
             json!("sig_replay")
+        );
+
+        // Case 3: thinking + raw signature (no mz sigil) — native Anthropic encrypted reasoning.
+        // The signature IS the encrypted full reasoning; it must NOT be downstream-only.
+        let native_encrypted = decode_request(&json!({
+            "model": "claude-sonnet-5",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "summarized reasoning",
+                    "signature": "WaUjzkypQ2mUEVM36O2TxuBase64EncryptedReasoning"
+                }]
+            }]
+        }))
+        .expect("messages native encrypted reasoning decodes");
+        let Node::Reasoning {
+            id,
+            encrypted,
+            summary,
+            extra_body,
+            ..
+        } = &native_encrypted.input[0]
+        else {
+            panic!("expected reasoning node");
+        };
+        assert!(id.is_none());
+        assert_eq!(summary.as_deref(), Some("summarized reasoning"));
+        assert_eq!(
+            encrypted.as_ref().and_then(Value::as_str),
+            Some("WaUjzkypQ2mUEVM36O2TxuBase64EncryptedReasoning")
+        );
+        assert!(
+            !extra_body.contains_key(REASONING_DOWNSTREAM_ONLY_PRESENTATION_EXTRA_KEY),
+            "native signature must not be downstream-only"
+        );
+
+        // Verify it encodes to Responses with encrypted_content on the response path
+        let resp = UrpResponse {
+            id: "msg_test".to_string(),
+            model: "claude-sonnet-5".to_string(),
+            created_at: None,
+            output: native_encrypted.input.clone(),
+            finish_reason: Some(crate::urp::FinishReason::Stop),
+            usage: None,
+            extra_body: std::collections::HashMap::new(),
+        };
+        let responses_resp =
+            crate::urp::encode::openai_responses::encode_response(&resp, "claude-sonnet-5");
+        let reasoning_item = responses_resp["output"]
+            .as_array()
+            .and_then(|arr| arr.iter().find(|item| item["type"] == "reasoning"));
+        assert!(
+            reasoning_item.is_some(),
+            "reasoning item must appear in Responses output"
+        );
+        assert_eq!(
+            reasoning_item.unwrap()["encrypted_content"],
+            json!("WaUjzkypQ2mUEVM36O2TxuBase64EncryptedReasoning"),
+            "native signature must surface as encrypted_content"
         );
     }
 
