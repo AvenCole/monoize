@@ -979,6 +979,8 @@ PM2b. For downstream `POST /v1/messages` request parsing, Monoize MUST decode or
 - `source: { type: "url", url: <url> }` -> `ImageSource::Url`;
 - `source: { type: "file", file_id: <file id> }` -> `ImageSource::FileId`.
 
+PM2b.1. When encoding an image for an upstream Anthropic Messages request, Monoize MUST normalize an `ImageSource::Url` value of the exact form `data:<image media type>;base64,<non-empty raw base64>` to `source: { type: "base64", media_type: <image media type>, data: <raw base64> }`. Every other `ImageSource::Url` value MUST encode as `source: { type: "url", url: <url> }`.
+
 PM2c. For downstream `POST /v1/messages` request parsing, Monoize MUST decode ordinary `messages[].content[]` blocks with `type = "document"` or `type = "file"` into role-bearing URP `File` nodes when a supported file source is present.
 
 PM2c.1. The Messages adapter MUST decode and encode the following document source shapes:

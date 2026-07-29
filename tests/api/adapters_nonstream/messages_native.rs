@@ -420,6 +420,47 @@ async fn messages_request_forwards_ordinary_url_image_to_messages_upstream() {
 }
 
 #[tokio::test]
+async fn responses_data_url_image_becomes_base64_for_messages_upstream() {
+    let ctx = setup().await;
+    let data = base64::engine::general_purpose::STANDARD.encode(b"tiny-image");
+    let image_url = format!("data:image/png;base64,{data}");
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5-mini-msg",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "describe" },
+                    { "type": "input_image", "image_url": image_url }
+                ]
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let upstream = last_captured_body(&ctx, "messages");
+    let content = upstream["messages"][0]["content"]
+        .as_array()
+        .expect("message content array");
+    assert_eq!(content[0], json!({ "type": "text", "text": "describe" }));
+    assert_eq!(
+        content[1],
+        json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": data
+            }
+        })
+    );
+}
+
+#[tokio::test]
 async fn messages_file_id_sources_forward_with_files_beta_header() {
     let ctx = setup().await;
     let (status, _) = json_post(

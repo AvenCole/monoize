@@ -137,10 +137,18 @@ fn encode_anthropic_image(
     extra_body: &HashMap<String, Value>,
 ) -> Option<Value> {
     match source {
-        ImageSource::Url { url, .. } => Some(json!({
-            "type": "image",
-            "source": { "type": "url", "url": url }
-        })),
+        ImageSource::Url { url, .. } => {
+            if let Some((media_type, data)) = split_base64_image_data_url(url) {
+                return Some(json!({
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": media_type, "data": data }
+                }));
+            }
+            Some(json!({
+                "type": "image",
+                "source": { "type": "url", "url": url }
+            }))
+        }
         ImageSource::Base64 { media_type, data } => Some(json!({
             "type": "image",
             "source": { "type": "base64", "media_type": media_type, "data": data }
@@ -155,6 +163,16 @@ fn encode_anthropic_image(
         }
         ImageSource::FileId { .. } => None,
     }
+}
+
+fn split_base64_image_data_url(url: &str) -> Option<(&str, &str)> {
+    let payload = url.strip_prefix("data:")?;
+    let (metadata, data) = payload.split_once(',')?;
+    let media_type = metadata.strip_suffix(";base64")?;
+    if !media_type.starts_with("image/") || media_type.len() == "image/".len() || data.is_empty() {
+        return None;
+    }
+    Some((media_type, data))
 }
 
 fn encode_anthropic_file(
