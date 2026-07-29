@@ -28,6 +28,7 @@ async fn models_list_returns_union_sorted_and_unique() {
 
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["object"], "list");
+    assert_eq!(v["models"], json!([]));
     let data = v["data"].as_array().expect("data should be an array");
 
     let ids: Vec<String> = data
@@ -63,6 +64,46 @@ async fn models_list_api_alias_works() {
     assert_eq!(status, StatusCode::OK);
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["object"], "list");
+    assert_eq!(v["models"], json!([]));
+}
+
+#[tokio::test]
+async fn models_list_includes_only_configured_available_codex_models() {
+    let ctx = setup().await;
+    let mut settings = ctx
+        .state
+        .settings_store
+        .get_all()
+        .await
+        .expect("settings load");
+    settings.codex_model_ids = vec![
+        "grok-4".to_string(),
+        "missing-model".to_string(),
+        "gpt-5-mini".to_string(),
+    ];
+    ctx.state
+        .settings_store
+        .update_all(&settings)
+        .await
+        .expect("settings update");
+
+    let (status, body) = json_get(&ctx, "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let response: Value = serde_json::from_str(&body).unwrap();
+    let models = response["models"]
+        .as_array()
+        .expect("models should be an array");
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0]["slug"], "grok-4");
+    assert_eq!(models[0]["display_name"], "grok-4");
+    assert_eq!(models[0]["priority"], 0);
+    assert_eq!(models[0]["visibility"], "list");
+    assert_eq!(models[0]["shell_type"], "default");
+    assert_eq!(models[0]["truncation_policy"]["mode"], "bytes");
+    assert_eq!(models[0]["truncation_policy"]["limit"], 10_000);
+    assert_eq!(models[1]["slug"], "gpt-5-mini");
+    assert_eq!(models[1]["priority"], 1);
 }
 
 #[tokio::test]
@@ -393,6 +434,22 @@ async fn provider_api_type_override_matches_logical_model_before_provider_redire
 #[tokio::test]
 async fn models_list_respects_api_key_model_limits() {
     let ctx = setup().await;
+    let mut settings = ctx
+        .state
+        .settings_store
+        .get_all()
+        .await
+        .expect("settings load");
+    settings.codex_model_ids = vec![
+        "gemini-2.5-flash".to_string(),
+        "grok-4".to_string(),
+        "gpt-5-mini".to_string(),
+    ];
+    ctx.state
+        .settings_store
+        .update_all(&settings)
+        .await
+        .expect("settings update");
 
     let (status, body) = json_get(&ctx, "/v1/models").await;
     assert_eq!(status, StatusCode::OK);
@@ -453,8 +510,15 @@ async fn models_list_respects_api_key_model_limits() {
         .iter()
         .map(|item| item["id"].as_str().unwrap().to_string())
         .collect();
+    let restricted_codex_ids: Vec<String> = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["slug"].as_str().unwrap().to_string())
+        .collect();
 
     assert_eq!(restricted_ids, vec!["gpt-5-mini", "grok-4"]);
+    assert_eq!(restricted_codex_ids, vec!["grok-4", "gpt-5-mini"]);
 }
 
 #[tokio::test]

@@ -1466,6 +1466,14 @@ DMO3. The response body MUST be JSON with the shape:
 ```json
 {
   "object": "list",
+  "models": [
+    {
+      "slug": "<selected_logical_model>",
+      "display_name": "<selected_logical_model>",
+      "visibility": "list",
+      "supported_in_api": true
+    }
+  ],
   "data": [
     {
       "id": "<logical_model>",
@@ -1476,6 +1484,35 @@ DMO3. The response body MUST be JSON with the shape:
   ]
 }
 ```
+
+DMO3a. System setting `codex_model_ids` MUST be an ordered array of logical model IDs. A missing or invalid stored value MUST resolve to `[]`. Before persistence, Monoize MUST trim every value, remove empty values, and remove duplicate values while preserving the first occurrence.
+
+DMO3b. `models` MUST contain one Codex model descriptor for every `codex_model_ids` value that is also present in the response's post-authentication `data` array. Descriptor order MUST equal setting order. A configured ID that is absent from `data` MUST be omitted. An empty setting MUST produce `"models": []`.
+
+DMO3c. Each Codex model descriptor MUST use the following values:
+
+- `slug` and `display_name`: the selected logical model ID.
+- `description`: `"Routed by Monoize."`.
+- `default_reasoning_level`: `null`.
+- `supported_reasoning_levels`: `[]`.
+- `shell_type`: `"default"`.
+- `visibility`: `"list"`.
+- `supported_in_api`: `true`.
+- `priority`: the zero-based index in the emitted `models` array.
+- `additional_speed_tiers` and `service_tiers`: `[]`.
+- `default_service_tier`, `availability_nux`, `upgrade`, `model_messages`, `default_verbosity`, `apply_patch_tool_type`, `auto_compact_token_limit`, `comp_hash`, `auto_review_model_override`, `tool_mode`, and `multi_agent_version`: `null`.
+- `base_instructions`: `"You are Codex, a coding agent. Follow the user's instructions and repository guidance. Inspect the workspace before editing, preserve unrelated changes, make scoped changes, and verify completed work with the tools provided by the client."`.
+- `include_skills_usage_instructions`: `false`.
+- `supports_reasoning_summary_parameter`: `true`.
+- `default_reasoning_summary`: `"auto"`.
+- `support_verbosity`: `false`.
+- `web_search_tool_type`: `"text"`.
+- `truncation_policy`: `{ "mode": "bytes", "limit": 10000 }`.
+- `supports_parallel_tool_calls`, `supports_image_detail_original`, `supports_search_tool`, and `use_responses_lite`: `false`.
+- `context_window` and `max_context_window`: `272000`.
+- `effective_context_window_percent`: `95`.
+- `experimental_supported_tools`: `[]`.
+- `input_modalities`: `["text", "image"]`.
 
 DMO4. `data` MUST contain only logical model keys for which at least one enabled Provider has at least one Channel where `enabled == true`, `weight > 0`, and `models` contains the logical model.
 

@@ -93,6 +93,56 @@ fn messages_stream_keep_alive() -> KeepAlive {
         .event(Event::default().event("ping").data(r#"{"type":"ping"}"#))
 }
 
+const CODEX_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Follow the user's instructions and repository guidance. Inspect the workspace before editing, preserve unrelated changes, make scoped changes, and verify completed work with the tools provided by the client.";
+
+fn codex_model_descriptor(model_id: &str, priority: usize) -> Value {
+    // These conservative values match Codex's unknown-model fallback rather than claiming
+    // provider-specific capabilities that Monoize cannot prove from a logical model ID.
+    json!({
+        "slug": model_id,
+        "display_name": model_id,
+        "description": "Routed by Monoize.",
+        "default_reasoning_level": null,
+        "supported_reasoning_levels": [],
+        "shell_type": "default",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": priority,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "default_service_tier": null,
+        "availability_nux": null,
+        "upgrade": null,
+        "base_instructions": CODEX_BASE_INSTRUCTIONS,
+        "model_messages": null,
+        "include_skills_usage_instructions": false,
+        "supports_reasoning_summary_parameter": true,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": false,
+        "default_verbosity": null,
+        "apply_patch_tool_type": null,
+        "web_search_tool_type": "text",
+        "truncation_policy": {
+            "mode": "bytes",
+            "limit": 10_000
+        },
+        "supports_parallel_tool_calls": false,
+        "supports_image_detail_original": false,
+        "context_window": 272_000,
+        "max_context_window": 272_000,
+        "auto_compact_token_limit": null,
+        "comp_hash": null,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": false,
+        "use_responses_lite": false,
+        "auto_review_model_override": null,
+        "tool_mode": null,
+        "multi_agent_version": null
+    })
+}
+
 pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
     let auth = auth_tenant(&headers, &state).await?;
     let providers =
@@ -115,6 +165,19 @@ pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> A
         model_ids.retain(|id| allowed.contains(id.as_str()));
     }
 
+    let settings =
+        state.settings_store.get_all().await.map_err(|e| {
+            AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "settings_store_error", e)
+        })?;
+    let visible_model_ids: HashSet<&str> = model_ids.iter().map(String::as_str).collect();
+    let codex_models: Vec<Value> = settings
+        .codex_model_ids
+        .iter()
+        .filter(|model_id| visible_model_ids.contains(model_id.as_str()))
+        .enumerate()
+        .map(|(priority, model_id)| codex_model_descriptor(model_id, priority))
+        .collect();
+
     let data: Vec<Value> = model_ids
         .into_iter()
         .map(|id| {
@@ -127,7 +190,12 @@ pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> A
         })
         .collect();
 
-    Ok(Json(json!({ "object": "list", "data": data })).into_response())
+    Ok(Json(json!({
+        "object": "list",
+        "data": data,
+        "models": codex_models
+    }))
+    .into_response())
 }
 
 pub async fn create_response(

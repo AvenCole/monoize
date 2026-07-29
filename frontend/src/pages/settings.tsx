@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Plus, Save, Settings2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -15,7 +15,12 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { useSettings, updateSettingsOptimistic, useTransformRegistry } from "@/lib/swr";
+import {
+  useProviders,
+  useSettings,
+  updateSettingsOptimistic,
+  useTransformRegistry,
+} from "@/lib/swr";
 import type { SystemSettings } from "@/lib/api";
 import { PageWrapper, motion, transitions, StaggerList, StaggerItem } from "@/components/ui/motion";
 import { PageHeader } from "@/components/ui/page-header";
@@ -23,6 +28,7 @@ import { TablePageSkeleton } from "@/components/ui/page-skeleton";
 import { TransformChainEditor } from "@/components/transforms/transform-chain-editor";
 import { findFirstInvalidTransformRule } from "@/components/transforms/transform-schema";
 import { toast } from "sonner";
+import { CodexModelSelector } from "@/components/settings/codex-model-selector";
 
 const EFFORT_VALUES = ["none", "minimum", "low", "medium", "high", "xhigh", "max"] as const;
 
@@ -140,6 +146,12 @@ function SuffixMapEditor({
 export function SettingsPage() {
   const { t } = useTranslation();
   const { data: settings, isLoading, mutate } = useSettings();
+  const {
+    data: providers,
+    error: providersError,
+    isLoading: providersLoading,
+    mutate: mutateProviders,
+  } = useProviders();
   const { data: transformRegistry = [] } = useTransformRegistry();
   const [localSettings, setLocalSettings] = useState<SystemSettings | null>(null);
   const [saving, setSaving] = useState(false);
@@ -150,6 +162,19 @@ export function SettingsPage() {
   const globalTransformRegistry = transformRegistry.filter((item) =>
     item.supported_scopes.includes("global")
   );
+  const availableCodexModelIds = useMemo(() => {
+    const modelIds = new Set<string>();
+    for (const provider of providers ?? []) {
+      if (!provider.enabled) continue;
+      for (const channel of provider.channels) {
+        if (!channel.enabled || channel.weight <= 0) continue;
+        for (const modelId of Object.keys(channel.models)) {
+          modelIds.add(modelId);
+        }
+      }
+    }
+    return Array.from(modelIds).sort();
+  }, [providers]);
 
   const handleChange = (updates: Partial<SystemSettings>) => {
     if (!currentSettings) return;
@@ -220,7 +245,7 @@ export function SettingsPage() {
         </motion.div>)} />
       </motion.div>
 
-      <StaggerList className="grid gap-6">
+      <StaggerList className="grid min-w-0 gap-6 [&>*]:min-w-0">
         <StaggerItem>
           <Card>
             <CardHeader>
@@ -259,6 +284,25 @@ export function SettingsPage() {
                   {t("settings.apiBaseUrlDescription")}
                 </p>
               </div>
+            </CardContent>
+          </Card>
+        </StaggerItem>
+
+        <StaggerItem>
+          <Card>
+            <CardHeader>
+              <CardTitle>{t("settings.codexModels")}</CardTitle>
+              <CardDescription>{t("settings.codexModelsDescription")}</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <CodexModelSelector
+                availableModelIds={availableCodexModelIds}
+                selectedModelIds={currentSettings.codex_model_ids ?? []}
+                isLoading={providersLoading}
+                loadError={providersError}
+                onRetry={() => void mutateProviders()}
+                onChange={(codex_model_ids) => handleChange({ codex_model_ids })}
+              />
             </CardContent>
           </Card>
         </StaggerItem>

@@ -82,6 +82,8 @@ PL8. Each provider transform chain MUST support:
 - per-item enabled toggle
 - per-item config button that opens a config dialog
 
+PL8a. At viewport widths below `640px`, each transform chain header MUST stack its title and add controls vertically. The transform selector MUST shrink to the available width, and the add action MUST remain visible without creating horizontal overflow.
+
 PL9. Provider transform config dialog MUST:
 
 - edit `models` glob filters as string list (`*` and `?` supported)
@@ -276,6 +278,18 @@ ST3. Settings UI MUST perform optimistic update and persist via existing setting
 ST4. `/dashboard/admin-settings` MUST include a global transform editor bound to `GET/PUT /api/dashboard/settings` field `global_transforms`.
 
 ST5. The global transform editor MUST follow the same interaction contract as PL7, PL8, PL9, and PL10, but its option list MUST be filtered to transforms whose registry metadata includes `global` in `supported_scopes`.
+
+ST6. `/dashboard/admin-settings` MUST include a "Codex Model Picker" card bound to `GET/PUT /api/dashboard/settings` field `codex_model_ids`.
+
+ST6a. The card MUST load Provider data through the existing SWR Provider hook. Its available model set MUST be the sorted union of Channel model keys where the Provider is enabled, the Channel is enabled, and Channel weight is greater than zero.
+
+ST6b. The card MUST provide a text search input and one controlled checkbox for each matching model. Changing a checkbox MUST update the local optimistic settings draft. The existing settings save action MUST persist the resulting ordered array. The card MUST NOT provide a bulk "select all" action.
+
+ST6c. A configured model absent from the available model set MUST remain visible and removable with an unavailable label. Provider loading MUST render skeleton rows. Provider failure MUST render an error state with a retry action. Search with no matches MUST render an explicit empty state.
+
+ST6d. The card MUST state that standard OpenAI `data` continues to include every available model and that `codex_model_ids` controls only the extended Codex `models` catalog.
+
+ST6e. At viewport widths below `640px`, the settings card grid and each direct card wrapper MUST shrink to the available content width without creating horizontal page overflow.
 
 PG-L1. `/playground` page MUST be accessible from the main navigation sidebar (below Token Management).
 

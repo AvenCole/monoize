@@ -1131,6 +1131,7 @@ async fn settings_store_round_trips_global_transforms() {
     let store = SettingsStore::new(db).await.expect("store creates");
     let mut settings = store.get_all().await.expect("settings load");
     assert!(settings.global_transforms.is_empty());
+    assert!(settings.codex_model_ids.is_empty());
     assert!(!settings.monoize_request_capture_enabled);
     assert_eq!(settings.monoize_request_capture_retention_days, 1);
     assert!(settings.monoize_affinity_enabled);
@@ -1148,6 +1149,12 @@ async fn settings_store_round_trips_global_transforms() {
         phase: Phase::Request,
         config: json!({}),
     }];
+    settings.codex_model_ids = vec![
+        " gpt-5.6-sol ".to_string(),
+        "claude-opus-4.8".to_string(),
+        "gpt-5.6-sol".to_string(),
+        String::new(),
+    ];
     settings.monoize_strip_cross_protocol_nested_extra = false;
     settings.monoize_request_capture_enabled = true;
     settings.monoize_request_capture_retention_days = 0;
@@ -1164,6 +1171,10 @@ async fn settings_store_round_trips_global_transforms() {
         "strip_anthropic_billing_header"
     );
     assert_eq!(updated.global_transforms[0].phase, Phase::Request);
+    assert_eq!(
+        updated.codex_model_ids,
+        vec!["gpt-5.6-sol", "claude-opus-4.8"]
+    );
     assert!(!updated.monoize_strip_cross_protocol_nested_extra);
     assert!(updated.monoize_request_capture_enabled);
     assert_eq!(updated.monoize_request_capture_retention_days, 1);

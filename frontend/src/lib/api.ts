@@ -111,6 +111,7 @@ export interface SystemSettings {
   api_base_url: string;
   global_transforms: TransformRuleConfig[];
   reasoning_suffix_map: Record<string, string>;
+  codex_model_ids: string[];
   monoize_active_probe_enabled: boolean;
   monoize_active_probe_interval_seconds: number;
   monoize_active_probe_success_threshold: number;

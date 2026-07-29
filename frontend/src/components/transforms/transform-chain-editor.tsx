@@ -138,15 +138,15 @@ function PhaseChainSection({
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-2">
           <PhaseIcon className="h-4 w-4 text-muted-foreground" />
           <h3 className="text-sm font-medium">{title}</h3>
           <Badge variant="secondary" className="text-xs">{rules.length}</Badge>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           <Select value={selectedAddType} onValueChange={setAddType} disabled={available.length === 0}>
-            <SelectTrigger className="h-8 w-[220px]">
+            <SelectTrigger className="h-8 min-w-0 flex-1 sm:w-[220px] sm:flex-none">
               <SelectValue placeholder={t("transforms.selectTransform")} />
             </SelectTrigger>
             <SelectContent>

@@ -23,6 +23,7 @@ pub struct UpdateSettingsRequest {
     pub api_base_url: Option<String>,
     pub global_transforms: Option<Vec<TransformRuleConfig>>,
     pub reasoning_suffix_map: Option<std::collections::HashMap<String, String>>,
+    pub codex_model_ids: Option<Vec<String>>,
     pub monoize_active_probe_enabled: Option<bool>,
     pub monoize_active_probe_interval_seconds: Option<u64>,
     pub monoize_active_probe_success_threshold: Option<u32>,
@@ -109,6 +110,9 @@ pub async fn update_settings(
     }
     if let Some(v) = body.reasoning_suffix_map {
         settings.reasoning_suffix_map = v;
+    }
+    if let Some(v) = body.codex_model_ids {
+        settings.codex_model_ids = v;
     }
     if let Some(v) = body.monoize_active_probe_enabled {
         settings.monoize_active_probe_enabled = v;

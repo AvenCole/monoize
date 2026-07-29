@@ -5,7 +5,7 @@ use crate::transforms::{TransformRuleConfig, canonicalize_transform_rules};
 use chrono::{DateTime, Utc};
 use sea_orm::{EntityTrait, Set, sea_query::OnConflict};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PricingProfilePattern {
@@ -25,6 +25,8 @@ pub struct SystemSettings {
     #[serde(default)]
     pub global_transforms: Vec<TransformRuleConfig>,
     pub reasoning_suffix_map: HashMap<String, String>,
+    #[serde(default)]
+    pub codex_model_ids: Vec<String>,
     #[serde(default = "default_pricing_profile_model_patterns")]
     pub pricing_profile_model_patterns: Vec<PricingProfilePattern>,
     pub monoize_active_probe_enabled: bool,
@@ -62,6 +64,18 @@ pub const BUILTIN_REASONING_EFFORT_SUFFIXES: &[(&str, &str)] = &[
     ("-xhigh", "xhigh"),
     ("-max", "max"),
 ];
+
+pub fn canonicalize_codex_model_ids(model_ids: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    model_ids.retain_mut(|model_id| {
+        let trimmed = model_id.trim().to_string();
+        if trimmed.is_empty() || !seen.insert(trimmed.clone()) {
+            return false;
+        }
+        *model_id = trimmed;
+        true
+    });
+}
 
 pub fn normalize_pricing_model_key(
     model_id: &str,
@@ -153,6 +167,7 @@ impl Default for SystemSettings {
             api_base_url: String::new(),
             global_transforms: Vec::new(),
             reasoning_suffix_map: default_reasoning_suffix_map(),
+            codex_model_ids: Vec::new(),
             pricing_profile_model_patterns: default_pricing_profile_model_patterns(),
             monoize_active_probe_enabled: true,
             monoize_active_probe_interval_seconds: 30,
@@ -478,6 +493,12 @@ impl SettingsStore {
                         settings.reasoning_suffix_map = map;
                     }
                 }
+                "codex_model_ids" => {
+                    if let Ok(mut model_ids) = serde_json::from_str::<Vec<String>>(&row.value) {
+                        canonicalize_codex_model_ids(&mut model_ids);
+                        settings.codex_model_ids = model_ids;
+                    }
+                }
                 "pricing_profile_model_patterns" => {
                     if let Ok(patterns) = serde_json::from_str(&row.value) {
                         settings.pricing_profile_model_patterns = patterns;
@@ -573,6 +594,7 @@ impl SettingsStore {
     pub async fn update_all(&self, settings: &SystemSettings) -> Result<(), String> {
         let mut settings = settings.clone();
         canonicalize_transform_rules(&mut settings.global_transforms);
+        canonicalize_codex_model_ids(&mut settings.codex_model_ids);
         self.set(
             "registration_enabled",
             &settings.registration_enabled.to_string(),
@@ -601,6 +623,11 @@ impl SettingsStore {
             "reasoning_suffix_map",
             &serde_json::to_string(&settings.reasoning_suffix_map)
                 .unwrap_or_else(|_| "{}".to_string()),
+        )
+        .await?;
+        self.set(
+            "codex_model_ids",
+            &serde_json::to_string(&settings.codex_model_ids).unwrap_or_else(|_| "[]".to_string()),
         )
         .await?;
         self.set(
