@@ -134,6 +134,7 @@ TM-TF-3. Allowed API-key request-phase transforms are exactly:
 - `strip_anthropic_billing_header`
 - `auto_cache_system`
 - `auto_cache_tool_use`
+- `auto_cache_openai_tool_use`
 - `auto_cache_user_id`
 - `auto_cache_openai_prompt`
 

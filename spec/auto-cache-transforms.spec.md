@@ -2,23 +2,31 @@
 
 ## 0. Status
 
-- Version: `1.1.0`
-- Scope: Four request-phase transforms that automatically optimize provider prompt caching by injecting Anthropic `cache_control` markers, OpenAI prompt-cache request fields, and user identity fields.
+- Version: `1.2.0`
+- Scope: Five request-phase transforms that automatically optimize provider prompt caching by injecting Anthropic `cache_control` markers, OpenAI prompt-cache request fields and content breakpoints, and user identity fields.
 - Dependency: URP Transform System (see `urp-transform-system.spec.md`, TF-1 through TF-6).
 
 ## 1. Shared Definitions
 
-DEF-1. A **cache breakpoint** is any `Node` in `req.input` whose `extra_body` contains a key `"cache_control"`.
+DEF-1. An **Anthropic cache breakpoint** is any `Node` in `req.input` whose `extra_body` contains a key `"cache_control"`.
 
-DEF-2. The **cache breakpoint count** of a request is the total number of cache breakpoints across all nodes in `req.input`.
+DEF-2. The **Anthropic cache breakpoint count** of a request is the total number of Anthropic cache breakpoints across all nodes in `req.input`.
 
-DEF-3. The **max cache breakpoint limit** is `4`. No transform in this specification SHALL increase the cache breakpoint count beyond `4`.
+DEF-3. The **Anthropic max cache breakpoint limit** is `4`. No transform in this specification SHALL increase the Anthropic cache breakpoint count beyond `4`.
 
 DEF-4. The **Monoize username** is the string value of `req.extra_body["__monoize_username"]`, if present and non-null. The **Monoize API key ID** is the string value of `req.extra_body["__monoize_api_key_id"]`, if present and non-null. These fields are injected by the request handler before transforms run and stripped after transforms complete. Transforms MUST NOT assume their presence.
 
 DEF-5. The canonical Anthropic cache control value is `{"type": "ephemeral"}`.
 
 DEF-6. An **OpenAI upstream request** is a request attempt whose selected upstream provider type is `responses` or `chat_completion`.
+
+DEF-7. An **OpenAI explicit cache breakpoint** is an `extra_body` key named `"prompt_cache_breakpoint"` on either a node in `req.input` or a nested `ToolResultContent` value in a `Node::ToolResult`.
+
+DEF-8. The **OpenAI explicit cache breakpoint count** is the total number of OpenAI explicit cache breakpoints defined by DEF-7.
+
+DEF-9. The **OpenAI explicit cache breakpoint limit** is `4` when `req.extra_body["prompt_cache_options"]["mode"]` is the string `"explicit"`. The limit is `3` otherwise because the default implicit breakpoint consumes one of the four new cache-write slots.
+
+DEF-10. An **OpenAI explicit-breakpoint model** is a model whose identifier contains a `/`- or `:`-delimited segment with a `gpt-<major>[.<minor>]` prefix, where `major > 5` or `major = 5` and `minor >= 6`. Missing `minor` is treated as `0`.
 
 ## 2. `auto_cache_user_id`
 
@@ -34,7 +42,7 @@ ACUID-3. Config schema: empty object, no configuration parameters.
 
 ACUID-4. If `req.extra_body["__monoize_username"]` is absent or not a string, the transform is a no-op.
 
-ACUID-5. If no cache breakpoint exists anywhere in `req.input` (i.e., cache breakpoint count = 0), the transform is a no-op.
+ACUID-5. If no Anthropic cache breakpoint exists anywhere in `req.input` (i.e., Anthropic cache breakpoint count = 0), the transform is a no-op.
 
 ### 2.3 Behavior
 
@@ -56,7 +64,7 @@ ACS-3. Config schema: empty object, no configuration parameters.
 
 ### 3.2 Preconditions
 
-ACS-4. If the cache breakpoint count is `>= 4`, the transform is a no-op.
+ACS-4. If the Anthropic cache breakpoint count is `>= 4`, the transform is a no-op.
 
 ACS-5. If `req.input` contains no node with `role == System` or `role == Developer`, the transform is a no-op.
 
@@ -68,7 +76,7 @@ ACS-7. The **target node** is the last node in `req.input` whose role is `System
 
 ACS-8. The transform MUST insert `"cache_control": {"type": "ephemeral"}` into the `extra_body` of the target node.
 
-ACS-9. After insertion, the cache breakpoint count increases by exactly `1`.
+ACS-9. After insertion, the Anthropic cache breakpoint count increases by exactly `1`.
 
 ACS-10. The transform MUST NOT modify any other node, any node content (text, image data, etc.), `req.model`, or `req.user`.
 
@@ -86,7 +94,7 @@ ACTU-3. Config schema: empty object, no configuration parameters.
 
 ACTU-4. Let `last_node` = the last element of `req.input`. If `last_node` is not `Node::ToolResult`, the transform is a no-op. (The request is not a tool-result submission.)
 
-ACTU-5. If the cache breakpoint count is `>= 4`, the transform is a no-op.
+ACTU-5. If the Anthropic cache breakpoint count is `>= 4`, the transform is a no-op.
 
 ### 4.3 Target Resolution
 
@@ -103,7 +111,7 @@ ACTU-8. If `req.input[user_idx]` already contains a `"cache_control"` key in its
 
 ACTU-9. The transform MUST insert `"cache_control": {"type": "ephemeral"}` into the `extra_body` of `req.input[user_idx]`.
 
-ACTU-10. After insertion, the cache breakpoint count increases by exactly `1`.
+ACTU-10. After insertion, the Anthropic cache breakpoint count increases by exactly `1`.
 
 ACTU-11. The transform MUST NOT modify any other node, any node content, `req.model`, or `req.user`.
 
@@ -176,7 +184,60 @@ ACOP-18. The transform is idempotent.
 
 ACOP-19. The transform does not guarantee an OpenAI cache hit. OpenAI prompt caching requires upstream eligibility, a minimum prompt size, and exact prefix compatibility as defined by OpenAI.
 
-## 7. Transform Ordering Guidance
+## 7. `auto_cache_openai_tool_use`
+
+### 7.1 Registration
+
+ACOTU-1. Transform type ID: `"auto_cache_openai_tool_use"`.
+
+ACOTU-2. Phase: `Request` only.
+
+ACOTU-3. Supported scopes are `Provider`, `Global`, and `ApiKey`.
+
+ACOTU-4. Config schema: empty object, no configuration parameters.
+
+### 7.2 Preconditions
+
+ACOTU-5. If the selected upstream provider type is not `responses`, the transform is a no-op.
+
+ACOTU-6. If `req.model` is not an OpenAI explicit-breakpoint model as defined by DEF-10, the transform is a no-op.
+
+ACOTU-7. Let `last_node` be the last element of `req.input`. If `last_node` is not `Node::ToolResult`, the transform is a no-op.
+
+ACOTU-8. If the OpenAI explicit cache breakpoint count is greater than or equal to the limit defined by DEF-9, the transform is a no-op.
+
+### 7.3 Target Resolution
+
+ACOTU-9. Starting from `last_node`, scan backwards through the contiguous trailing `Node::ToolResult` entries. The first node before this trailing run MUST be `Node::ToolCall`. If this condition is not met, the transform is a no-op.
+
+ACOTU-10. A **tool-result run** is a maximal contiguous sequence of one or more `Node::ToolResult` entries whose immediately preceding node is `Node::ToolCall`. Scan all tool-result runs in reverse request order. Within each run, scan its result nodes and their `content` entries in reverse order. The first content entry in each run that satisfies one of the following conditions is that run's candidate content block:
+1. every `ToolResultContent::Text`;
+2. `ToolResultContent::Image` with `ImageSource::Url` or `ImageSource::Base64`;
+3. `ToolResultContent::Image` with `ImageSource::FileId` whose `extra_body["_monoize_file_id_origin"]` equals `"openai"`;
+4. `ToolResultContent::File` with `FileSource::Url` or `FileSource::Base64`; or
+5. `ToolResultContent::File` with `FileSource::FileId` whose `extra_body["_monoize_file_id_origin"]` equals `"openai"`.
+
+`ToolResultContent::File` with `FileSource::Text` or `FileSource::Content` and every `ToolResultContent::ProviderItem` are not eligible. A run with no eligible content block produces no candidate. If no run produces a candidate, the transform is a no-op.
+
+ACOTU-11. Let `remaining` equal the limit defined by DEF-9 minus the current OpenAI explicit cache breakpoint count. Starting with the newest candidate and proceeding towards older candidates, select each candidate whose `extra_body` does not already contain `"prompt_cache_breakpoint"` until `remaining` candidates have been selected. A candidate that already contains the key is preserved and skipped.
+
+### 7.4 Behavior
+
+ACOTU-12. The transform MUST insert `"prompt_cache_breakpoint": {"mode": "explicit"}` into the `extra_body` of every selected candidate content block.
+
+ACOTU-13. After insertion, the OpenAI explicit cache breakpoint count increases by exactly the number of selected candidates and does not exceed the limit defined by DEF-9.
+
+ACOTU-14. The transform MUST NOT set `"prompt_cache_breakpoint"` on the outer `Node::ToolResult.extra_body`.
+
+ACOTU-15. For a Responses request, the encoder MUST emit every selected candidate as an `input_text`, `input_image`, or `input_file` block inside the corresponding `function_call_output.output` or `custom_tool_call_output.output` array. Each emitted content block MUST contain the inserted `"prompt_cache_breakpoint"` value.
+
+ACOTU-16. The transform MUST NOT create or modify `req.extra_body["prompt_cache_options"]`. An existing request-wide mode and TTL MUST remain unchanged.
+
+ACOTU-17. The transform MUST NOT modify any node content, `req.model`, `req.tools`, `req.response_format`, or `req.user`.
+
+ACOTU-18. The transform is idempotent.
+
+## 8. Transform Ordering Guidance
 
 ORD-1. `auto_cache_system` SHOULD be ordered before `auto_cache_tool_use` in the transform rule list, so that system prompt caching takes priority when approaching the 4-breakpoint limit.
 
@@ -184,16 +245,20 @@ ORD-2. `auto_cache_user_id` has no ordering dependency relative to the other tra
 
 ORD-3. The per-attempt cross-protocol strip of nested `extra_body` (see provider setting `strip_cross_protocol_nested_extra`) MUST run BEFORE any request-phase transform (provider, global, and API-key scopes) within the same attempt. This guarantees that `cache_control` markers produced by `auto_cache_system` / `auto_cache_tool_use` on part-level `extra_body` survive into the encoded upstream request, even when the downstream and upstream protocol families differ (e.g. downstream OpenAI Responses → upstream Anthropic Messages).
 
-ORD-4. As a consequence of ORD-3, request-phase transforms may be invoked more than once per request across multiple attempts. Each invocation operates on an independent clone of the originally-decoded URP request, so `auto_cache_*` idempotency (INV-3) is sufficient to keep behavior deterministic; non-idempotent transforms MUST likewise produce the same result when applied once to a fresh clone, which is the only pattern exercised here.
+ORD-4. As a consequence of ORD-3, request-phase transforms may be invoked more than once per request across multiple attempts. Each invocation operates on an independent clone of the originally-decoded URP request, so `auto_cache_*` idempotency (INV-4) is sufficient to keep behavior deterministic; non-idempotent transforms MUST likewise produce the same result when applied once to a fresh clone, which is the only pattern exercised here.
 
 ORD-5. `auto_cache_openai_prompt` SHOULD run after transforms that modify the stable prompt prefix, tool definitions, or response format. This ensures the generated `prompt_cache_key` reflects the upstream request shape after those mutations.
 
 ORD-6. `strip_anthropic_billing_header` SHOULD run before `auto_cache_openai_prompt` when both transforms are enabled. This ensures the generated `prompt_cache_key` and the OpenAI upstream prompt omit Claude Code's per-request billing marker.
 
-## 8. Invariants
+ORD-7. `auto_cache_openai_tool_use` SHOULD run before `auto_cache_openai_prompt` when `auto_cache_openai_prompt.include_full_input_in_key = true`. This ensures the generated key material includes the inserted content breakpoint.
 
-INV-1. No transform in this specification shall produce a request with cache breakpoint count exceeding `4`.
+## 9. Invariants
 
-INV-2. No transform in this specification shall overwrite an existing `cache_control`, `metadata.user_id`, `req.user`, `prompt_cache_key`, or `prompt_cache_retention` value.
+INV-1. No transform in this specification shall produce a request whose Anthropic cache breakpoint count exceeds `4`.
 
-INV-3. All four transforms are idempotent: applying the same transform twice to the same request produces the same result as applying it once.
+INV-2. No transform in this specification shall produce a request whose OpenAI explicit cache breakpoint count exceeds the limit defined by DEF-9.
+
+INV-3. No transform in this specification shall overwrite an existing `cache_control`, `prompt_cache_breakpoint`, `metadata.user_id`, `req.user`, `prompt_cache_key`, or `prompt_cache_retention` value.
+
+INV-4. All five transforms are idempotent: applying the same transform twice to the same request produces the same result as applying it once.

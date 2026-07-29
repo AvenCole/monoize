@@ -11,6 +11,7 @@ pub mod append_empty_user_message;
 pub mod assistant_markdown_images_to_output;
 pub mod assistant_output_images_to_markdown;
 pub mod auto_cache_openai_prompt;
+pub mod auto_cache_openai_tool_use;
 pub mod auto_cache_system;
 pub mod auto_cache_tool_use;
 pub mod auto_cache_user_id;
@@ -203,6 +204,7 @@ fn builtin_transforms() -> Vec<Box<dyn Transform>> {
         Box::new(assistant_markdown_images_to_output::AssistantMarkdownImagesToOutputTransform),
         Box::new(assistant_output_images_to_markdown::AssistantOutputImagesToMarkdownTransform),
         Box::new(auto_cache_openai_prompt::AutoCacheOpenAiPromptTransform),
+        Box::new(auto_cache_openai_tool_use::AutoCacheOpenAiToolUseTransform),
         Box::new(auto_cache_system::AutoCacheSystemTransform),
         Box::new(auto_cache_tool_use::AutoCacheToolUseTransform),
         Box::new(auto_cache_user_id::AutoCacheUserIdTransform),

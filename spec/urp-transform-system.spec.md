@@ -162,6 +162,7 @@ TF-7. Built-ins that MUST exist are:
 - `auto_cache_user_id`
 - `auto_cache_system`
 - `auto_cache_tool_use`
+- `auto_cache_openai_tool_use`
 - `auto_cache_openai_prompt`
 - `strip_anthropic_billing_header`
 - `compress_user_message_images`

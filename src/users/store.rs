@@ -30,6 +30,7 @@ const ALLOWED_API_KEY_REQUEST_TRANSFORMS: &[&str] = &[
     "strip_anthropic_billing_header",
     "auto_cache_system",
     "auto_cache_tool_use",
+    "auto_cache_openai_tool_use",
     "auto_cache_user_id",
     "auto_cache_openai_prompt",
 ];
@@ -1830,6 +1831,19 @@ mod tests {
                 "jpeg_quality": 80,
                 "skip_if_smaller": true
             }),
+        }];
+
+        assert!(validate_api_key_transforms(&transforms, false).is_ok());
+    }
+
+    #[test]
+    fn validate_api_key_transforms_allows_openai_tool_cache_breakpoints() {
+        let transforms = vec![TransformRuleConfig {
+            transform: "auto_cache_openai_tool_use".to_string(),
+            enabled: true,
+            models: Some(vec!["gpt-5.6*".to_string()]),
+            phase: Phase::Request,
+            config: json!({}),
         }];
 
         assert!(validate_api_key_transforms(&transforms, false).is_ok());
