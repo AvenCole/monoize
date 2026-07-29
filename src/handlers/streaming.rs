@@ -116,7 +116,6 @@ pub(super) async fn forward_stream_typed(
     let mut execution_state = AttemptExecutionState::default();
 
     for attempt in attempts {
-        execution_state.enter_provider(&attempt.provider_id);
         if !execution_state.provider_budget_remaining(&attempt) {
             continue;
         }
@@ -143,7 +142,7 @@ pub(super) async fn forward_stream_typed(
                 break;
             }
 
-            let attempt_number = execution_state.record_upstream_attempt();
+            let attempt_number = execution_state.record_upstream_attempt(&attempt);
             // Clone from the pristine original request (pre-transforms) so
             // that the cross-family strip runs BEFORE provider, global, and
             // API-key transforms; see `execute_nonstream_typed`.

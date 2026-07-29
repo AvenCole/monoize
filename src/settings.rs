@@ -1,5 +1,6 @@
 use crate::db::DbPool;
 use crate::entity::system_settings;
+use crate::monoize_routing::AffinityFailbackMode;
 use crate::transforms::{TransformRuleConfig, canonicalize_transform_rules};
 use chrono::{DateTime, Utc};
 use sea_orm::{EntityTrait, Set, sea_query::OnConflict};
@@ -45,6 +46,10 @@ pub struct SystemSettings {
     pub monoize_strip_cross_protocol_nested_extra: bool,
     pub monoize_request_capture_enabled: bool,
     pub monoize_request_capture_retention_days: u64,
+    pub monoize_affinity_enabled: bool,
+    pub monoize_affinity_idle_ttl_seconds: u64,
+    pub monoize_affinity_failback_mode: AffinityFailbackMode,
+    pub monoize_affinity_failback_delay_seconds: u64,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -166,6 +171,10 @@ impl Default for SystemSettings {
             monoize_strip_cross_protocol_nested_extra: true,
             monoize_request_capture_enabled: false,
             monoize_request_capture_retention_days: 1,
+            monoize_affinity_enabled: true,
+            monoize_affinity_idle_ttl_seconds: 30 * 60,
+            monoize_affinity_failback_mode: AffinityFailbackMode::Sticky,
+            monoize_affinity_failback_delay_seconds: 5 * 60,
             updated_at: Utc::now(),
         }
     }
@@ -334,6 +343,26 @@ impl SettingsStore {
         self.set_if_not_exists(
             "monoize_request_capture_retention_days",
             &defaults.monoize_request_capture_retention_days.to_string(),
+        )
+        .await?;
+        self.set_if_not_exists(
+            "monoize_affinity_enabled",
+            &defaults.monoize_affinity_enabled.to_string(),
+        )
+        .await?;
+        self.set_if_not_exists(
+            "monoize_affinity_idle_ttl_seconds",
+            &defaults.monoize_affinity_idle_ttl_seconds.to_string(),
+        )
+        .await?;
+        self.set_if_not_exists(
+            "monoize_affinity_failback_mode",
+            defaults.monoize_affinity_failback_mode.as_str(),
+        )
+        .await?;
+        self.set_if_not_exists(
+            "monoize_affinity_failback_delay_seconds",
+            &defaults.monoize_affinity_failback_delay_seconds.to_string(),
         )
         .await?;
         Ok(())
@@ -518,6 +547,21 @@ impl SettingsStore {
                     settings.monoize_request_capture_retention_days =
                         row.value.parse().unwrap_or(1);
                 }
+                "monoize_affinity_enabled" => {
+                    settings.monoize_affinity_enabled = row.value.parse().unwrap_or(true);
+                }
+                "monoize_affinity_idle_ttl_seconds" => {
+                    settings.monoize_affinity_idle_ttl_seconds =
+                        row.value.parse::<u64>().unwrap_or(30 * 60).max(1);
+                }
+                "monoize_affinity_failback_mode" => {
+                    settings.monoize_affinity_failback_mode =
+                        AffinityFailbackMode::from_str(&row.value).unwrap_or_default();
+                }
+                "monoize_affinity_failback_delay_seconds" => {
+                    settings.monoize_affinity_failback_delay_seconds =
+                        row.value.parse().unwrap_or(5 * 60);
+                }
                 _ => {}
             }
         }
@@ -656,6 +700,29 @@ impl SettingsStore {
                 .monoize_request_capture_retention_days
                 .max(1)
                 .to_string(),
+        )
+        .await?;
+        self.set(
+            "monoize_affinity_enabled",
+            &settings.monoize_affinity_enabled.to_string(),
+        )
+        .await?;
+        self.set(
+            "monoize_affinity_idle_ttl_seconds",
+            &settings
+                .monoize_affinity_idle_ttl_seconds
+                .max(1)
+                .to_string(),
+        )
+        .await?;
+        self.set(
+            "monoize_affinity_failback_mode",
+            settings.monoize_affinity_failback_mode.as_str(),
+        )
+        .await?;
+        self.set(
+            "monoize_affinity_failback_delay_seconds",
+            &settings.monoize_affinity_failback_delay_seconds.to_string(),
         )
         .await?;
         Ok(())

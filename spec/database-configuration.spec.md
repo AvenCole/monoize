@@ -169,3 +169,7 @@ DB21. Request-log storage MUST use a single canonical table schema across SQLite
 DB22. The process MUST serialize dashboard settings updates from the initial `get_all()` read through database writes, the final `get_all()` read, and publication to `monoize_runtime`.
 
 DB23. A settings update MUST read its base state after every earlier settings update in the same process has published its runtime snapshot. An earlier update's snapshot MUST NOT overwrite a later update's snapshot.
+
+DB24. `system_settings` MUST persist `monoize_affinity_enabled`, `monoize_affinity_idle_ttl_seconds`, `monoize_affinity_failback_mode`, and `monoize_affinity_failback_delay_seconds`. Missing rows MUST resolve to `true`, `1800`, `"sticky"`, and `300`, respectively.
+
+DB25. `monoize_channels` MUST persist nullable `affinity_enabled_override`, `affinity_idle_ttl_seconds_override`, `affinity_failback_mode_override`, and `affinity_failback_delay_seconds_override` columns.

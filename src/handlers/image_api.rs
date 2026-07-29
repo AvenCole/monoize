@@ -493,7 +493,6 @@ async fn execute_stream_collected_image_typed(
     let mut execution_state = AttemptExecutionState::default();
 
     for attempt in attempts {
-        execution_state.enter_provider(&attempt.provider_id);
         if !execution_state.provider_budget_remaining(&attempt) {
             continue;
         }
@@ -504,7 +503,7 @@ async fn execute_stream_collected_image_typed(
                 break;
             }
 
-            let attempt_number = execution_state.record_upstream_attempt();
+            let attempt_number = execution_state.record_upstream_attempt(&attempt);
             let mut req_attempt = original_req.clone();
             if let Some(target_protocol) = super::provider_type_protocol(attempt.provider_type) {
                 urp::retain_provider_items_for_protocol(&mut req_attempt.input, target_protocol);

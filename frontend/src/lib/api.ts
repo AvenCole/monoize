@@ -115,6 +115,10 @@ export interface SystemSettings {
   monoize_active_probe_interval_seconds: number;
   monoize_active_probe_success_threshold: number;
   monoize_active_probe_model?: string | null;
+  monoize_affinity_enabled: boolean;
+  monoize_affinity_idle_ttl_seconds: number;
+  monoize_affinity_failback_mode: AffinityFailbackMode;
+  monoize_affinity_failback_delay_seconds: number;
   monoize_passive_failure_threshold: number;
   monoize_passive_cooldown_seconds: number;
   monoize_passive_window_seconds: number;
@@ -195,12 +199,17 @@ export interface MonoizeChannel {
   active_probe_interval_seconds_override?: number | null;
   active_probe_success_threshold_override?: number | null;
   active_probe_model_override?: string | null;
+  affinity_enabled_override?: boolean | null;
+  affinity_idle_ttl_seconds_override?: number | null;
+  affinity_failback_mode_override?: AffinityFailbackMode | null;
+  affinity_failback_delay_seconds_override?: number | null;
   _healthy?: boolean;
   _last_success_at?: string;
   _health_status?: "healthy" | "probing" | "unhealthy";
 }
 
 export type ProviderType = "responses" | "chat_completion" | "messages" | "gemini" | "openai_image" | "replicate";
+export type AffinityFailbackMode = "sticky" | "prefer_higher_priority";
 
 export interface ApiTypeOverride {
   pattern: string;
@@ -250,6 +259,10 @@ export interface CreateMonoizeChannelInput {
   active_probe_interval_seconds_override?: number | null;
   active_probe_success_threshold_override?: number | null;
   active_probe_model_override?: string | null;
+  affinity_enabled_override?: boolean | null;
+  affinity_idle_ttl_seconds_override?: number | null;
+  affinity_failback_mode_override?: AffinityFailbackMode | null;
+  affinity_failback_delay_seconds_override?: number | null;
 }
 
 export interface CreateProviderInput {

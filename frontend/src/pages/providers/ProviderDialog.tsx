@@ -54,6 +54,7 @@ import { Switch } from '@/components/ui/switch'
 import { api } from '@/lib/api'
 import type {
 	CreateProviderInput,
+	AffinityFailbackMode,
 	FetchChannelModelsInput,
 	ModelMetadataRecord,
 	Provider,
@@ -133,7 +134,11 @@ function channelInput(channel: ChannelRow) {
 		active_probe_enabled_override: channel.active_probe_enabled_override,
 		active_probe_interval_seconds_override: optionalPositiveInteger(channel.active_probe_interval_seconds_override),
 		active_probe_success_threshold_override: optionalPositiveInteger(channel.active_probe_success_threshold_override),
-		active_probe_model_override: channel.active_probe_model_override.trim() || null
+		active_probe_model_override: channel.active_probe_model_override.trim() || null,
+		affinity_enabled_override: channel.affinity_enabled_override,
+		affinity_idle_ttl_seconds_override: optionalPositiveInteger(channel.affinity_idle_ttl_seconds_override),
+		affinity_failback_mode_override: channel.affinity_failback_mode_override,
+		affinity_failback_delay_seconds_override: optionalPositiveInteger(channel.affinity_failback_delay_seconds_override)
 	}
 }
 
@@ -553,6 +558,19 @@ function ChannelDetail({ form, activeChannel, selectedChannel, setMobileChannelO
 		/>
 
 		<details className='group rounded-xl border bg-card'>
+			<summary className='flex cursor-pointer list-none items-center justify-between gap-3 p-4 sm:p-5'><div className='flex items-center gap-3'><GitBranch className='size-4 text-muted-foreground' /><div><h4 className='font-medium'>{c('路由亲和', 'Routing affinity')}</h4><p className='mt-0.5 text-xs text-muted-foreground'>{c('默认继承全局设置', 'Inherits global settings by default')}</p></div></div><ChevronRight className='size-4 transition-transform group-open:rotate-90' /></summary>
+			<div className='grid gap-4 border-t p-4 sm:grid-cols-2 sm:p-5'>
+				<NullableBoolean label={c('启用亲和', 'Affinity enabled')} value={activeChannel.affinity_enabled_override} onChange={value => updateChannel(selectedChannel, { affinity_enabled_override: value })} c={c} />
+				<AffinityModeOverride label={c('恢复策略', 'Recovery policy')} value={activeChannel.affinity_failback_mode_override} onChange={value => updateChannel(selectedChannel, { affinity_failback_mode_override: value })} c={c} />
+				<NumberOverride label={c('空闲过期（秒）', 'Idle expiry (seconds)')} value={activeChannel.affinity_idle_ttl_seconds_override} placeholder={settings?.monoize_affinity_idle_ttl_seconds} onChange={value => updateChannel(selectedChannel, { affinity_idle_ttl_seconds_override: value })} />
+				<NumberOverride min={0} label={c('回切延迟（秒）', 'Failback delay (seconds)')} value={activeChannel.affinity_failback_delay_seconds_override} placeholder={settings?.monoize_affinity_failback_delay_seconds} onChange={value => updateChannel(selectedChannel, { affinity_failback_delay_seconds_override: value })} />
+				<p className='text-xs leading-relaxed text-muted-foreground sm:col-span-2'>
+					{c('“保持当前 Channel”会让同一 Agent Thread 持续使用回落后的 Channel；“优先级恢复”在延迟结束后，遇到更高优先级 Provider 恢复时按正常顺序重新选择。', '“Keep current channel” keeps an Agent thread on its fallback channel. “Prefer higher priority” returns to normal ordering after the delay when an earlier provider becomes eligible.')}
+				</p>
+			</div>
+		</details>
+
+		<details className='group rounded-xl border bg-card'>
 			<summary className='flex cursor-pointer list-none items-center justify-between gap-3 p-4 sm:p-5'><div className='flex items-center gap-3'><CircleGauge className='size-4 text-muted-foreground' /><div><h4 className='font-medium'>{c('健康检查与熔断', 'Health and circuit breaker')}</h4><p className='mt-0.5 text-xs text-muted-foreground'>{c('默认继承全局设置', 'Inherits global settings by default')}</p></div></div><ChevronRight className='size-4 transition-transform group-open:rotate-90' /></summary>
 			<div className='grid gap-4 border-t p-4 sm:grid-cols-2 sm:p-5'>
 				<NullableBoolean label={c('主动探测', 'Active probing')} value={activeChannel.active_probe_enabled_override} onChange={value => updateChannel(selectedChannel, { active_probe_enabled_override: value })} c={c} />
@@ -566,12 +584,16 @@ function ChannelDetail({ form, activeChannel, selectedChannel, setMobileChannelO
 	</div>
 }
 
-function NumberOverride({ label, value, placeholder, onChange }: { label: string; value: string; placeholder?: number; onChange: (value: string) => void }) {
-	return <Field label={label}><Input type='number' min='1' value={value} placeholder={placeholder == null ? undefined : String(placeholder)} onChange={event => onChange(event.target.value)} /></Field>
+function NumberOverride({ label, value, placeholder, min = 1, onChange }: { label: string; value: string; placeholder?: number; min?: number; onChange: (value: string) => void }) {
+	return <Field label={label}><Input type='number' min={min} value={value} placeholder={placeholder == null ? undefined : String(placeholder)} onChange={event => onChange(event.target.value)} /></Field>
 }
 
 function NullableBoolean({ label, value, onChange, c }: { label: string; value: boolean | null; onChange: (value: boolean | null) => void; c: (zh: string, en: string) => string }) {
 	return <Field label={label}><Select value={value == null ? 'inherit' : value ? 'enabled' : 'disabled'} onValueChange={next => onChange(next === 'inherit' ? null : next === 'enabled')}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value='inherit'>{c('继承全局', 'Inherit global')}</SelectItem><SelectItem value='enabled'>{c('启用', 'Enabled')}</SelectItem><SelectItem value='disabled'>{c('停用', 'Disabled')}</SelectItem></SelectGroup></SelectContent></Select></Field>
+}
+
+function AffinityModeOverride({ label, value, onChange, c }: { label: string; value: AffinityFailbackMode | null; onChange: (value: AffinityFailbackMode | null) => void; c: (zh: string, en: string) => string }) {
+	return <Field label={label}><Select value={value ?? 'inherit'} onValueChange={next => onChange(next === 'inherit' ? null : next as AffinityFailbackMode)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value='inherit'>{c('继承全局', 'Inherit global')}</SelectItem><SelectItem value='sticky'>{c('保持当前 Channel', 'Keep current channel')}</SelectItem><SelectItem value='prefer_higher_priority'>{c('优先级恢复', 'Prefer higher priority')}</SelectItem></SelectGroup></SelectContent></Select></Field>
 }
 
 function RoutingSettings({ form, setForm, settings, c }: { form: ProviderForm; setForm: React.Dispatch<React.SetStateAction<ProviderForm>>; settings?: SystemSettings; c: (zh: string, en: string) => string }) {

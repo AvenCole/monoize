@@ -206,6 +206,15 @@ PL23. Provider channel edit dialog MUST expose channel-level passive breaker ove
 - `passive_window_seconds_override`
 - `passive_rate_limit_cooldown_seconds_override`
 
+PL23b. Provider channel edit dialog MUST expose these Channel affinity overrides. The inherit option or an empty numeric value MUST serialize as null:
+
+- `affinity_enabled_override`
+- `affinity_idle_ttl_seconds_override`
+- `affinity_failback_mode_override`
+- `affinity_failback_delay_seconds_override`
+
+PL23c. The Channel editor MUST describe `"sticky"` as retaining an eligible bound Channel and `"prefer_higher_priority"` as retrying an earlier eligible Provider after the configured delay.
+
 PL23a. Provider channel edit dialog MUST operate on a draft copy of the selected channel row.
 
 - Clicking "Add Channel" MUST open a draft channel dialog without appending a row immediately.
@@ -252,6 +261,15 @@ ST2. Health Monitoring section MUST expose at least these editable fields bound 
 - `monoize_strip_cross_protocol_nested_extra` (boolean)
 - `monoize_request_capture_enabled` (boolean switch, default off)
 - `monoize_request_capture_retention_days` (integer >= 1, default 1)
+
+ST2a. `/dashboard/admin-settings` MUST include a "Routing Affinity" card bound to `GET/PUT /api/dashboard/settings`. The card MUST expose:
+
+- `monoize_affinity_enabled` (boolean switch, default `true`)
+- `monoize_affinity_idle_ttl_seconds` (integer >= 1, default `1800`)
+- `monoize_affinity_failback_mode` (exactly `"sticky"` or `"prefer_higher_priority"`, default `"sticky"`)
+- `monoize_affinity_failback_delay_seconds` (integer >= 0, default `300`)
+
+ST2b. The Routing Affinity card MUST state that Channel overrides replace global values and that `"prefer_higher_priority"` returns to normal Provider order only after its delay and only when an earlier Provider is eligible.
 
 ST3. Settings UI MUST perform optimistic update and persist via existing settings save flow; persisted values MUST be reflected after reload.
 

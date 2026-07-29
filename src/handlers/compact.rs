@@ -92,7 +92,6 @@ pub async fn compact_response(
     let mut execution_state = AttemptExecutionState::default();
 
     for attempt in attempts {
-        execution_state.enter_provider(&attempt.provider_id);
         if !execution_state.provider_budget_remaining(&attempt) {
             continue;
         }
@@ -101,7 +100,7 @@ pub async fn compact_response(
             if !execution_state.provider_budget_remaining(&attempt) {
                 break;
             }
-            let attempt_number = execution_state.record_upstream_attempt();
+            let attempt_number = execution_state.record_upstream_attempt(&attempt);
             let mut upstream_body = crate::urp::encode::sanitize_provider_item_wire_body(&body);
             if let Some(obj) = upstream_body.as_object_mut() {
                 obj.insert(

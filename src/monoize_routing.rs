@@ -56,6 +56,31 @@ impl MonoizeProviderType {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityFailbackMode {
+    #[default]
+    Sticky,
+    PreferHigherPriority,
+}
+
+impl AffinityFailbackMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sticky => "sticky",
+            Self::PreferHigherPriority => "prefer_higher_priority",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "sticky" => Some(Self::Sticky),
+            "prefer_higher_priority" => Some(Self::PreferHigherPriority),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiTypeOverride {
     pub pattern: String,
@@ -98,6 +123,14 @@ pub struct MonoizeChannel {
     pub active_probe_success_threshold_override: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_probe_model_override: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affinity_enabled_override: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affinity_idle_ttl_seconds_override: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affinity_failback_mode_override: Option<AffinityFailbackMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affinity_failback_delay_seconds_override: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub _healthy: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,6 +197,14 @@ pub struct CreateMonoizeChannelInput {
     pub active_probe_interval_seconds_override: Option<u64>,
     pub active_probe_success_threshold_override: Option<u32>,
     pub active_probe_model_override: Option<String>,
+    #[serde(default)]
+    pub affinity_enabled_override: Option<bool>,
+    #[serde(default)]
+    pub affinity_idle_ttl_seconds_override: Option<u64>,
+    #[serde(default)]
+    pub affinity_failback_mode_override: Option<AffinityFailbackMode>,
+    #[serde(default)]
+    pub affinity_failback_delay_seconds_override: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -249,6 +290,10 @@ pub struct MonoizeRuntimeConfig {
     pub strip_cross_protocol_nested_extra: bool,
     pub request_capture_enabled: bool,
     pub request_capture_retention_days: u64,
+    pub affinity_enabled: bool,
+    pub affinity_idle_ttl_seconds: u64,
+    pub affinity_failback_mode: AffinityFailbackMode,
+    pub affinity_failback_delay_seconds: u64,
 }
 
 impl Default for MonoizeRuntimeConfig {
@@ -271,6 +316,10 @@ impl Default for MonoizeRuntimeConfig {
             strip_cross_protocol_nested_extra: true,
             request_capture_enabled: false,
             request_capture_retention_days: 1,
+            affinity_enabled: true,
+            affinity_idle_ttl_seconds: 30 * 60,
+            affinity_failback_mode: AffinityFailbackMode::Sticky,
+            affinity_failback_delay_seconds: 5 * 60,
         }
     }
 }
@@ -295,10 +344,10 @@ pub struct ChannelHealthState {
 pub struct ChannelAffinityBinding {
     pub provider_id: String,
     pub channel_id: String,
+    pub bound_at: i64,
     pub updated_at: i64,
 }
 
-pub const CHANNEL_AFFINITY_IDLE_TTL_SECONDS: i64 = 30 * 60;
 pub const CHANNEL_AFFINITY_MAX_ENTRIES: usize = 4096;
 
 impl ChannelHealthState {
@@ -890,8 +939,10 @@ impl MonoizeRoutingStore {
                           passive_window_seconds_override, passive_rate_limit_cooldown_seconds_override,
                           active_probe_enabled_override, active_probe_interval_seconds_override,
                           active_probe_success_threshold_override, active_probe_model_override,
+                          affinity_enabled_override, affinity_idle_ttl_seconds_override,
+                          affinity_failback_mode_override, affinity_failback_delay_seconds_override,
                           created_at, updated_at)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"#,
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)"#,
                     vec![
                         id.clone().into(),
                         provider_id.into(),
@@ -911,6 +962,13 @@ impl MonoizeRoutingStore {
                         opt_u64_to_value(input.active_probe_interval_seconds_override),
                         opt_u64_to_value(input.active_probe_success_threshold_override.map(|v| v as u64)),
                         input.active_probe_model_override.clone().into(),
+                        opt_bool_to_value(input.affinity_enabled_override),
+                        opt_u64_to_value(input.affinity_idle_ttl_seconds_override),
+                        input
+                            .affinity_failback_mode_override
+                            .map(|mode| mode.as_str().to_string())
+                            .into(),
+                        opt_u64_to_value(input.affinity_failback_delay_seconds_override),
                         now_str.clone().into(),
                         now_str.into(),
                     ],
@@ -954,7 +1012,11 @@ impl MonoizeRoutingStore {
                           active_probe_enabled_override,
                           active_probe_interval_seconds_override,
                           active_probe_success_threshold_override,
-                          active_probe_model_override
+                          active_probe_model_override,
+                          affinity_enabled_override,
+                          affinity_idle_ttl_seconds_override,
+                          affinity_failback_mode_override,
+                          affinity_failback_delay_seconds_override
                    FROM monoize_channels
                    WHERE provider_id = $1
                    ORDER BY created_at ASC"#,
@@ -1071,6 +1133,57 @@ impl MonoizeRoutingStore {
                 active_probe_model_override: cr
                     .try_get("", "active_probe_model_override")
                     .map_err(|e| format!("channel {channel_id} invalid active_probe_model_override: {e}"))?,
+                affinity_enabled_override: cr
+                    .try_get::<Option<i32>>("", "affinity_enabled_override")
+                    .map_err(|e| {
+                        format!("channel {channel_id} invalid affinity_enabled_override: {e}")
+                    })?
+                    .map(|value| value != 0),
+                affinity_idle_ttl_seconds_override: cr
+                    .try_get::<Option<i32>>("", "affinity_idle_ttl_seconds_override")
+                    .map_err(|e| {
+                        format!(
+                            "channel {channel_id} invalid affinity_idle_ttl_seconds_override: {e}"
+                        )
+                    })?
+                    .map(|value| {
+                        decode_positive_u64(
+                            &channel_id,
+                            "affinity_idle_ttl_seconds_override",
+                            i64::from(value),
+                        )
+                    })
+                    .transpose()?,
+                affinity_failback_mode_override: cr
+                    .try_get::<Option<String>>("", "affinity_failback_mode_override")
+                    .map_err(|e| {
+                        format!(
+                            "channel {channel_id} invalid affinity_failback_mode_override: {e}"
+                        )
+                    })?
+                    .map(|value| {
+                        AffinityFailbackMode::from_str(&value).ok_or_else(|| {
+                            format!(
+                                "channel {channel_id} invalid affinity_failback_mode_override: {value}"
+                            )
+                        })
+                    })
+                    .transpose()?,
+                affinity_failback_delay_seconds_override: cr
+                    .try_get::<Option<i32>>("", "affinity_failback_delay_seconds_override")
+                    .map_err(|e| {
+                        format!(
+                            "channel {channel_id} invalid affinity_failback_delay_seconds_override: {e}"
+                        )
+                    })?
+                    .map(|value| {
+                        decode_nonnegative_u64(
+                            &channel_id,
+                            "affinity_failback_delay_seconds_override",
+                            i64::from(value),
+                        )
+                    })
+                    .transpose()?,
                 _healthy: None,
                 _last_success_at: None,
                 _health_status: None,
@@ -1207,6 +1320,11 @@ fn decode_positive_u64(provider_id: &str, field: &str, value: i64) -> Result<u64
         .ok_or_else(|| format!("provider {provider_id} invalid {field}: must be >= 1"))
 }
 
+fn decode_nonnegative_u64(provider_id: &str, field: &str, value: i64) -> Result<u64, String> {
+    u64::try_from(value)
+        .map_err(|_| format!("provider {provider_id} invalid {field}: must be >= 0"))
+}
+
 fn canonicalize_models(
     models: &HashMap<String, MonoizeModelEntry>,
 ) -> HashMap<String, MonoizeModelEntry> {
@@ -1312,6 +1430,22 @@ fn validate_channels(
             if !(1..=i32::MAX as u32).contains(&v) {
                 return Err(
                     "channel active_probe_success_threshold_override must be between 1 and 2147483647".to_string(),
+                );
+            }
+        }
+        if let Some(v) = c.affinity_idle_ttl_seconds_override {
+            if !(1..=i32::MAX as u64).contains(&v) {
+                return Err(
+                    "channel affinity_idle_ttl_seconds_override must be between 1 and 2147483647"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(v) = c.affinity_failback_delay_seconds_override {
+            if v > i32::MAX as u64 {
+                return Err(
+                    "channel affinity_failback_delay_seconds_override must be between 0 and 2147483647"
+                        .to_string(),
                 );
             }
         }

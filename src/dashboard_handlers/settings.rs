@@ -2,6 +2,7 @@ use crate::app::AppState;
 use crate::dashboard_handlers::auth::UserResponse;
 use crate::dashboard_handlers::session_helpers::{get_current_user, require_admin};
 use crate::error::{AppError, AppResult};
+use crate::monoize_routing::AffinityFailbackMode;
 use crate::transforms::TransformRuleConfig;
 use axum::Json;
 use axum::extract::State;
@@ -9,6 +10,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateSettingsRequest {
@@ -38,6 +40,10 @@ pub struct UpdateSettingsRequest {
     pub monoize_strip_cross_protocol_nested_extra: Option<bool>,
     pub monoize_request_capture_enabled: Option<bool>,
     pub monoize_request_capture_retention_days: Option<u64>,
+    pub monoize_affinity_enabled: Option<bool>,
+    pub monoize_affinity_idle_ttl_seconds: Option<u64>,
+    pub monoize_affinity_failback_mode: Option<AffinityFailbackMode>,
+    pub monoize_affinity_failback_delay_seconds: Option<u64>,
 }
 
 pub async fn get_settings(
@@ -70,6 +76,12 @@ pub async fn update_settings(
         .get_all()
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    let affinity_settings_before = (
+        settings.monoize_affinity_enabled,
+        settings.monoize_affinity_idle_ttl_seconds,
+        settings.monoize_affinity_failback_mode,
+        settings.monoize_affinity_failback_delay_seconds,
+    );
 
     if let Some(v) = body.registration_enabled {
         settings.registration_enabled = v;
@@ -158,6 +170,18 @@ pub async fn update_settings(
     if let Some(v) = body.monoize_request_capture_retention_days {
         settings.monoize_request_capture_retention_days = v.max(1);
     }
+    if let Some(v) = body.monoize_affinity_enabled {
+        settings.monoize_affinity_enabled = v;
+    }
+    if let Some(v) = body.monoize_affinity_idle_ttl_seconds {
+        settings.monoize_affinity_idle_ttl_seconds = v.max(1);
+    }
+    if let Some(v) = body.monoize_affinity_failback_mode {
+        settings.monoize_affinity_failback_mode = v;
+    }
+    if let Some(v) = body.monoize_affinity_failback_delay_seconds {
+        settings.monoize_affinity_failback_delay_seconds = v;
+    }
 
     settings_store
         .update_all(&settings)
@@ -188,6 +212,21 @@ pub async fn update_settings(
         rt.strip_cross_protocol_nested_extra = updated.monoize_strip_cross_protocol_nested_extra;
         rt.request_capture_enabled = updated.monoize_request_capture_enabled;
         rt.request_capture_retention_days = updated.monoize_request_capture_retention_days.max(1);
+        rt.affinity_enabled = updated.monoize_affinity_enabled;
+        rt.affinity_idle_ttl_seconds = updated.monoize_affinity_idle_ttl_seconds.max(1);
+        rt.affinity_failback_mode = updated.monoize_affinity_failback_mode;
+        rt.affinity_failback_delay_seconds = updated.monoize_affinity_failback_delay_seconds;
+    }
+
+    let affinity_settings_after = (
+        updated.monoize_affinity_enabled,
+        updated.monoize_affinity_idle_ttl_seconds,
+        updated.monoize_affinity_failback_mode,
+        updated.monoize_affinity_failback_delay_seconds,
+    );
+    if affinity_settings_before != affinity_settings_after {
+        state.routing_config_revision.fetch_add(1, Ordering::AcqRel);
+        state.channel_affinity.lock().await.clear();
     }
 
     Ok(Json(updated))

@@ -3,11 +3,18 @@ import { useTranslation } from "react-i18next";
 import { Plus, Save, Settings2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldGroup,
+  FieldLabel,
+} from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useSettings, updateSettingsOptimistic, useTransformRegistry } from "@/lib/swr";
 import type { SystemSettings } from "@/lib/api";
 import { PageWrapper, motion, transitions, StaggerList, StaggerItem } from "@/components/ui/motion";
@@ -382,6 +389,111 @@ export function SettingsPage() {
               <p className="text-sm text-muted-foreground">
                 {t("settings.globalTransformsHelp")}
               </p>
+            </CardContent>
+          </Card>
+        </StaggerItem>
+
+        <StaggerItem>
+          <Card>
+            <CardHeader>
+              <CardTitle>{t("settings.affinityRouting")}</CardTitle>
+              <CardDescription>{t("settings.affinityRoutingDescription")}</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <FieldGroup>
+                <Field orientation="horizontal">
+                  <FieldContent>
+                    <FieldLabel htmlFor="affinity_enabled">
+                      {t("settings.affinityEnabled")}
+                    </FieldLabel>
+                    <FieldDescription>
+                      {t("settings.affinityEnabledDescription")}
+                    </FieldDescription>
+                  </FieldContent>
+                  <Switch
+                    id="affinity_enabled"
+                    checked={currentSettings.monoize_affinity_enabled}
+                    onCheckedChange={(checked) =>
+                      handleChange({ monoize_affinity_enabled: checked })
+                    }
+                  />
+                </Field>
+                <Separator />
+                <div className="grid gap-5 md:grid-cols-2">
+                  <Field>
+                    <FieldLabel htmlFor="affinity_failback_mode">
+                      {t("settings.affinityFailbackMode")}
+                    </FieldLabel>
+                    <Select
+                      value={currentSettings.monoize_affinity_failback_mode}
+                      onValueChange={(value: SystemSettings["monoize_affinity_failback_mode"]) =>
+                        handleChange({ monoize_affinity_failback_mode: value })
+                      }
+                    >
+                      <SelectTrigger id="affinity_failback_mode">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectItem value="sticky">
+                            {t("settings.affinitySticky")}
+                          </SelectItem>
+                          <SelectItem value="prefer_higher_priority">
+                            {t("settings.affinityPreferHigherPriority")}
+                          </SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                    <FieldDescription>
+                      {t("settings.affinityFailbackModeDescription")}
+                    </FieldDescription>
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="affinity_idle_ttl_seconds">
+                      {t("settings.affinityIdleTtlSeconds")}
+                    </FieldLabel>
+                    <Input
+                      id="affinity_idle_ttl_seconds"
+                      type="number"
+                      min="1"
+                      value={currentSettings.monoize_affinity_idle_ttl_seconds}
+                      onChange={(event) =>
+                        handleChange({
+                          monoize_affinity_idle_ttl_seconds: Math.max(
+                            1,
+                            parseInt(event.target.value) || 1
+                          ),
+                        })
+                      }
+                    />
+                    <FieldDescription>
+                      {t("settings.affinityIdleTtlSecondsDescription")}
+                    </FieldDescription>
+                  </Field>
+                  <Field className="md:col-span-2">
+                    <FieldLabel htmlFor="affinity_failback_delay_seconds">
+                      {t("settings.affinityFailbackDelaySeconds")}
+                    </FieldLabel>
+                    <Input
+                      id="affinity_failback_delay_seconds"
+                      type="number"
+                      min="0"
+                      value={currentSettings.monoize_affinity_failback_delay_seconds}
+                      onChange={(event) =>
+                        handleChange({
+                          monoize_affinity_failback_delay_seconds: Math.max(
+                            0,
+                            parseInt(event.target.value) || 0
+                          ),
+                        })
+                      }
+                    />
+                    <FieldDescription>
+                      {t("settings.affinityFailbackDelaySecondsDescription")}
+                    </FieldDescription>
+                  </Field>
+                </div>
+              </FieldGroup>
             </CardContent>
           </Card>
         </StaggerItem>

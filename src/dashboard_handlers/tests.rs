@@ -13,8 +13,8 @@ use crate::dashboard_handlers::auth::UserResponse;
 use crate::db::DbPool;
 use crate::migration::Migrator;
 use crate::monoize_routing::{
-    CreateMonoizeProviderInput, MonoizeChannel, MonoizeModelEntry, MonoizeProvider,
-    MonoizeProviderType, MonoizeRoutingStore, UpdateMonoizeProviderInput,
+    AffinityFailbackMode, CreateMonoizeProviderInput, MonoizeChannel, MonoizeModelEntry,
+    MonoizeProvider, MonoizeProviderType, MonoizeRoutingStore, UpdateMonoizeProviderInput,
 };
 use crate::settings::SettingsStore;
 use crate::transforms::{Phase, TransformRuleConfig};
@@ -205,6 +205,10 @@ fn dashboard_provider_response_includes_groups_and_channel_hides_api_key() {
         active_probe_interval_seconds_override: None,
         active_probe_success_threshold_override: None,
         active_probe_model_override: None,
+        affinity_enabled_override: None,
+        affinity_idle_ttl_seconds_override: None,
+        affinity_failback_mode_override: None,
+        affinity_failback_delay_seconds_override: None,
         _healthy: None,
         _last_success_at: None,
         _health_status: None,
@@ -269,6 +273,10 @@ async fn dashboard_provider_groups_round_trip_through_store_and_update_preserves
                 "provider_type": "responses",
                 "base_url": "https://example.com",
                 "api_key": "secret",
+                "affinity_enabled_override": true,
+                "affinity_idle_ttl_seconds_override": 90,
+                "affinity_failback_mode_override": "prefer_higher_priority",
+                "affinity_failback_delay_seconds_override": 15,
                 "models": { "gpt-5": { "redirect": null, "multiplier": 1.0 } }
             }
         ]
@@ -286,6 +294,19 @@ async fn dashboard_provider_groups_round_trip_through_store_and_update_preserves
         vec!["alpha".to_string(), "beta".to_string()]
     );
     assert_eq!(created.channels[0].api_key, "secret");
+    assert_eq!(created.channels[0].affinity_enabled_override, Some(true));
+    assert_eq!(
+        created.channels[0].affinity_idle_ttl_seconds_override,
+        Some(90)
+    );
+    assert_eq!(
+        created.channels[0].affinity_failback_mode_override,
+        Some(AffinityFailbackMode::PreferHigherPriority)
+    );
+    assert_eq!(
+        created.channels[0].affinity_failback_delay_seconds_override,
+        Some(15)
+    );
 
     let update_body: UpdateMonoizeProviderInput = serde_json::from_value(json!({
         "channels": [
@@ -295,6 +316,10 @@ async fn dashboard_provider_groups_round_trip_through_store_and_update_preserves
                 "provider_type": "responses",
                 "base_url": "https://example.com",
                 "api_key": "",
+                "affinity_enabled_override": false,
+                "affinity_idle_ttl_seconds_override": 120,
+                "affinity_failback_mode_override": "sticky",
+                "affinity_failback_delay_seconds_override": 0,
                 "models": { "gpt-5": { "redirect": null, "multiplier": 1.0 } }
             }
         ]
@@ -311,6 +336,19 @@ async fn dashboard_provider_groups_round_trip_through_store_and_update_preserves
         vec!["alpha".to_string(), "beta".to_string()]
     );
     assert_eq!(updated.channels[0].api_key, "secret");
+    assert_eq!(updated.channels[0].affinity_enabled_override, Some(false));
+    assert_eq!(
+        updated.channels[0].affinity_idle_ttl_seconds_override,
+        Some(120)
+    );
+    assert_eq!(
+        updated.channels[0].affinity_failback_mode_override,
+        Some(AffinityFailbackMode::Sticky)
+    );
+    assert_eq!(
+        updated.channels[0].affinity_failback_delay_seconds_override,
+        Some(0)
+    );
 
     let cleared = store
         .update_provider(
@@ -1058,6 +1096,26 @@ async fn sqlite_migration_creates_request_log_retention_indexes() {
     assert!(index_rows.iter().any(|(name, sql)| {
         name == "idx_request_logs_created_at" && sql.contains("(created_at_unix_ms DESC)")
     }));
+
+    let channel_columns = db
+        .read()
+        .query_all(db.stmt(
+            "SELECT name FROM pragma_table_info('monoize_channels')",
+            vec![],
+        ))
+        .await
+        .expect("list channel columns")
+        .into_iter()
+        .filter_map(|row| row.try_get::<String>("", "name").ok())
+        .collect::<std::collections::HashSet<_>>();
+    for column in [
+        "affinity_enabled_override",
+        "affinity_idle_ttl_seconds_override",
+        "affinity_failback_mode_override",
+        "affinity_failback_delay_seconds_override",
+    ] {
+        assert!(channel_columns.contains(column), "missing column {column}");
+    }
 }
 
 #[tokio::test]
@@ -1075,6 +1133,13 @@ async fn settings_store_round_trips_global_transforms() {
     assert!(settings.global_transforms.is_empty());
     assert!(!settings.monoize_request_capture_enabled);
     assert_eq!(settings.monoize_request_capture_retention_days, 1);
+    assert!(settings.monoize_affinity_enabled);
+    assert_eq!(settings.monoize_affinity_idle_ttl_seconds, 1800);
+    assert_eq!(
+        settings.monoize_affinity_failback_mode,
+        AffinityFailbackMode::Sticky
+    );
+    assert_eq!(settings.monoize_affinity_failback_delay_seconds, 300);
 
     settings.global_transforms = vec![TransformRuleConfig {
         transform: "remove_anthropic_billing_header".to_string(),
@@ -1086,6 +1151,10 @@ async fn settings_store_round_trips_global_transforms() {
     settings.monoize_strip_cross_protocol_nested_extra = false;
     settings.monoize_request_capture_enabled = true;
     settings.monoize_request_capture_retention_days = 0;
+    settings.monoize_affinity_enabled = false;
+    settings.monoize_affinity_idle_ttl_seconds = 90;
+    settings.monoize_affinity_failback_mode = AffinityFailbackMode::PreferHigherPriority;
+    settings.monoize_affinity_failback_delay_seconds = 0;
     store.update_all(&settings).await.expect("settings update");
 
     let updated = store.get_all().await.expect("settings reload");
@@ -1098,4 +1167,11 @@ async fn settings_store_round_trips_global_transforms() {
     assert!(!updated.monoize_strip_cross_protocol_nested_extra);
     assert!(updated.monoize_request_capture_enabled);
     assert_eq!(updated.monoize_request_capture_retention_days, 1);
+    assert!(!updated.monoize_affinity_enabled);
+    assert_eq!(updated.monoize_affinity_idle_ttl_seconds, 90);
+    assert_eq!(
+        updated.monoize_affinity_failback_mode,
+        AffinityFailbackMode::PreferHigherPriority
+    );
+    assert_eq!(updated.monoize_affinity_failback_delay_seconds, 0);
 }

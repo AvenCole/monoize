@@ -205,9 +205,25 @@ STRM-4. If a partial stream later fails with a retryable upstream/adapter error,
 
 ## 5.1 Channel Affinity
 
-AFF-1. Affinity MUST be enabled by default and stored in process memory only.
+AFF-1. Affinity MUST be stored in process memory only.
 
-AFF-2. An affinity binding expires after 30 minutes of idle time.
+AFF-1a. Global affinity settings MUST be:
+
+- `monoize_affinity_enabled: boolean` (default `true`)
+- `monoize_affinity_idle_ttl_seconds: integer >= 1` (default `1800`)
+- `monoize_affinity_failback_mode: enum("sticky", "prefer_higher_priority")` (default `"sticky"`)
+- `monoize_affinity_failback_delay_seconds: integer >= 0` (default `300`)
+
+AFF-1b. Each Channel MAY define these nullable override fields:
+
+- `affinity_enabled_override: boolean?`
+- `affinity_idle_ttl_seconds_override: integer?`
+- `affinity_failback_mode_override: enum("sticky", "prefer_higher_priority")?`
+- `affinity_failback_delay_seconds_override: integer?`
+
+For each field, a non-null Channel value MUST replace the matching global value for that Channel. A null Channel value MUST inherit the global value. Therefore `affinity_enabled_override = true` MAY enable affinity for one Channel when `monoize_affinity_enabled = false`, and `affinity_enabled_override = false` MUST disable affinity for one Channel when `monoize_affinity_enabled = true`.
+
+AFF-2. An affinity binding MUST expire when its last successful use is older than the effective `affinity_idle_ttl_seconds` of the bound Channel.
 
 AFF-3. The affinity cache key MUST include:
 
@@ -220,23 +236,38 @@ AFF-4. Explicit stable metadata fields are Responses `previous_response_id`, ses
 
 AFF-5. The fallback input-prefix hash MUST hash normalized request input only. It MUST consider at most the first 8 input nodes and at most 16384 bytes of normalized JSON/text material. Raw affinity material MUST NOT be persisted.
 
-AFF-6. The affinity value MUST be `(provider_id, channel_id)`.
+AFF-6. The affinity value MUST contain `(provider_id, channel_id, bound_at, last_used_at)`.
 
 AFF-7. If an affinity hit points to a Provider+Channel that is still eligible for the request, routing MAY jump directly to that attempt before normal provider-order attempts. This jump consumes the normal provider/channel attempt budget.
 
-AFF-8. If the bound Provider+Channel is stale, disabled, zero weight, unhealthy, group-ineligible, multiplier-ineligible, or does not support the logical model, the binding MUST be cleared and normal waterfall routing MUST begin from the first provider.
+AFF-7a. Under effective failback mode `"sticky"`, an eligible unexpired binding MUST remain first even when an earlier Provider has recovered.
+
+AFF-7b. Under effective failback mode `"prefer_higher_priority"`, Monoize MUST use normal waterfall order instead of moving the bound attempt first when both conditions hold:
+
+- `now - bound_at >= effective affinity_failback_delay_seconds`
+- the normal eligible-attempt list contains an attempt from a different Provider before the bound attempt
+
+Attempts from the same Provider that happen to precede the bound Channel after weighted randomization MUST NOT trigger failback.
+
+AFF-7c. If AFF-7b uses normal waterfall order, request logging MUST set `affinity_hit = false` and retain the prior binding target in `affinity_target`. A successful attempt MUST replace or refresh the binding with that attempt as target and MUST set `bound_at` to the success time. If normal waterfall returns to the prior bound target after earlier attempts fail, `bound_at` MUST also reset to the success time.
+
+AFF-7d. A successful request that used the bound target through AFF-7 or AFF-7a MUST update `last_used_at` and MUST preserve `bound_at`.
+
+AFF-8. If the bound Provider+Channel is stale, affinity-disabled, disabled, zero weight, unhealthy, group-ineligible, multiplier-ineligible, or does not support the logical model, the binding MUST be cleared and normal waterfall routing MUST begin from the first provider.
 
 AFF-9. Retryable failures (`429`, `5xx`, timeout, and connection errors) MUST clear affinity. Non-retryable client errors MUST NOT clear affinity by themselves.
 
-AFF-10. Successful non-stream requests MUST write or refresh affinity after success.
+AFF-10. A successful non-stream request MUST write or refresh affinity after success only when the successful Channel's effective `affinity_enabled` is true.
 
-AFF-11. After a successful `type=responses` attempt, Monoize MUST write an additional affinity binding keyed by authenticated tenant, logical model, and the non-empty upstream response id. A subsequent Responses request that sends that id as `previous_response_id` MUST resolve the additional binding under AFF-7 through AFF-9. A successful Responses stream MUST write this binding only after successful terminal completion.
+AFF-11. After a successful `type=responses` attempt on an affinity-enabled Channel, Monoize MUST write an additional affinity binding keyed by authenticated tenant, logical model, and the non-empty upstream response id. A subsequent Responses request that sends that id as `previous_response_id` MUST resolve the additional binding under AFF-7 through AFF-9. A successful Responses stream MUST write this binding only after successful terminal completion. If the successful attempt was an affinity hit and retained the same target, the response-id binding MUST inherit the source binding's `bound_at`; otherwise the response-id binding MUST set `bound_at` to the success time.
 
 AFF-12. The process-local affinity map MUST contain at most 4096 bindings. Inserting a new key at capacity MUST evict one existing binding before insertion.
 
 AFF-13. Lookup MUST inspect only the requested binding. It MUST remove that binding when expired and MUST NOT scan the complete affinity map on each request.
 
 AFF-14. A provider update or delete MUST remove affinity bindings for every channel in the affected provider. An upstream attempt created before the completed provider mutation MUST NOT write or refresh affinity afterward.
+
+AFF-15. A successful settings mutation that changes any global affinity setting MUST advance the routing configuration revision and clear all process-local affinity bindings before the updated settings response is returned. An upstream attempt created under the earlier revision MUST NOT recreate a cleared binding.
 
 ## 6. Health Check
 

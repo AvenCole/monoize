@@ -3,6 +3,7 @@ import { Anthropic, Google, OpenAI } from '@lobehub/icons'
 import { Box } from 'lucide-react'
 import { StatusBadge, StatusDot } from '@/components/ui/status'
 import type {
+	AffinityFailbackMode,
 	ApiTypeOverride,
 	ModelMetadataRecord,
 	Provider,
@@ -33,6 +34,10 @@ export type ChannelRow = {
 	active_probe_interval_seconds_override: string
 	active_probe_success_threshold_override: string
 	active_probe_model_override: string
+	affinity_enabled_override: boolean | null
+	affinity_idle_ttl_seconds_override: string
+	affinity_failback_mode_override: AffinityFailbackMode | null
+	affinity_failback_delay_seconds_override: string
 	_health_status?: 'healthy' | 'probing' | 'unhealthy'
 }
 
@@ -104,6 +109,10 @@ export function emptyChannelRow(): ChannelRow {
 		active_probe_interval_seconds_override: '',
 		active_probe_success_threshold_override: '',
 		active_probe_model_override: '',
+		affinity_enabled_override: null,
+		affinity_idle_ttl_seconds_override: '',
+		affinity_failback_mode_override: null,
+		affinity_failback_delay_seconds_override: '',
 		_health_status: undefined
 	}
 }
@@ -174,6 +183,10 @@ export function fromProvider(provider: Provider): ProviderForm {
 			active_probe_interval_seconds_override: channel.active_probe_interval_seconds_override == null ? '' : String(channel.active_probe_interval_seconds_override),
 			active_probe_success_threshold_override: channel.active_probe_success_threshold_override == null ? '' : String(channel.active_probe_success_threshold_override),
 			active_probe_model_override: channel.active_probe_model_override ?? '',
+			affinity_enabled_override: channel.affinity_enabled_override ?? null,
+			affinity_idle_ttl_seconds_override: channel.affinity_idle_ttl_seconds_override == null ? '' : String(channel.affinity_idle_ttl_seconds_override),
+			affinity_failback_mode_override: channel.affinity_failback_mode_override ?? null,
+			affinity_failback_delay_seconds_override: channel.affinity_failback_delay_seconds_override == null ? '' : String(channel.affinity_failback_delay_seconds_override),
 			_health_status: channel._health_status
 		})),
 		transforms: provider.transforms ?? [],

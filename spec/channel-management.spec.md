@@ -71,6 +71,13 @@ Channel-level active probe override fields MAY be present:
 - `active_probe_success_threshold_override: integer? (>= 1)`
 - `active_probe_model_override: string?`
 
+Channel-level affinity override fields MAY be present:
+
+- `affinity_enabled_override: boolean?`
+- `affinity_idle_ttl_seconds_override: integer? (>= 1)`
+- `affinity_failback_mode_override: enum("sticky","prefer_higher_priority")?`
+- `affinity_failback_delay_seconds_override: integer? (>= 0)`
+
 ## 2. Invariants
 
 CP-INV-1. `channels.length >= 1`.
@@ -92,6 +99,12 @@ CP-INV-8. Channel model keys MUST be non-empty after trimming and unique within 
 CP-INV-9. Provider MUST NOT contain a `models` field. Provider-level model selection, redirect, and multiplier state are obsolete and MUST NOT be accepted or returned.
 
 CP-INV-10. A Channel MAY have an empty `models` object. The UI MUST warn. The Channel MUST NOT be eligible for any model route until at least one model entry exists.
+
+CP-INV-11. Every non-null `affinity_idle_ttl_seconds_override` MUST be between `1` and `2147483647`, inclusive.
+
+CP-INV-12. Every non-null `affinity_failback_delay_seconds_override` MUST be between `0` and `2147483647`, inclusive.
+
+CP-INV-13. Every non-null `affinity_failback_mode_override` MUST equal `"sticky"` or `"prefer_higher_priority"`.
 
 Provider group routing semantics:
 
@@ -126,7 +139,7 @@ All endpoints require an authenticated dashboard admin session.
   - `channel_retry_interval_ms?: integer`
   - `circuit_breaker_enabled?: boolean`
   - `per_model_circuit_break?: boolean`
-  - `channels: Array<{ id?: string, name: string, provider_type: ProviderType, base_url: string, api_key: string, weight?: number, enabled?: boolean, models: Record<string, { redirect: string | null, multiplier: number }>, passive_failure_count_threshold_override?: integer | null, passive_window_seconds_override?: integer | null, passive_cooldown_seconds_override?: integer | null, passive_rate_limit_cooldown_seconds_override?: integer | null, active_probe_enabled_override?: boolean | null, active_probe_interval_seconds_override?: integer | null, active_probe_success_threshold_override?: integer | null, active_probe_model_override?: string | null }>`
+  - `channels: Array<{ id?: string, name: string, provider_type: ProviderType, base_url: string, api_key: string, weight?: number, enabled?: boolean, models: Record<string, { redirect: string | null, multiplier: number }>, passive_failure_count_threshold_override?: integer | null, passive_window_seconds_override?: integer | null, passive_cooldown_seconds_override?: integer | null, passive_rate_limit_cooldown_seconds_override?: integer | null, active_probe_enabled_override?: boolean | null, active_probe_interval_seconds_override?: integer | null, active_probe_success_threshold_override?: integer | null, active_probe_model_override?: string | null, affinity_enabled_override?: boolean | null, affinity_idle_ttl_seconds_override?: integer | null, affinity_failback_mode_override?: "sticky" | "prefer_higher_priority" | null, affinity_failback_delay_seconds_override?: integer | null }>`
   - `groups?: string[]`
   - `api_type_overrides?: ApiTypeOverride[]`
   - `strip_cross_protocol_nested_extra?: boolean | null`

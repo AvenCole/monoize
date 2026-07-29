@@ -244,6 +244,12 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
     monoize_runtime.request_capture_retention_days = settings_snapshot
         .monoize_request_capture_retention_days
         .max(1);
+    monoize_runtime.affinity_enabled = settings_snapshot.monoize_affinity_enabled;
+    monoize_runtime.affinity_idle_ttl_seconds =
+        settings_snapshot.monoize_affinity_idle_ttl_seconds.max(1);
+    monoize_runtime.affinity_failback_mode = settings_snapshot.monoize_affinity_failback_mode;
+    monoize_runtime.affinity_failback_delay_seconds =
+        settings_snapshot.monoize_affinity_failback_delay_seconds;
     let channel_health = Arc::new(Mutex::new(HashMap::new()));
     let channel_affinity = Arc::new(Mutex::new(HashMap::new()));
     let routing_config_revision = Arc::new(AtomicU64::new(0));

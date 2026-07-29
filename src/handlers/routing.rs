@@ -280,7 +280,7 @@ fn affinity_tenant(auth: &crate::auth::AuthResult) -> Option<String> {
         .or_else(|| auth.user_id.as_ref().map(|id| format!("user:{id}")))
 }
 
-fn affinity_key_for_request(
+pub(super) fn affinity_key_for_request(
     urp: &UrpRequest,
     auth: &crate::auth::AuthResult,
 ) -> Option<(String, String)> {
@@ -295,7 +295,7 @@ fn affinity_key_for_request(
     Some((key, key_hash))
 }
 
-fn response_id_affinity_key(
+pub(super) fn response_id_affinity_key(
     logical_model: &str,
     response_id: &str,
     auth: &crate::auth::AuthResult,
@@ -306,7 +306,7 @@ fn response_id_affinity_key(
     ))
 }
 
-async fn apply_channel_affinity(
+pub(super) async fn apply_channel_affinity(
     state: &AppState,
     urp: &UrpRequest,
     auth: &crate::auth::AuthResult,
@@ -316,19 +316,8 @@ async fn apply_channel_affinity(
         return Ok(attempts);
     };
     let now = now_ts();
-    let binding = {
-        let mut guard = state.channel_affinity.lock().await;
-        match guard.get(&key).cloned() {
-            Some(binding)
-                if now.saturating_sub(binding.updated_at)
-                    > crate::monoize_routing::CHANNEL_AFFINITY_IDLE_TTL_SECONDS =>
-            {
-                guard.remove(&key);
-                None
-            }
-            binding => binding,
-        }
-    };
+    let binding = state.channel_affinity.lock().await.get(&key).cloned();
+    let had_binding = binding.is_some();
 
     let mut bound_target = None;
     if let Some(binding) = binding {
@@ -336,18 +325,42 @@ async fn apply_channel_affinity(
         if let Some(pos) = attempts.iter().position(|attempt| {
             attempt.provider_id == binding.provider_id && attempt.channel_id == binding.channel_id
         }) {
-            let mut attempt = attempts.remove(pos);
-            attempt.affinity_key = Some(key.clone());
-            attempt.affinity_key_hash = Some(key_hash.clone());
-            attempt.affinity_hit = Some(true);
-            attempt.affinity_target = Some(target.clone());
-            attempts.insert(0, attempt);
-            bound_target = Some(target);
+            let bound_attempt = &attempts[pos];
+            let idle_ttl =
+                i64::try_from(bound_attempt.affinity_idle_ttl_seconds).unwrap_or(i64::MAX);
+            let expired = now.saturating_sub(binding.updated_at) > idle_ttl;
+            if !bound_attempt.affinity_enabled || expired {
+                state.channel_affinity.lock().await.remove(&key);
+            } else {
+                let failback_delay = i64::try_from(bound_attempt.affinity_failback_delay_seconds)
+                    .unwrap_or(i64::MAX);
+                let has_earlier_provider = attempts[..pos]
+                    .iter()
+                    .any(|attempt| attempt.provider_id != binding.provider_id);
+                let failback_due = bound_attempt.affinity_failback_mode
+                    == crate::monoize_routing::AffinityFailbackMode::PreferHigherPriority
+                    && now.saturating_sub(binding.bound_at) >= failback_delay
+                    && has_earlier_provider;
+                if !failback_due {
+                    let mut attempt = attempts.remove(pos);
+                    attempt.affinity_key = Some(key.clone());
+                    attempt.affinity_key_hash = Some(key_hash.clone());
+                    attempt.affinity_hit = Some(true);
+                    attempt.affinity_target = Some(target.clone());
+                    attempts.insert(0, attempt);
+                }
+                bound_target = Some(target);
+            }
         } else {
             state.channel_affinity.lock().await.remove(&key);
         }
     }
 
+    let affinity_should_run =
+        had_binding || attempts.iter().any(|attempt| attempt.affinity_enabled);
+    if !affinity_should_run {
+        return Ok(attempts);
+    }
     for attempt in &mut attempts {
         if attempt.affinity_key.is_none() {
             attempt.affinity_key = Some(key.clone());
@@ -384,13 +397,31 @@ pub(super) async fn refresh_channel_affinity(state: &AppState, attempt: &Monoize
     if state.routing_config_revision.load(Ordering::Acquire) != attempt.routing_config_revision {
         return;
     }
+    if !attempt.affinity_enabled {
+        guard.remove(key);
+        return;
+    }
+    let now = now_ts();
+    let bound_at = if attempt.affinity_hit == Some(true) {
+        guard
+            .get(key)
+            .filter(|binding| {
+                binding.provider_id == attempt.provider_id
+                    && binding.channel_id == attempt.channel_id
+            })
+            .map(|binding| binding.bound_at)
+            .unwrap_or(now)
+    } else {
+        now
+    };
     insert_channel_affinity(
         &mut guard,
         key.clone(),
         crate::monoize_routing::ChannelAffinityBinding {
             provider_id: attempt.provider_id.clone(),
             channel_id: attempt.channel_id.clone(),
-            updated_at: now_ts(),
+            bound_at,
+            updated_at: now,
         },
     );
 }
@@ -402,6 +433,9 @@ pub(super) async fn refresh_response_id_affinity(
     response_id: &str,
     attempt: &MonoizeAttempt,
 ) {
+    if !attempt.affinity_enabled {
+        return;
+    }
     let response_id = response_id.trim();
     if response_id.is_empty() {
         return;
@@ -413,13 +447,29 @@ pub(super) async fn refresh_response_id_affinity(
     if state.routing_config_revision.load(Ordering::Acquire) != attempt.routing_config_revision {
         return;
     }
+    let now = now_ts();
+    let bound_at = if attempt.affinity_hit == Some(true) {
+        attempt
+            .affinity_key
+            .as_ref()
+            .and_then(|source_key| guard.get(source_key))
+            .filter(|binding| {
+                binding.provider_id == attempt.provider_id
+                    && binding.channel_id == attempt.channel_id
+            })
+            .map(|binding| binding.bound_at)
+            .unwrap_or(now)
+    } else {
+        now
+    };
     insert_channel_affinity(
         &mut guard,
         key,
         crate::monoize_routing::ChannelAffinityBinding {
             provider_id: attempt.provider_id.clone(),
             channel_id: attempt.channel_id.clone(),
-            updated_at: now_ts(),
+            bound_at,
+            updated_at: now,
         },
     );
 }
@@ -513,6 +563,19 @@ pub(super) async fn collect_provider_attempts(
             .request_timeout_ms_override
             .unwrap_or(runtime.request_timeout_ms)
             .max(1);
+        let affinity_enabled = channel
+            .affinity_enabled_override
+            .unwrap_or(runtime.affinity_enabled);
+        let affinity_idle_ttl_seconds = channel
+            .affinity_idle_ttl_seconds_override
+            .unwrap_or(runtime.affinity_idle_ttl_seconds)
+            .max(1);
+        let affinity_failback_mode = channel
+            .affinity_failback_mode_override
+            .unwrap_or(runtime.affinity_failback_mode);
+        let affinity_failback_delay_seconds = channel
+            .affinity_failback_delay_seconds_override
+            .unwrap_or(runtime.affinity_failback_delay_seconds);
         out.push(MonoizeAttempt {
             provider_id: provider.id.clone(),
             provider_type: effective_provider_type.to_config_type(),
@@ -547,6 +610,10 @@ pub(super) async fn collect_provider_attempts(
             affinity_key_hash: None,
             affinity_hit: None,
             affinity_target: None,
+            affinity_enabled,
+            affinity_idle_ttl_seconds,
+            affinity_failback_mode,
+            affinity_failback_delay_seconds,
             routing_config_revision,
         });
     }

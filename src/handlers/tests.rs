@@ -453,6 +453,10 @@ async fn routing_uses_channel_model_multiplier_and_redirect_per_attempt() {
         active_probe_interval_seconds_override: None,
         active_probe_success_threshold_override: None,
         active_probe_model_override: None,
+        affinity_enabled_override: None,
+        affinity_idle_ttl_seconds_override: None,
+        affinity_failback_mode_override: None,
+        affinity_failback_delay_seconds_override: None,
     };
 
     state
@@ -1180,6 +1184,10 @@ async fn resolve_model_suffix_preserves_reasoning_effort_on_attempt_base_request
                 active_probe_interval_seconds_override: None,
                 active_probe_success_threshold_override: None,
                 active_probe_model_override: None,
+                affinity_enabled_override: None,
+                affinity_idle_ttl_seconds_override: None,
+                affinity_failback_mode_override: None,
+                affinity_failback_delay_seconds_override: None,
             }],
         })
         .await
@@ -1276,6 +1284,10 @@ async fn build_monoize_attempts_rejects_unpriced_models_before_forwarding() {
                 active_probe_interval_seconds_override: None,
                 active_probe_success_threshold_override: None,
                 active_probe_model_override: None,
+                affinity_enabled_override: None,
+                affinity_idle_ttl_seconds_override: None,
+                affinity_failback_mode_override: None,
+                affinity_failback_delay_seconds_override: None,
             }],
         })
         .await
@@ -1345,6 +1357,10 @@ async fn build_monoize_attempts_rejects_admin_unpriced_models_without_pricing() 
                 active_probe_interval_seconds_override: None,
                 active_probe_success_threshold_override: None,
                 active_probe_model_override: None,
+                affinity_enabled_override: None,
+                affinity_idle_ttl_seconds_override: None,
+                affinity_failback_mode_override: None,
+                affinity_failback_delay_seconds_override: None,
             }],
         })
         .await
@@ -1413,6 +1429,10 @@ async fn build_monoize_attempts_rejects_admin_missing_server_tool_meter_rate() {
                 active_probe_interval_seconds_override: None,
                 active_probe_success_threshold_override: None,
                 active_probe_model_override: None,
+                affinity_enabled_override: None,
+                affinity_idle_ttl_seconds_override: None,
+                affinity_failback_mode_override: None,
+                affinity_failback_delay_seconds_override: None,
             }],
         })
         .await
@@ -1484,6 +1504,10 @@ async fn build_monoize_attempts_accepts_redirected_model_when_logical_fallback_i
                 active_probe_interval_seconds_override: None,
                 active_probe_success_threshold_override: None,
                 active_probe_model_override: None,
+                affinity_enabled_override: None,
+                affinity_idle_ttl_seconds_override: None,
+                affinity_failback_mode_override: None,
+                affinity_failback_delay_seconds_override: None,
             }],
         })
         .await
@@ -1603,6 +1627,10 @@ async fn build_monoize_attempts_uses_metadata_pricing_profile_fallback() {
                 active_probe_interval_seconds_override: None,
                 active_probe_success_threshold_override: None,
                 active_probe_model_override: None,
+                affinity_enabled_override: None,
+                affinity_idle_ttl_seconds_override: None,
+                affinity_failback_mode_override: None,
+                affinity_failback_delay_seconds_override: None,
             }],
         })
         .await
@@ -1675,6 +1703,10 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
             active_probe_interval_seconds_override: None,
             active_probe_success_threshold_override: None,
             active_probe_model_override: None,
+            affinity_enabled_override: None,
+            affinity_idle_ttl_seconds_override: None,
+            affinity_failback_mode_override: None,
+            affinity_failback_delay_seconds_override: None,
         }],
     )
     .await;
@@ -1706,6 +1738,10 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
             active_probe_interval_seconds_override: None,
             active_probe_success_threshold_override: None,
             active_probe_model_override: None,
+            affinity_enabled_override: None,
+            affinity_idle_ttl_seconds_override: None,
+            affinity_failback_mode_override: None,
+            affinity_failback_delay_seconds_override: None,
         }],
     )
     .await;
@@ -1737,6 +1773,10 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
             active_probe_interval_seconds_override: None,
             active_probe_success_threshold_override: None,
             active_probe_model_override: None,
+            affinity_enabled_override: None,
+            affinity_idle_ttl_seconds_override: None,
+            affinity_failback_mode_override: None,
+            affinity_failback_delay_seconds_override: None,
         }],
     )
     .await;
@@ -1805,6 +1845,10 @@ async fn execute_nonstream_typed_keeps_bad_gateway_when_groups_filter_every_chan
             active_probe_interval_seconds_override: None,
             active_probe_success_threshold_override: None,
             active_probe_model_override: None,
+            affinity_enabled_override: None,
+            affinity_idle_ttl_seconds_override: None,
+            affinity_failback_mode_override: None,
+            affinity_failback_delay_seconds_override: None,
         }],
     )
     .await;
@@ -1856,4 +1900,233 @@ fn apply_model_redirects_to_model_leaves_unmatched_model_unchanged() {
     );
 
     assert_eq!(model, "gpt-5-mini");
+}
+
+fn affinity_test_attempt(
+    provider_id: &str,
+    channel_id: &str,
+    failback_mode: crate::monoize_routing::AffinityFailbackMode,
+    failback_delay_seconds: u64,
+) -> MonoizeAttempt {
+    MonoizeAttempt {
+        provider_id: provider_id.to_string(),
+        provider_type: ProviderType::Responses,
+        channel_id: channel_id.to_string(),
+        base_url: "https://example.com".to_string(),
+        api_key: "secret".to_string(),
+        logical_model: "gpt-affinity".to_string(),
+        upstream_model: "gpt-affinity".to_string(),
+        model_multiplier: 1.0,
+        server_tool_usage_classes: Vec::new(),
+        provider_transforms: Vec::new(),
+        passive_failure_count_threshold: 3,
+        passive_cooldown_seconds: 60,
+        passive_window_seconds: 30,
+        passive_rate_limit_cooldown_seconds: 15,
+        channel_max_retries: 0,
+        channel_retry_interval_ms: 0,
+        circuit_breaker_enabled: true,
+        per_model_circuit_break: false,
+        provider_attempt_limit: Some(1),
+        request_timeout_ms: 30_000,
+        extra_fields_whitelist: None,
+        strip_cross_protocol_nested_extra: true,
+        billable_pricing_available: true,
+        affinity_key: None,
+        affinity_key_hash: None,
+        affinity_hit: None,
+        affinity_target: None,
+        affinity_enabled: true,
+        affinity_idle_ttl_seconds: 1800,
+        affinity_failback_mode: failback_mode,
+        affinity_failback_delay_seconds: failback_delay_seconds,
+        routing_config_revision: 0,
+    }
+}
+
+fn affinity_test_auth() -> AuthResult {
+    let mut auth = build_test_auth(None);
+    auth.user_id = Some("affinity-user".to_string());
+    auth
+}
+
+#[tokio::test]
+async fn affinity_failback_mode_controls_recovered_provider_order() {
+    let runtime = RuntimeConfig {
+        listen: "127.0.0.1:0".to_string(),
+        metrics_path: "/metrics".to_string(),
+        database_dsn: "sqlite::memory:".to_string(),
+    };
+    let state = load_state_with_runtime(runtime).await.expect("state loads");
+    let request = build_test_routing_request("gpt-affinity");
+    let auth = affinity_test_auth();
+    let (key, _) = affinity_key_for_request(&request, &auth).expect("affinity key");
+    let now = now_ts();
+    state.channel_affinity.lock().await.insert(
+        key.clone(),
+        crate::monoize_routing::ChannelAffinityBinding {
+            provider_id: "provider-b".to_string(),
+            channel_id: "channel-b1".to_string(),
+            bound_at: now - 60,
+            updated_at: now,
+        },
+    );
+
+    let sticky = apply_channel_affinity(
+        &state,
+        &request,
+        &auth,
+        vec![
+            affinity_test_attempt(
+                "provider-a",
+                "channel-a1",
+                crate::monoize_routing::AffinityFailbackMode::Sticky,
+                30,
+            ),
+            affinity_test_attempt(
+                "provider-b",
+                "channel-b1",
+                crate::monoize_routing::AffinityFailbackMode::Sticky,
+                30,
+            ),
+        ],
+    )
+    .await
+    .expect("sticky affinity applies");
+    assert_eq!(sticky[0].channel_id, "channel-b1");
+    assert_eq!(sticky[0].affinity_hit, Some(true));
+
+    let failback = apply_channel_affinity(
+        &state,
+        &request,
+        &auth,
+        vec![
+            affinity_test_attempt(
+                "provider-a",
+                "channel-a1",
+                crate::monoize_routing::AffinityFailbackMode::Sticky,
+                30,
+            ),
+            affinity_test_attempt(
+                "provider-b",
+                "channel-b1",
+                crate::monoize_routing::AffinityFailbackMode::PreferHigherPriority,
+                30,
+            ),
+        ],
+    )
+    .await
+    .expect("failback affinity applies");
+    assert_eq!(failback[0].channel_id, "channel-a1");
+    assert_eq!(failback[0].affinity_hit, Some(false));
+    assert_eq!(
+        failback[0].affinity_target.as_deref(),
+        Some("provider-b/channel-b1")
+    );
+}
+
+#[tokio::test]
+async fn affinity_disabled_override_removes_existing_binding() {
+    let runtime = RuntimeConfig {
+        listen: "127.0.0.1:0".to_string(),
+        metrics_path: "/metrics".to_string(),
+        database_dsn: "sqlite::memory:".to_string(),
+    };
+    let state = load_state_with_runtime(runtime).await.expect("state loads");
+    let request = build_test_routing_request("gpt-affinity");
+    let auth = affinity_test_auth();
+    let (key, _) = affinity_key_for_request(&request, &auth).expect("affinity key");
+    let now = now_ts();
+    state.channel_affinity.lock().await.insert(
+        key.clone(),
+        crate::monoize_routing::ChannelAffinityBinding {
+            provider_id: "provider-b".to_string(),
+            channel_id: "channel-b1".to_string(),
+            bound_at: now,
+            updated_at: now,
+        },
+    );
+    let mut disabled = affinity_test_attempt(
+        "provider-b",
+        "channel-b1",
+        crate::monoize_routing::AffinityFailbackMode::Sticky,
+        300,
+    );
+    disabled.affinity_enabled = false;
+
+    let attempts = apply_channel_affinity(&state, &request, &auth, vec![disabled])
+        .await
+        .expect("disabled affinity applies");
+
+    assert_eq!(attempts[0].affinity_hit, Some(false));
+    assert!(!state.channel_affinity.lock().await.contains_key(&key));
+}
+
+#[tokio::test]
+async fn response_id_affinity_inherits_source_binding_age_on_hit() {
+    let runtime = RuntimeConfig {
+        listen: "127.0.0.1:0".to_string(),
+        metrics_path: "/metrics".to_string(),
+        database_dsn: "sqlite::memory:".to_string(),
+    };
+    let state = load_state_with_runtime(runtime).await.expect("state loads");
+    let request = build_test_routing_request("gpt-affinity");
+    let auth = affinity_test_auth();
+    let (key, _) = affinity_key_for_request(&request, &auth).expect("affinity key");
+    let now = now_ts();
+    let original_bound_at = now - 120;
+    state.channel_affinity.lock().await.insert(
+        key.clone(),
+        crate::monoize_routing::ChannelAffinityBinding {
+            provider_id: "provider-b".to_string(),
+            channel_id: "channel-b1".to_string(),
+            bound_at: original_bound_at,
+            updated_at: now,
+        },
+    );
+    let mut attempt = affinity_test_attempt(
+        "provider-b",
+        "channel-b1",
+        crate::monoize_routing::AffinityFailbackMode::PreferHigherPriority,
+        300,
+    );
+    attempt.affinity_key = Some(key);
+    attempt.affinity_hit = Some(true);
+
+    refresh_channel_affinity(&state, &attempt).await;
+    refresh_response_id_affinity(&state, &auth, "gpt-affinity", "resp-next", &attempt).await;
+
+    let response_key = response_id_affinity_key("gpt-affinity", "resp-next", &auth)
+        .expect("response affinity key");
+    let response_binding = state
+        .channel_affinity
+        .lock()
+        .await
+        .get(&response_key)
+        .cloned()
+        .expect("response binding");
+    assert_eq!(response_binding.bound_at, original_bound_at);
+}
+
+#[test]
+fn provider_attempt_budget_survives_affinity_interleaving() {
+    let provider_a = affinity_test_attempt(
+        "provider-a",
+        "channel-a1",
+        crate::monoize_routing::AffinityFailbackMode::Sticky,
+        300,
+    );
+    let provider_b = affinity_test_attempt(
+        "provider-b",
+        "channel-b1",
+        crate::monoize_routing::AffinityFailbackMode::Sticky,
+        300,
+    );
+    let mut execution = AttemptExecutionState::default();
+
+    execution.record_upstream_attempt(&provider_b);
+    execution.record_upstream_attempt(&provider_a);
+
+    assert!(!execution.provider_budget_remaining(&provider_b));
+    assert!(!execution.provider_budget_remaining(&provider_a));
 }

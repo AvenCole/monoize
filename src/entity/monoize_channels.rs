@@ -27,6 +27,11 @@ pub struct Model {
     pub active_probe_success_threshold_override: Option<i32>,
     #[sea_orm(column_type = "Text")]
     pub active_probe_model_override: Option<String>,
+    pub affinity_enabled_override: Option<i32>,
+    pub affinity_idle_ttl_seconds_override: Option<i32>,
+    #[sea_orm(column_type = "Text")]
+    pub affinity_failback_mode_override: Option<String>,
+    pub affinity_failback_delay_seconds_override: Option<i32>,
     #[sea_orm(column_type = "Text")]
     pub created_at: String,
     #[sea_orm(column_type = "Text")]

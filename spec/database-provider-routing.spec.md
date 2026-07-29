@@ -80,6 +80,20 @@ R-CH-11. If all providers are exhausted, router MUST return `502 upstream_error`
 
 R-CH-12. If `provider.circuit_breaker_enabled == false`, routing MUST ignore runtime health state for that provider and retryable failures MUST NOT trip passive circuit breaking.
 
+## 4.1 Channel Affinity and Failback
+
+R-AFF-1. Every eligible Channel attempt MUST resolve effective affinity settings by taking each non-null Channel override before the matching global setting.
+
+R-AFF-2. A successful attempt whose effective affinity enabled value is false MUST NOT create or refresh a binding to that Channel.
+
+R-AFF-3. A binding whose target Channel resolves effective affinity enabled value false MUST be removed during targeted lookup.
+
+R-AFF-4. `"sticky"` mode MUST keep an eligible bound attempt ahead of normal Provider order.
+
+R-AFF-5. `"prefer_higher_priority"` mode MUST restore normal Provider order after the effective failback delay only when a different eligible Provider precedes the bound Provider. Weighted Channel order inside the bound Provider MUST NOT trigger this transition.
+
+R-AFF-6. An affinity-prioritized attempt and a normal-order failback attempt MUST remain subject to R-CH-3 through R-CH-8.
+
 ## 4. Model Rewriting
 
 R-MDL-1. For the selected Channel model entry:

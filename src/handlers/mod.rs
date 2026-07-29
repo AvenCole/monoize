@@ -31,7 +31,7 @@ use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
@@ -462,7 +462,6 @@ pub async fn create_embeddings(
     let mut execution_state = AttemptExecutionState::default();
 
     for attempt in attempts {
-        execution_state.enter_provider(&attempt.provider_id);
         if !execution_state.provider_budget_remaining(&attempt) {
             continue;
         }
@@ -473,7 +472,7 @@ pub async fn create_embeddings(
                 break;
             }
 
-            let attempt_number = execution_state.record_upstream_attempt();
+            let attempt_number = execution_state.record_upstream_attempt(&attempt);
             let mut upstream_body = body.clone();
             if let Some(upstream_obj) = upstream_body.as_object_mut() {
                 upstream_obj.insert(
@@ -710,6 +709,10 @@ struct MonoizeAttempt {
     affinity_key_hash: Option<String>,
     affinity_hit: Option<bool>,
     affinity_target: Option<String>,
+    affinity_enabled: bool,
+    affinity_idle_ttl_seconds: u64,
+    affinity_failback_mode: crate::monoize_routing::AffinityFailbackMode,
+    affinity_failback_delay_seconds: u64,
     routing_config_revision: u64,
 }
 
@@ -773,29 +776,30 @@ impl TriedProvider {
 
 #[derive(Default)]
 struct AttemptExecutionState {
-    current_provider_id: Option<String>,
-    provider_attempts_used: usize,
+    provider_attempts_used: HashMap<String, usize>,
     next_attempt_number: u32,
 }
 
 impl AttemptExecutionState {
-    fn enter_provider(&mut self, provider_id: &str) {
-        if self.current_provider_id.as_deref() == Some(provider_id) {
-            return;
-        }
-        self.current_provider_id = Some(provider_id.to_string());
-        self.provider_attempts_used = 0;
-    }
-
     fn provider_budget_remaining(&self, attempt: &MonoizeAttempt) -> bool {
         attempt
             .provider_attempt_limit
-            .map(|limit| self.provider_attempts_used < limit)
+            .map(|limit| {
+                self.provider_attempts_used
+                    .get(&attempt.provider_id)
+                    .copied()
+                    .unwrap_or(0)
+                    < limit
+            })
             .unwrap_or(true)
     }
 
-    fn record_upstream_attempt(&mut self) -> u32 {
-        self.provider_attempts_used = self.provider_attempts_used.saturating_add(1);
+    fn record_upstream_attempt(&mut self, attempt: &MonoizeAttempt) -> u32 {
+        let used = self
+            .provider_attempts_used
+            .entry(attempt.provider_id.clone())
+            .or_default();
+        *used = used.saturating_add(1);
         self.next_attempt_number = self.next_attempt_number.saturating_add(1);
         self.next_attempt_number
     }

@@ -250,8 +250,14 @@ ISM4.11. `monoize_channels` columns:
 - `active_probe_interval_seconds_override` INTEGER NULL
 - `active_probe_success_threshold_override` INTEGER NULL
 - `active_probe_model_override` TEXT NULL
+- `affinity_enabled_override` INTEGER NULL
+- `affinity_idle_ttl_seconds_override` INTEGER NULL
+- `affinity_failback_mode_override` TEXT NULL
+- `affinity_failback_delay_seconds_override` INTEGER NULL
 - `created_at` TEXT NOT NULL
 - `updated_at` TEXT NOT NULL
+
+ISM4.11a. Migration `m20260729_000024_channel_affinity_overrides` MUST add the four Channel affinity override columns when they are absent on SQLite or PostgreSQL. Running the migration when a column already exists MUST NOT fail.
 
 ISM4.10a. Migration `m20260403_000013_drop_orphan_channel_override_columns` MUST be idempotent when these obsolete columns are absent from a fresh baseline schema:
 

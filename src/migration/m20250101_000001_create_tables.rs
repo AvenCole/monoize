@@ -545,6 +545,13 @@ impl MigrationTrait for Migration {
                             .integer(),
                     )
                     .col(ColumnDef::new(MonoizeChannels::ActiveProbeModelOverride).text())
+                    .col(ColumnDef::new(MonoizeChannels::AffinityEnabledOverride).integer())
+                    .col(ColumnDef::new(MonoizeChannels::AffinityIdleTtlSecondsOverride).integer())
+                    .col(ColumnDef::new(MonoizeChannels::AffinityFailbackModeOverride).text())
+                    .col(
+                        ColumnDef::new(MonoizeChannels::AffinityFailbackDelaySecondsOverride)
+                            .integer(),
+                    )
                     .col(ColumnDef::new(MonoizeChannels::CreatedAt).text().not_null())
                     .col(ColumnDef::new(MonoizeChannels::UpdatedAt).text().not_null())
                     .foreign_key(
@@ -1097,6 +1104,10 @@ enum MonoizeChannels {
     ActiveProbeIntervalSecondsOverride,
     ActiveProbeSuccessThresholdOverride,
     ActiveProbeModelOverride,
+    AffinityEnabledOverride,
+    AffinityIdleTtlSecondsOverride,
+    AffinityFailbackModeOverride,
+    AffinityFailbackDelaySecondsOverride,
     CreatedAt,
     UpdatedAt,
 }
