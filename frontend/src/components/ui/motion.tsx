@@ -1,6 +1,15 @@
 /* eslint-disable react-refresh/only-export-components */
-import { motion, useReducedMotion, type Variants, type Transition } from "framer-motion";
+import { motion, useReducedMotion, LayoutGroup, type Variants, type Transition } from "framer-motion";
 import { forwardRef, type ReactNode, type ComponentProps } from "react";
+
+// Spring presets — Apple-style non-linear physics
+export const springs = {
+  snappy: { type: "spring", stiffness: 500, damping: 30 },
+  smooth: { type: "spring", stiffness: 300, damping: 30 },
+  bouncy: { type: "spring", stiffness: 400, damping: 15 },
+  gentle: { type: "spring", stiffness: 200, damping: 24 },
+  exit: { type: "spring", stiffness: 300, damping: 35 },
+} as const;
 
 // Easing functions - non-linear for smooth feel
 export const easings = {
@@ -40,7 +49,6 @@ export const scaleFadeVariants: Variants = {
   animate: { opacity: 1, scale: 1 },
   exit: { opacity: 0, scale: 0.95 },
 };
-
 // Slide up variants
 export const slideUpVariants: Variants = {
   initial: { opacity: 0, y: 20 },
@@ -82,7 +90,6 @@ const reducedStaggerItemVariants: Variants = {
 };
 
 const reducedTransition: Transition = { duration: 0 };
-
 // Page wrapper component
 interface PageWrapperProps {
   children: ReactNode;
@@ -100,7 +107,7 @@ export const PageWrapper = forwardRef<HTMLDivElement, PageWrapperProps>(
         animate="animate"
         exit="exit"
         variants={shouldReduceMotion ? reducedPageVariants : pageVariants}
-        transition={shouldReduceMotion ? reducedTransition : transitions.normal}
+        transition={shouldReduceMotion ? reducedTransition : springs.smooth}
         className={className}
       >
         {children}
@@ -135,7 +142,6 @@ export const FadeIn = forwardRef<HTMLDivElement, FadeInProps>(
   }
 );
 FadeIn.displayName = "FadeIn";
-
 // Slide up component
 interface SlideUpProps {
   children: ReactNode;
@@ -152,7 +158,7 @@ export const SlideUp = forwardRef<HTMLDivElement, SlideUpProps>(
         ref={ref}
         initial={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, y: 16 }}
         animate={shouldReduceMotion ? { opacity: 1 } : { opacity: 1, y: 0 }}
-        transition={shouldReduceMotion ? reducedTransition : { ...transitions.normal, delay }}
+        transition={shouldReduceMotion ? reducedTransition : { ...springs.smooth, delay }}
         className={className}
       >
         {children}
@@ -178,7 +184,7 @@ export const ScaleIn = forwardRef<HTMLDivElement, ScaleInProps>(
         ref={ref}
         initial={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.9 }}
         animate={shouldReduceMotion ? { opacity: 1 } : { opacity: 1, scale: 1 }}
-        transition={shouldReduceMotion ? reducedTransition : { ...transitions.springBounce, delay }}
+        transition={shouldReduceMotion ? reducedTransition : { ...springs.bouncy, delay }}
         className={className}
       >
         {children}
@@ -187,7 +193,6 @@ export const ScaleIn = forwardRef<HTMLDivElement, ScaleInProps>(
   }
 );
 ScaleIn.displayName = "ScaleIn";
-
 // Stagger list component
 interface StaggerListProps {
   children: ReactNode;
@@ -227,7 +232,7 @@ export const StaggerItem = forwardRef<HTMLDivElement, StaggerItemProps>(
       <motion.div
         ref={ref}
         variants={shouldReduceMotion ? reducedStaggerItemVariants : staggerItemVariants}
-        transition={shouldReduceMotion ? reducedTransition : transitions.normal}
+        transition={shouldReduceMotion ? reducedTransition : springs.smooth}
         className={className}
       >
         {children}
@@ -253,7 +258,7 @@ export const AnimatedCard = forwardRef<HTMLDivElement, AnimatedCardProps>(
         ref={ref}
         whileHover={shouldReduceMotion ? undefined : { scale: hoverScale, y: -2 }}
         whileTap={shouldReduceMotion ? undefined : { scale: 0.98 }}
-        transition={shouldReduceMotion ? reducedTransition : transitions.spring}
+        transition={shouldReduceMotion ? reducedTransition : springs.snappy}
         className={className}
         {...props}
       >
@@ -279,7 +284,7 @@ export const AnimatedButton = forwardRef<HTMLDivElement, AnimatedButtonProps>(
         ref={ref}
         whileHover={shouldReduceMotion ? undefined : { scale: 1.02 }}
         whileTap={shouldReduceMotion ? undefined : { scale: 0.98 }}
-        transition={shouldReduceMotion ? reducedTransition : transitions.spring}
+        transition={shouldReduceMotion ? reducedTransition : springs.snappy}
         className={className}
       >
         {children}
@@ -289,5 +294,48 @@ export const AnimatedButton = forwardRef<HTMLDivElement, AnimatedButtonProps>(
 );
 AnimatedButton.displayName = "AnimatedButton";
 
-// Re-export motion for custom usage
-export { motion, type Variants, type Transition };
+// Viewport-triggered reveal animation
+interface RevealOnScrollProps {
+  children: ReactNode;
+  className?: string;
+  once?: boolean;
+}
+
+export const RevealOnScroll = forwardRef<HTMLDivElement, RevealOnScrollProps>(
+  ({ children, className = "", once = true }, ref) => {
+    const shouldReduceMotion = useReducedMotion();
+
+    return (
+      <motion.div
+        ref={ref}
+        initial={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, y: 20 }}
+        whileInView={shouldReduceMotion ? { opacity: 1 } : { opacity: 1, y: 0 }}
+        viewport={{ once, amount: 0.2 }}
+        transition={shouldReduceMotion ? reducedTransition : springs.smooth}
+        className={className}
+      >
+        {children}
+      </motion.div>
+    );
+  }
+);
+RevealOnScroll.displayName = "RevealOnScroll";
+
+// Shared layout tab indicator for animated active-state underlines/pills
+interface SharedTabIndicatorProps {
+  layoutId: string;
+  className?: string;
+}
+
+export function SharedTabIndicator({ layoutId, className = "" }: SharedTabIndicatorProps) {
+  return (
+    <motion.span
+      layoutId={layoutId}
+      className={className}
+      transition={springs.snappy}
+    />
+  );
+}
+
+// Re-export motion utilities
+export { motion, LayoutGroup, type Variants, type Transition };

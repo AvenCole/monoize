@@ -12,13 +12,13 @@ const PageHeader = React.forwardRef<HTMLDivElement, PageHeaderProps>(
   ({ className, title, description, actions, ...props }, ref) => (
     <div
       ref={ref}
-      className={cn("flex flex-wrap items-center justify-between gap-4", className)}
+      className={cn("flex flex-wrap items-center justify-between gap-4 pb-1", className)}
       {...props}
     >
       <div className="min-w-0">
-        <h1 className="truncate font-display text-2xl font-semibold tracking-tight">{title}</h1>
+        <h1 className="truncate font-display text-2xl font-semibold tracking-tight text-balance">{title}</h1>
         {description ? (
-          <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+          <p className="mt-1.5 text-sm text-muted-foreground">{description}</p>
         ) : null}
       </div>
       {actions ? (

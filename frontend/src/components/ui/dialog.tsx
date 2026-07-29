@@ -107,7 +107,7 @@ const DialogContent = React.forwardRef<
                 opacity: 0,
                 transition: { duration: 0.16, ease: easings.easeInOutQuart },
               }}
-              className="fixed inset-0 z-50 bg-black/80"
+              className="fixed inset-0 z-50 bg-black/50 backdrop-blur-[2px]"
             />
           </DialogPrimitive.Overlay>
         ) : null}
@@ -136,7 +136,7 @@ const DialogContent = React.forwardRef<
                   }}
                   style={touchScrollStyle}
                   className={cn(
-                    "relative z-50 flex w-full max-w-lg flex-col overflow-y-auto overscroll-contain border bg-background p-6 shadow-sm sm:rounded-lg [&_*]:ring-offset-background",
+                    "relative z-50 flex w-full max-w-lg flex-col overflow-y-auto overscroll-contain rounded-lg border bg-background p-6 shadow-lg [&_*]:ring-offset-background",
                     className
                   )}
                 >

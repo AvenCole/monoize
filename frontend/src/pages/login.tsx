@@ -78,7 +78,7 @@ export function LoginPage() {
         transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
         className="absolute right-4 top-4 flex gap-2"
       >
-        <motion.div whileHover={{ scale: 1.1 }} whileTap={{ scale: 0.9 }}>
+        <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
           <Button
             variant="ghost"
             size="icon"
@@ -102,7 +102,7 @@ export function LoginPage() {
             </AnimatePresence>
           </Button>
         </motion.div>
-        <motion.div whileHover={{ scale: 1.1 }} whileTap={{ scale: 0.9 }}>
+        <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
           <Button
             variant="ghost"
             size="icon"
@@ -124,9 +124,9 @@ export function LoginPage() {
           <CardHeader className="text-center">
             <motion.div
               variants={itemVariants}
-              whileHover={{ scale: 1.05, rotate: 5 }}
-              whileTap={{ scale: 0.95 }}
-              transition={{ type: "spring", stiffness: 400, damping: 17 }}
+              whileHover={{ scale: 1.03 }}
+              whileTap={{ scale: 0.97 }}
+              transition={{ type: "spring", stiffness: 500, damping: 30 }}
               className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border bg-background p-2 text-foreground"
             >
               <MonoizeLogo className="h-full w-full" />

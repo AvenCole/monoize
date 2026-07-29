@@ -13,7 +13,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { type DashboardAnalyticsBucket } from "@/lib/api";
 import { useDashboardAnalytics, useProviders, usePublicSettings, useRequestLogs, useStats } from "@/lib/swr";
 import { cn } from "@/lib/utils";
-import { PageWrapper, motion, transitions } from "@/components/ui/motion";
+import { PageWrapper, motion, transitions, springs, SharedTabIndicator } from "@/components/ui/motion";
 import { EmptyState } from "@/components/ui/empty-state";
 import { PageHeader } from "@/components/ui/page-header";
 import { CardsPageSkeleton } from "@/components/ui/page-skeleton";
@@ -95,7 +95,7 @@ function OverviewCard({
       initial={{ opacity: 0, y: 22, scale: 0.98 }}
       animate={{ opacity: 1, y: 0, scale: 1 }}
       transition={{ delay: 0.08 * index, ...transitions.normal }}
-      whileHover={{ y: -3, transition: { duration: 0.18 } }}
+      whileHover={{ y: -1, transition: springs.snappy }}
       className="h-full"
     >
       <Card className="h-full">
@@ -458,10 +458,9 @@ export function DashboardPage() {
                       >
                         <span>{tt(tab.i18nKey, tab.fallback)}</span>
                         {active && (
-                          <motion.span
+                          <SharedTabIndicator
                             layoutId="dashboard-analysis-tab"
                             className="absolute inset-x-0 -bottom-1 h-0.5 rounded-full bg-primary"
-                            transition={{ type: "spring", stiffness: 420, damping: 36 }}
                           />
                         )}
                       </button>
