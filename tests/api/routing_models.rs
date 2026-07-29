@@ -697,6 +697,39 @@ async fn forwarding_applies_api_key_model_redirects_before_model_limits_and_rout
 }
 
 #[tokio::test]
+async fn forwarding_applies_global_model_redirects_before_model_limits_and_routing() {
+    let ctx = setup().await;
+    ctx.state
+        .monoize_runtime
+        .write()
+        .await
+        .global_model_redirects = vec![monoize::users::ModelRedirectRule {
+        pattern: "claude-.*".to_string(),
+        replace: "gpt-5-mini".to_string(),
+    }];
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, &ctx.auth_header)
+        .body(Body::from(
+            json!({
+                "model": "claude-sonnet-5",
+                "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = ctx.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["model"].as_str(), Some("gpt-5-mini"));
+}
+
+#[tokio::test]
 async fn image_generation_applies_api_key_model_redirects_before_model_limits() {
     let ctx = setup().await;
     let user = ctx

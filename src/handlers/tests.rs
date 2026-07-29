@@ -1886,9 +1886,34 @@ fn apply_model_redirects_to_model_uses_first_match_wins() {
             build_model_redirect_rule(".*opus.*", "gpt-5.4"),
             build_model_redirect_rule("claude-.*", "gpt-5.4-mini"),
         ],
+        &[],
     );
 
     assert_eq!(model, "gpt-5.4");
+}
+
+#[test]
+fn apply_model_redirects_to_model_uses_global_rule_when_api_key_rules_miss() {
+    let mut model = "claude-sonnet-5".to_string();
+    apply_model_redirects_to_model(
+        &mut model,
+        &[build_model_redirect_rule(".*opus.*", "key-target")],
+        &[build_model_redirect_rule("claude-.*", "global-target")],
+    );
+
+    assert_eq!(model, "global-target");
+}
+
+#[test]
+fn apply_model_redirects_to_model_does_not_chain_global_after_api_key_match() {
+    let mut model = "claude-sonnet-5".to_string();
+    apply_model_redirects_to_model(
+        &mut model,
+        &[build_model_redirect_rule("claude-.*", "intermediate")],
+        &[build_model_redirect_rule("intermediate", "global-target")],
+    );
+
+    assert_eq!(model, "intermediate");
 }
 
 #[test]
@@ -1897,6 +1922,7 @@ fn apply_model_redirects_to_model_leaves_unmatched_model_unchanged() {
     apply_model_redirects_to_model(
         &mut model,
         &[build_model_redirect_rule(".*opus.*", "gpt-5.4")],
+        &[build_model_redirect_rule("claude-.*", "gpt-5.4-mini")],
     );
 
     assert_eq!(model, "gpt-5-mini");

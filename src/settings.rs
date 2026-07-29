@@ -2,6 +2,7 @@ use crate::db::DbPool;
 use crate::entity::system_settings;
 use crate::monoize_routing::AffinityFailbackMode;
 use crate::transforms::{TransformRuleConfig, canonicalize_transform_rules};
+use crate::users::ModelRedirectRule;
 use chrono::{DateTime, Utc};
 use sea_orm::{EntityTrait, Set, sea_query::OnConflict};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,8 @@ pub struct SystemSettings {
     pub api_base_url: String,
     #[serde(default)]
     pub global_transforms: Vec<TransformRuleConfig>,
+    #[serde(default)]
+    pub global_model_redirects: Vec<ModelRedirectRule>,
     pub reasoning_suffix_map: HashMap<String, String>,
     #[serde(default)]
     pub codex_model_ids: Vec<String>,
@@ -166,6 +169,7 @@ impl Default for SystemSettings {
             site_description: "Unified Responses Proxy".to_string(),
             api_base_url: String::new(),
             global_transforms: Vec::new(),
+            global_model_redirects: Vec::new(),
             reasoning_suffix_map: default_reasoning_suffix_map(),
             codex_model_ids: Vec::new(),
             pricing_profile_model_patterns: default_pricing_profile_model_patterns(),
@@ -253,6 +257,12 @@ impl SettingsStore {
         self.set_if_not_exists(
             "global_transforms",
             &serde_json::to_string(&defaults.global_transforms)
+                .unwrap_or_else(|_| "[]".to_string()),
+        )
+        .await?;
+        self.set_if_not_exists(
+            "global_model_redirects",
+            &serde_json::to_string(&defaults.global_model_redirects)
                 .unwrap_or_else(|_| "[]".to_string()),
         )
         .await?;
@@ -488,6 +498,11 @@ impl SettingsStore {
                         settings.global_transforms = transforms;
                     }
                 }
+                "global_model_redirects" => {
+                    if let Ok(rules) = serde_json::from_str::<Vec<ModelRedirectRule>>(&row.value) {
+                        settings.global_model_redirects = rules;
+                    }
+                }
                 "reasoning_suffix_map" => {
                     if let Ok(map) = serde_json::from_str(&row.value) {
                         settings.reasoning_suffix_map = map;
@@ -616,6 +631,12 @@ impl SettingsStore {
         self.set(
             "global_transforms",
             &serde_json::to_string(&settings.global_transforms)
+                .unwrap_or_else(|_| "[]".to_string()),
+        )
+        .await?;
+        self.set(
+            "global_model_redirects",
+            &serde_json::to_string(&settings.global_model_redirects)
                 .unwrap_or_else(|_| "[]".to_string()),
         )
         .await?;

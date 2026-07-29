@@ -174,4 +174,8 @@ DB24. `system_settings` MUST persist `monoize_affinity_enabled`, `monoize_affini
 
 DB24a. `system_settings` MUST persist `codex_model_ids` as a JSON array of strings. A missing, invalid, or non-array value MUST resolve to `[]`. Writes MUST use the canonical ordered array defined by `spec/unified_responses_proxy.spec.md` DMO3a.
 
+DB24b. `system_settings` MUST persist `global_model_redirects` as a JSON array
+of `ModelRedirectRule` objects defined by `spec/api-key-model-redirects.spec.md`.
+A missing, invalid, or non-array value MUST resolve to `[]`.
+
 DB25. `monoize_channels` MUST persist nullable `affinity_enabled_override`, `affinity_idle_ttl_seconds_override`, `affinity_failback_mode_override`, and `affinity_failback_delay_seconds_override` columns.

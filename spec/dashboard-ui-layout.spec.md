@@ -291,6 +291,10 @@ ST6d. The card MUST state that standard OpenAI `data` continues to include every
 
 ST6e. At viewport widths below `640px`, the settings card grid and each direct card wrapper MUST shrink to the available content width without creating horizontal page overflow.
 
+ST7. `/dashboard/admin-settings` MUST include a "Global Model Redirects" card
+bound to `GET/PUT /api/dashboard/settings` field `global_model_redirects`.
+The card MUST follow `spec/api-key-model-redirects.spec.md` FR-8 through FR-13.
+
 PG-L1. `/playground` page MUST be accessible from the main navigation sidebar (below Token Management).
 
 PG-L2. The page MUST follow standard dashboard layout patterns: `PageWrapper`, `text-3xl` heading, motion animations.

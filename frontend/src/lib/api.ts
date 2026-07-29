@@ -110,6 +110,7 @@ export interface SystemSettings {
   site_description: string;
   api_base_url: string;
   global_transforms: TransformRuleConfig[];
+  global_model_redirects: ModelRedirectRule[];
   reasoning_suffix_map: Record<string, string>;
   codex_model_ids: string[];
   monoize_active_probe_enabled: boolean;

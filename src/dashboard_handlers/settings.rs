@@ -4,6 +4,7 @@ use crate::dashboard_handlers::session_helpers::{get_current_user, require_admin
 use crate::error::{AppError, AppResult};
 use crate::monoize_routing::AffinityFailbackMode;
 use crate::transforms::TransformRuleConfig;
+use crate::users::{ModelRedirectRule, validate_model_redirects};
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -22,6 +23,7 @@ pub struct UpdateSettingsRequest {
     pub site_description: Option<String>,
     pub api_base_url: Option<String>,
     pub global_transforms: Option<Vec<TransformRuleConfig>>,
+    pub global_model_redirects: Option<Vec<ModelRedirectRule>>,
     pub reasoning_suffix_map: Option<std::collections::HashMap<String, String>>,
     pub codex_model_ids: Option<Vec<String>>,
     pub monoize_active_probe_enabled: Option<bool>,
@@ -107,6 +109,12 @@ pub async fn update_settings(
     }
     if let Some(v) = body.global_transforms {
         settings.global_transforms = v;
+    }
+    if let Some(v) = body.global_model_redirects {
+        validate_model_redirects(&v).map_err(|message| {
+            AppError::new(StatusCode::BAD_REQUEST, "invalid_request", message)
+        })?;
+        settings.global_model_redirects = v;
     }
     if let Some(v) = body.reasoning_suffix_map {
         settings.reasoning_suffix_map = v;
@@ -212,6 +220,7 @@ pub async fn update_settings(
         rt.active_success_threshold = updated.monoize_active_probe_success_threshold.max(1);
         rt.active_probe_model = updated.monoize_active_probe_model.clone();
         rt.global_transforms = updated.global_transforms.clone();
+        rt.global_model_redirects = updated.global_model_redirects.clone();
         rt.extra_fields_whitelist = updated.monoize_extra_fields_whitelist.clone();
         rt.strip_cross_protocol_nested_extra = updated.monoize_strip_cross_protocol_nested_extra;
         rt.request_capture_enabled = updated.monoize_request_capture_enabled;

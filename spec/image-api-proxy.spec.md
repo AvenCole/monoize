@@ -33,6 +33,9 @@ IA-A3. Both endpoints MUST enforce quota guard.
 
 IA-A4. Both endpoints MUST enforce model allowlist per API key `model_limits`.
 
+IA-A5. Both endpoints MUST apply API-key and global model redirects according
+to `api-key-model-redirects.spec.md` before IA-A4.
+
 ## 3. Request parsing
 
 ### 3.1 `POST /v1/images/generations`

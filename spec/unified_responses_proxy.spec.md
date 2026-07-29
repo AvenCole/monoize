@@ -352,7 +352,7 @@ S4. Monoize MUST accept a Responses `input` item with `type = "item_reference"` 
 
 ### 7.1.0b Native Responses compaction endpoint
 
-CMP1. `POST /v1/responses/compact` accepts a JSON object with a non-empty string `model` and an `input` member. It MUST apply API-key model redirects, model allow-list checks, multiplier limits, Provider+Channel routing, balance guard, request logging, usage billing, retry policy, and passive health updates in the same order used by non-streaming forwarding requests.
+CMP1. `POST /v1/responses/compact` accepts a JSON object with a non-empty string `model` and an `input` member. It MUST apply API-key and global model redirects according to `spec/api-key-model-redirects.spec.md`, model allow-list checks, multiplier limits, Provider+Channel routing, balance guard, request logging, usage billing, retry policy, and passive health updates in the same order used by non-streaming forwarding requests.
 
 CMP2. A compact request MUST be eligible only for an effective upstream provider of `type=responses`. Monoize MUST call upstream path `POST /v1/responses/compact`. It MUST NOT adapt the compact request to Chat Completions, Messages, Gemini, image, or Replicate request shapes.
 

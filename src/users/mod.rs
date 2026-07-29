@@ -116,7 +116,7 @@ pub struct Session {
     pub expires_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelRedirectRule {
     pub pattern: String,
     pub replace: String,

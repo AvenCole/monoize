@@ -36,7 +36,7 @@ pub async fn compact_response(
         .filter(|model| !model.is_empty())
         .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "invalid_request", "missing model"))?
         .to_string();
-    apply_model_redirects_to_model(&mut logical_model, &auth.model_redirects);
+    apply_configured_model_redirects_to_model(&state, &mut logical_model, &auth).await;
     ensure_model_allowed(&auth, &logical_model)?;
     body_obj.insert("model".to_string(), Value::String(logical_model.clone()));
 

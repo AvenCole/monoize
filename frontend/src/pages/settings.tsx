@@ -29,6 +29,7 @@ import { TransformChainEditor } from "@/components/transforms/transform-chain-ed
 import { findFirstInvalidTransformRule } from "@/components/transforms/transform-schema";
 import { toast } from "sonner";
 import { CodexModelSelector } from "@/components/settings/codex-model-selector";
+import { ModelRedirectsEditor } from "@/components/settings/model-redirects-editor";
 
 const EFFORT_VALUES = ["none", "minimum", "low", "medium", "high", "xhigh", "max"] as const;
 
@@ -197,7 +198,13 @@ export function SettingsPage() {
     }
     setSaving(true);
     try {
-      await updateSettingsOptimistic(currentSettings);
+      const settingsToSave = {
+        ...currentSettings,
+        global_model_redirects: (currentSettings.global_model_redirects ?? []).filter(
+          (rule) => rule.pattern.trim() && rule.replace.trim()
+        ),
+      };
+      await updateSettingsOptimistic(settingsToSave);
       setLocalSettings(null); // Clear local state to use SWR data
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
@@ -409,6 +416,26 @@ export function SettingsPage() {
               <SuffixMapEditor
                 value={currentSettings.reasoning_suffix_map}
                 onChange={(map) => handleChange({ reasoning_suffix_map: map })}
+              />
+            </CardContent>
+          </Card>
+        </StaggerItem>
+
+        <StaggerItem>
+          <Card>
+            <CardHeader>
+              <CardTitle>{t("settings.globalModelRedirects")}</CardTitle>
+              <CardDescription>
+                {t("settings.globalModelRedirectsDescription")}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <ModelRedirectsEditor
+                value={currentSettings.global_model_redirects ?? []}
+                disabled={saving}
+                onChange={(global_model_redirects) =>
+                  handleChange({ global_model_redirects })
+                }
               />
             </CardContent>
           </Card>

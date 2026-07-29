@@ -38,7 +38,7 @@ pub async fn create_image_generation(
         .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "invalid_request", "missing model"))?
         .to_string();
 
-    apply_model_redirects_to_model(&mut model, &auth.model_redirects);
+    apply_configured_model_redirects_to_model(&state, &mut model, &auth).await;
 
     let n = parse_n_field(obj.get("n"))?;
 
@@ -164,7 +164,7 @@ pub async fn create_image_edit(
         AppError::new(StatusCode::BAD_REQUEST, "invalid_request", "missing model")
     })?;
 
-    apply_model_redirects_to_model(&mut model, &auth.model_redirects);
+    apply_configured_model_redirects_to_model(&state, &mut model, &auth).await;
 
     let (image_media_type, image_b64) = image_data.ok_or_else(|| {
         AppError::new(

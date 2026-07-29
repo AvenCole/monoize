@@ -1119,7 +1119,7 @@ async fn sqlite_migration_creates_request_log_retention_indexes() {
 }
 
 #[tokio::test]
-async fn settings_store_round_trips_global_transforms() {
+async fn settings_store_round_trips_global_transforms_and_model_redirects() {
     let db = DbPool::connect("sqlite::memory:")
         .await
         .expect("db connects");
@@ -1131,6 +1131,7 @@ async fn settings_store_round_trips_global_transforms() {
     let store = SettingsStore::new(db).await.expect("store creates");
     let mut settings = store.get_all().await.expect("settings load");
     assert!(settings.global_transforms.is_empty());
+    assert!(settings.global_model_redirects.is_empty());
     assert!(settings.codex_model_ids.is_empty());
     assert!(!settings.monoize_request_capture_enabled);
     assert_eq!(settings.monoize_request_capture_retention_days, 1);
@@ -1148,6 +1149,10 @@ async fn settings_store_round_trips_global_transforms() {
         models: Some(vec!["gpt-*".to_string()]),
         phase: Phase::Request,
         config: json!({}),
+    }];
+    settings.global_model_redirects = vec![ModelRedirectRule {
+        pattern: "claude-.*".to_string(),
+        replace: "gpt-5.6-sol".to_string(),
     }];
     settings.codex_model_ids = vec![
         " gpt-5.6-sol ".to_string(),
@@ -1171,6 +1176,13 @@ async fn settings_store_round_trips_global_transforms() {
         "strip_anthropic_billing_header"
     );
     assert_eq!(updated.global_transforms[0].phase, Phase::Request);
+    assert_eq!(
+        updated.global_model_redirects,
+        vec![ModelRedirectRule {
+            pattern: "claude-.*".to_string(),
+            replace: "gpt-5.6-sol".to_string(),
+        }]
+    );
     assert_eq!(
         updated.codex_model_ids,
         vec!["gpt-5.6-sol", "claude-opus-4.8"]

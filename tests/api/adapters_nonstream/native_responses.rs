@@ -537,6 +537,33 @@ async fn responses_compact_is_native_same_protocol_passthrough() {
 }
 
 #[tokio::test]
+async fn responses_compact_applies_global_model_redirect() {
+    let ctx = setup().await;
+    ctx.state
+        .monoize_runtime
+        .write()
+        .await
+        .global_model_redirects = vec![monoize::users::ModelRedirectRule {
+        pattern: "claude-sonnet-5".to_string(),
+        replace: "gpt-5-mini".to_string(),
+    }];
+
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/responses/compact",
+        json!({
+            "model": "claude-sonnet-5",
+            "input": [{ "role": "user", "content": "compact" }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let upstream = last_captured_body(&ctx, "responses_compact");
+    assert_eq!(upstream["model"], json!("gpt-5-mini"));
+}
+
+#[tokio::test]
 async fn responses_compact_rejects_streaming_before_upstream_dispatch() {
     let ctx = setup().await;
     let before = ctx
