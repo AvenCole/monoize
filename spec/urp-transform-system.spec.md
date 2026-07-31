@@ -365,9 +365,15 @@ EOIGT-12. The transform MUST NOT modify `request.input` or any response-phase pa
 CUMI-1. `compress_user_message_images` is request-phase only.
 
 CUMI-2. Config MAY contain:
-- `max_edge_px` (integer, default `1568`)
+- `max_edge_px` (integer, optional)
 - `jpeg_quality` (integer, default `80`)
+- `jpegxl_quality` (integer from `1` through `99`, default `90`)
+- `jpegxl_effort` (integer from `1` through `10`, default `7`)
+- `webp_quality` (integer from `1` through `100`, default `80`)
 - `skip_if_smaller` (boolean, default `true`)
+- `output_format` (`original`, `jpg`, `jpegxl_lossless`, `jpegxl`, `webp_lossless`, `webp`, or `png`; default `original`)
+
+When `max_edge_px` is absent, the transform MUST preserve the decoded image dimensions. When it is present, it MUST be at least `1`, and the transform MUST resize the decoded image only when its width or height exceeds that value.
 
 CUMI-3. The transform MUST inspect only ordinary `Image` nodes with `role = user`.
 
@@ -384,18 +390,30 @@ CUMI-7. On successful replacement:
 2. `data:` URL sources MUST remain `Url` with updated `url`; and
 3. provider-specific typed fields such as image detail hints MUST remain unchanged.
 
-CUMI-8. If the decoded image after resizing has an alpha channel, the transform MUST emit `image/png` using PNG best compression followed by lossless PNG optimization. If the decoded image after resizing has no alpha channel, the transform MUST emit `image/jpeg` using `jpeg_quality`.
+CUMI-8. When `output_format = original`, the transform MUST emit the same supported image format as the source, normalizing the `image/jpg` alias to `image/jpeg`; source WebP MUST use the `webp_lossless` encoder path. When `output_format` is any other configured value, the transform MUST emit the explicitly selected image format. The exact encoder modes are:
+1. `jpg` uses the mozjpeg fastest profile with `jpeg_quality`;
+2. `jpegxl_lossless` uses the reference libjxl encoder in lossless mode with `jpegxl_effort`;
+3. `jpegxl` uses the reference libjxl encoder in lossy mode with `jpegxl_quality` mapped through `JxlEncoderDistanceFromQuality` and `jpegxl_effort`;
+4. `webp_lossless` uses lossless WebP encoding;
+5. `webp` uses lossy libwebp encoding with `webp_quality`; and
+6. `png` uses PNG best compression followed by lossless PNG optimization.
+
+Both JPEG XL modes MUST emit media type `image/jxl`. Both WebP modes MUST emit media type `image/webp`.
 
 CUMI-9. The cache key material MUST be the ordered byte sequence:
-1. UTF-8 bytes of `compress_user_message_images:v3`;
+1. UTF-8 bytes of `compress_user_message_images:v4`;
 2. one zero byte;
 3. UTF-8 bytes of the source media type;
 4. one zero byte;
-5. `max_edge_px` encoded as little-endian `u32`;
+5. `max_edge_px` encoded as little-endian `u32`, using `0` when it is absent;
 6. `jpeg_quality` encoded as one byte;
-7. `skip_if_smaller` encoded as one byte, where `true = 1` and `false = 0`;
-8. one zero byte; and
-9. the decoded original image bytes.
+7. `jpegxl_quality` encoded as one byte;
+8. `jpegxl_effort` encoded as one byte;
+9. `webp_quality` encoded as one byte;
+10. `skip_if_smaller` encoded as one byte, where `true = 1` and `false = 0`;
+11. UTF-8 bytes of `output_format`;
+12. one zero byte; and
+13. the decoded original image bytes.
 
 CUMI-10. The cache key MUST be xxHash3 128-bit over the cache key material, formatted as 32 lowercase hexadecimal characters.
 
@@ -556,9 +574,15 @@ AOIM-12. `assistant_output_images_to_markdown` alone MUST NOT force an otherwise
 CAOI-1. `compress_assistant_output_images` is response-phase only.
 
 CAOI-2. Config MAY contain:
-- `max_edge_px` (integer, default `1568`)
+- `max_edge_px` (integer, optional)
 - `jpeg_quality` (integer, default `80`)
+- `jpegxl_quality` (integer from `1` through `99`, default `90`)
+- `jpegxl_effort` (integer from `1` through `10`, default `7`)
+- `webp_quality` (integer from `1` through `100`, default `80`)
 - `skip_if_smaller` (boolean, default `true`)
+- `output_format` (`original`, `jpg`, `jpegxl_lossless`, `jpegxl`, `webp_lossless`, `webp`, or `png`; default `original`)
+
+When `max_edge_px` is absent, the transform MUST preserve the decoded image dimensions. When it is present, it MUST be at least `1`, and the transform MUST resize the decoded image only when its width or height exceeds that value.
 
 CAOI-3. On non-stream responses, the transform MUST inspect only ordinary `Image` nodes with `role = assistant` in `response.output`.
 
@@ -580,7 +604,7 @@ CAOI-8. On successful replacement:
 2. `data:` URL sources MUST remain `Url` with updated `url`; and
 3. provider-specific typed fields such as image detail hints MUST remain unchanged.
 
-CAOI-9. If the decoded image after resizing has an alpha channel, the transform MUST emit `image/png` using PNG best compression followed by lossless PNG optimization. If the decoded image after resizing has no alpha channel, the transform MUST emit `image/jpeg` using `jpeg_quality`.
+CAOI-9. The output format selection and encoding rules MUST be identical to CUMI-8.
 
 CAOI-10. The cache key material and cache key algorithm MUST be identical to CUMI-9 and CUMI-10.
 

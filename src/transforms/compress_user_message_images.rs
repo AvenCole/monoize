@@ -7,9 +7,10 @@ use crate::urp::{ImageSource, Node, NodeDelta, NodeHeader, OrdinaryRole, UrpStre
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
+use image::codecs::webp::WebPEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageEncoder};
-use mozjpeg::{ColorSpace, Compress, ScanMode};
+use mozjpeg::{ColorSpace, Compress};
 use oxipng::Options;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -17,23 +18,68 @@ use std::any::Any;
 use std::collections::HashMap;
 use xxhash_rust::xxh3::Xxh3;
 
-const TRANSFORM_VERSION: &str = "compress_user_message_images:v3";
+const TRANSFORM_VERSION: &str = "compress_user_message_images:v4";
 
 #[derive(Debug, Deserialize, Clone)]
 struct Config {
-    #[serde(default = "default_max_edge_px")]
-    max_edge_px: u32,
+    #[serde(default)]
+    max_edge_px: Option<u32>,
     #[serde(default = "default_jpeg_quality")]
     jpeg_quality: u8,
+    #[serde(default = "default_jpegxl_quality")]
+    jpegxl_quality: u8,
+    #[serde(default = "default_jpegxl_effort")]
+    jpegxl_effort: u8,
+    #[serde(default = "default_webp_quality")]
+    webp_quality: u8,
     #[serde(default = "default_skip_if_smaller")]
     skip_if_smaller: bool,
+    #[serde(default)]
+    output_format: OutputFormat,
 }
 
-fn default_max_edge_px() -> u32 {
-    1568
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum OutputFormat {
+    #[default]
+    Original,
+    Jpg,
+    #[serde(rename = "jpegxl_lossless")]
+    JpegxlLossless,
+    Jpegxl,
+    #[serde(rename = "webp_lossless")]
+    WebpLossless,
+    Webp,
+    Png,
+}
+
+impl OutputFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::Jpg => "jpg",
+            Self::JpegxlLossless => "jpegxl_lossless",
+            Self::Jpegxl => "jpegxl",
+            Self::WebpLossless => "webp_lossless",
+            Self::Webp => "webp",
+            Self::Png => "png",
+        }
+    }
 }
 
 fn default_jpeg_quality() -> u8 {
+    80
+}
+
+fn default_jpegxl_quality() -> u8 {
+    90
+}
+
+fn default_jpegxl_effort() -> u8 {
+    7
+}
+
+fn default_webp_quality() -> u8 {
     80
 }
 
@@ -83,17 +129,46 @@ impl Transform for CompressUserMessageImagesTransform {
                 "max_edge_px": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Maximum width or height of compressed user-message images. Defaults to 1568."
+                    "description": "Optional maximum width or height of compressed user-message images. Omit to preserve the original dimensions."
                 },
                 "jpeg_quality": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 100,
-                    "description": "JPEG quality used when the output image has no alpha channel. Defaults to 80."
+                    "default": 80,
+                    "description": "JPEG quality used for JPEG output."
+                },
+                "jpegxl_quality": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 99,
+                    "default": 90,
+                    "description": "Quality used for lossy JPEG XL output. Quality 100 is reserved for the separate lossless mode."
+                },
+                "jpegxl_effort": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 7,
+                    "description": "JPEG XL encoding effort for both modes. Higher values compress more slowly."
+                },
+                "webp_quality": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 80,
+                    "description": "Quality used for lossy WebP output."
                 },
                 "skip_if_smaller": {
                     "type": "boolean",
-                    "description": "Keep the original image when compression does not reduce payload size. Defaults to true."
+                    "default": true,
+                    "description": "Keep the original image when compression does not reduce payload size."
+                },
+                "output_format": {
+                    "type": "string",
+                    "enum": ["original", "jpg", "jpegxl_lossless", "jpegxl", "webp_lossless", "webp", "png"],
+                    "default": "original",
+                    "description": "Output image format. Original preserves the source format."
                 }
             },
             "additionalProperties": false
@@ -103,7 +178,7 @@ impl Transform for CompressUserMessageImagesTransform {
     fn parse_config(&self, raw: Value) -> Result<Box<dyn TransformConfig>, TransformError> {
         let cfg: Config = serde_json::from_value(raw)
             .map_err(|e| TransformError::InvalidConfig(e.to_string()))?;
-        if cfg.max_edge_px == 0 {
+        if cfg.max_edge_px == Some(0) {
             return Err(TransformError::InvalidConfig(
                 "max_edge_px must be >= 1".to_string(),
             ));
@@ -111,6 +186,21 @@ impl Transform for CompressUserMessageImagesTransform {
         if !(1..=100).contains(&cfg.jpeg_quality) {
             return Err(TransformError::InvalidConfig(
                 "jpeg_quality must be between 1 and 100".to_string(),
+            ));
+        }
+        if !(1..=99).contains(&cfg.jpegxl_quality) {
+            return Err(TransformError::InvalidConfig(
+                "jpegxl_quality must be between 1 and 99".to_string(),
+            ));
+        }
+        if !(1..=10).contains(&cfg.jpegxl_effort) {
+            return Err(TransformError::InvalidConfig(
+                "jpegxl_effort must be between 1 and 10".to_string(),
+            ));
+        }
+        if !(1..=100).contains(&cfg.webp_quality) {
+            return Err(TransformError::InvalidConfig(
+                "webp_quality must be between 1 and 100".to_string(),
             ));
         }
         Ok(Box::new(cfg))
@@ -209,17 +299,46 @@ fn image_compression_config_schema(subject: &str) -> Value {
             "max_edge_px": {
                 "type": "integer",
                 "minimum": 1,
-                "description": format!("Maximum width or height of compressed {subject} images. Defaults to 1568.")
+                "description": format!("Optional maximum width or height of compressed {subject} images. Omit to preserve the original dimensions.")
             },
             "jpeg_quality": {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 100,
-                "description": "JPEG quality used when the output image has no alpha channel. Defaults to 80."
+                "default": 80,
+                "description": "JPEG quality used for JPEG output."
+            },
+            "jpegxl_quality": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 99,
+                "default": 90,
+                "description": "Quality used for lossy JPEG XL output. Quality 100 is reserved for the separate lossless mode."
+            },
+            "jpegxl_effort": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "default": 7,
+                "description": "JPEG XL encoding effort for both modes. Higher values compress more slowly."
+            },
+            "webp_quality": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 80,
+                "description": "Quality used for lossy WebP output."
             },
             "skip_if_smaller": {
                 "type": "boolean",
-                "description": "Keep the original image when compression does not reduce payload size. Defaults to true."
+                "default": true,
+                "description": "Keep the original image when compression does not reduce payload size."
+            },
+            "output_format": {
+                "type": "string",
+                "enum": ["original", "jpg", "jpegxl_lossless", "jpegxl", "webp_lossless", "webp", "png"],
+                "default": "original",
+                "description": "Output image format. Original preserves the source format."
             }
         },
         "additionalProperties": false
@@ -229,7 +348,7 @@ fn image_compression_config_schema(subject: &str) -> Value {
 fn parse_image_compression_config(raw: Value) -> Result<Box<dyn TransformConfig>, TransformError> {
     let cfg: Config =
         serde_json::from_value(raw).map_err(|e| TransformError::InvalidConfig(e.to_string()))?;
-    if cfg.max_edge_px == 0 {
+    if cfg.max_edge_px == Some(0) {
         return Err(TransformError::InvalidConfig(
             "max_edge_px must be >= 1".to_string(),
         ));
@@ -237,6 +356,21 @@ fn parse_image_compression_config(raw: Value) -> Result<Box<dyn TransformConfig>
     if !(1..=100).contains(&cfg.jpeg_quality) {
         return Err(TransformError::InvalidConfig(
             "jpeg_quality must be between 1 and 100".to_string(),
+        ));
+    }
+    if !(1..=99).contains(&cfg.jpegxl_quality) {
+        return Err(TransformError::InvalidConfig(
+            "jpegxl_quality must be between 1 and 99".to_string(),
+        ));
+    }
+    if !(1..=10).contains(&cfg.jpegxl_effort) {
+        return Err(TransformError::InvalidConfig(
+            "jpegxl_effort must be between 1 and 10".to_string(),
+        ));
+    }
+    if !(1..=100).contains(&cfg.webp_quality) {
+        return Err(TransformError::InvalidConfig(
+            "webp_quality must be between 1 and 100".to_string(),
         ));
     }
     Ok(Box::new(cfg))
@@ -457,9 +591,13 @@ fn build_cache_key(media_type: &str, cfg: &Config, original: &[u8]) -> String {
     hasher.update(&[0]);
     hasher.update(media_type.as_bytes());
     hasher.update(&[0]);
-    hasher.update(&cfg.max_edge_px.to_le_bytes());
+    hasher.update(&cfg.max_edge_px.unwrap_or_default().to_le_bytes());
     hasher.update(&[cfg.jpeg_quality]);
+    hasher.update(&[cfg.jpegxl_quality]);
+    hasher.update(&[cfg.jpegxl_effort]);
+    hasher.update(&[cfg.webp_quality]);
     hasher.update(&[u8::from(cfg.skip_if_smaller)]);
+    hasher.update(cfg.output_format.as_str().as_bytes());
     hasher.update(&[0]);
     hasher.update(original);
     format!("{:032x}", hasher.digest128())
@@ -471,7 +609,7 @@ struct CompressedImageBytes {
 }
 
 fn compress_image_bytes(
-    _media_type: &str,
+    media_type: &str,
     original: &[u8],
     cfg: &Config,
 ) -> Result<Option<CompressedImageBytes>, TransformError> {
@@ -480,33 +618,342 @@ fn compress_image_bytes(
         Err(_) => return Ok(None),
     };
     let resized = resize_if_needed(decoded, cfg.max_edge_px);
-    if resized.color().has_alpha() {
-        let rgba = resized.to_rgba8();
-        let (width, height) = rgba.dimensions();
-        let mut out = Vec::new();
-        let encoder =
-            PngEncoder::new_with_quality(&mut out, CompressionType::Best, PngFilterType::Adaptive);
+    let output_format = match cfg.output_format {
+        OutputFormat::Original => output_format_for_media_type(media_type),
+        selected => Some(selected),
+    };
+    let Some(output_format) = output_format else {
+        return Ok(None);
+    };
+
+    let transformed = match output_format {
+        OutputFormat::Original => unreachable!("original output format must be resolved"),
+        OutputFormat::Jpg => CompressedImageBytes {
+            media_type: "image/jpeg".to_string(),
+            bytes: encode_image_as_jpeg(&resized, cfg.jpeg_quality)?,
+        },
+        OutputFormat::JpegxlLossless => CompressedImageBytes {
+            media_type: "image/jxl".to_string(),
+            bytes: encode_image_as_jpegxl(&resized, true, cfg.jpegxl_quality, cfg.jpegxl_effort)?,
+        },
+        OutputFormat::Jpegxl => CompressedImageBytes {
+            media_type: "image/jxl".to_string(),
+            bytes: encode_image_as_jpegxl(&resized, false, cfg.jpegxl_quality, cfg.jpegxl_effort)?,
+        },
+        OutputFormat::WebpLossless => CompressedImageBytes {
+            media_type: "image/webp".to_string(),
+            bytes: encode_image_as_webp_lossless(&resized)?,
+        },
+        OutputFormat::Webp => CompressedImageBytes {
+            media_type: "image/webp".to_string(),
+            bytes: encode_image_as_webp_lossy(&resized, cfg.webp_quality)?,
+        },
+        OutputFormat::Png => CompressedImageBytes {
+            media_type: "image/png".to_string(),
+            bytes: encode_image_as_png(&resized)?,
+        },
+    };
+    Ok(Some(transformed))
+}
+
+fn output_format_for_media_type(media_type: &str) -> Option<OutputFormat> {
+    match media_type {
+        "image/jpeg" | "image/jpg" => Some(OutputFormat::Jpg),
+        "image/png" => Some(OutputFormat::Png),
+        "image/webp" => Some(OutputFormat::WebpLossless),
+        _ => None,
+    }
+}
+
+fn encode_image_as_jpeg(image: &DynamicImage, quality: u8) -> Result<Vec<u8>, TransformError> {
+    let rgb = image.to_rgb8();
+    encode_jpeg_with_mozjpeg(rgb.as_raw(), rgb.width(), rgb.height(), quality)
+}
+
+fn encode_image_as_png(image: &DynamicImage) -> Result<Vec<u8>, TransformError> {
+    let mut out = Vec::new();
+    let encoder =
+        PngEncoder::new_with_quality(&mut out, CompressionType::Best, PngFilterType::Adaptive);
+    if image.color().has_alpha() {
+        let rgba = image.to_rgba8();
         encoder
             .write_image(
                 rgba.as_raw(),
-                width,
-                height,
+                rgba.width(),
+                rgba.height(),
                 image::ExtendedColorType::Rgba8,
             )
             .map_err(|err| TransformError::Apply(format!("encode png: {err}")))?;
-        let out = optimize_png_losslessly(&out)?;
-        return Ok(Some(CompressedImageBytes {
-            media_type: "image/png".to_string(),
-            bytes: out,
-        }));
+    } else {
+        let rgb = image.to_rgb8();
+        encoder
+            .write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|err| TransformError::Apply(format!("encode png: {err}")))?;
     }
+    optimize_png_losslessly(&out)
+}
 
-    let rgb = resized.to_rgb8();
-    let out = encode_jpeg_with_mozjpeg(rgb.as_raw(), rgb.width(), rgb.height(), cfg.jpeg_quality)?;
-    Ok(Some(CompressedImageBytes {
-        media_type: "image/jpeg".to_string(),
-        bytes: out,
-    }))
+fn encode_image_as_webp_lossless(image: &DynamicImage) -> Result<Vec<u8>, TransformError> {
+    let mut out = Vec::new();
+    let encoder = WebPEncoder::new_lossless(&mut out);
+    if image.color().has_alpha() {
+        let rgba = image.to_rgba8();
+        encoder
+            .write_image(
+                rgba.as_raw(),
+                rgba.width(),
+                rgba.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|err| TransformError::Apply(format!("encode webp: {err}")))?;
+    } else {
+        let rgb = image.to_rgb8();
+        encoder
+            .write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|err| TransformError::Apply(format!("encode webp: {err}")))?;
+    }
+    Ok(out)
+}
+
+fn encode_image_as_webp_lossy(
+    image: &DynamicImage,
+    quality: u8,
+) -> Result<Vec<u8>, TransformError> {
+    let result = if image.color().has_alpha() {
+        let rgba = image.to_rgba8();
+        let config = fast_lossy_webp_config(quality)?;
+        webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+            .encode_advanced(&config)
+    } else {
+        let rgb = image.to_rgb8();
+        let config = fast_lossy_webp_config(quality)?;
+        webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height()).encode_advanced(&config)
+    };
+    result
+        .map(|encoded| encoded.to_vec())
+        .map_err(|err| TransformError::Apply(format!("encode lossy webp: {err:?}")))
+}
+
+fn fast_lossy_webp_config(quality: u8) -> Result<webp::WebPConfig, TransformError> {
+    let mut config = webp::WebPConfig::new()
+        .map_err(|_| TransformError::Apply("initialize libwebp config".to_string()))?;
+    config.lossless = 0;
+    config.quality = f32::from(quality);
+    config.method = 0;
+    config.thread_level = 1;
+    Ok(config)
+}
+
+struct LibJxlEncoder(*mut jxl_sys::JxlEncoder);
+
+struct LibJxlParallelRunner(*mut std::ffi::c_void);
+
+impl LibJxlParallelRunner {
+    fn new() -> Result<Self, TransformError> {
+        // SAFETY: the query has no preconditions and a null memory manager requests the default
+        // allocator for the runner.
+        let worker_threads = unsafe { jxl_sys::JxlThreadParallelRunnerDefaultNumWorkerThreads() };
+        let handle =
+            unsafe { jxl_sys::JxlThreadParallelRunnerCreate(std::ptr::null(), worker_threads) };
+        if handle.is_null() {
+            return Err(TransformError::Apply(
+                "create libjxl parallel runner: out of memory".to_string(),
+            ));
+        }
+        Ok(Self(handle))
+    }
+}
+
+impl Drop for LibJxlParallelRunner {
+    fn drop(&mut self) {
+        // SAFETY: the handle was returned by JxlThreadParallelRunnerCreate and is destroyed once.
+        unsafe { jxl_sys::JxlThreadParallelRunnerDestroy(self.0) };
+    }
+}
+
+impl LibJxlEncoder {
+    fn check(
+        &self,
+        status: jxl_sys::JxlEncoderStatus,
+        operation: &str,
+    ) -> Result<(), TransformError> {
+        if status == jxl_sys::JxlEncoderStatus::JXL_ENC_SUCCESS {
+            return Ok(());
+        }
+        // SAFETY: self owns a live encoder handle until Drop runs.
+        let detail = unsafe { jxl_sys::JxlEncoderGetError(self.0) };
+        Err(TransformError::Apply(format!(
+            "{operation}: libjxl status {status:?}, error {detail:?}"
+        )))
+    }
+}
+
+impl Drop for LibJxlEncoder {
+    fn drop(&mut self) {
+        // SAFETY: the handle was returned by JxlEncoderCreate and is destroyed exactly once.
+        unsafe { jxl_sys::JxlEncoderDestroy(self.0) };
+    }
+}
+
+fn encode_image_as_jpegxl(
+    image: &DynamicImage,
+    lossless: bool,
+    quality: u8,
+    effort: u8,
+) -> Result<Vec<u8>, TransformError> {
+    let has_alpha = image.color().has_alpha();
+    let (pixels, channels) = if has_alpha {
+        (image.to_rgba8().into_raw(), 4)
+    } else {
+        (image.to_rgb8().into_raw(), 3)
+    };
+    let (width, height) = image.dimensions();
+
+    let runner = LibJxlParallelRunner::new()?;
+
+    // SAFETY: a null memory manager requests libjxl's default allocator.
+    let handle = unsafe { jxl_sys::JxlEncoderCreate(std::ptr::null()) };
+    if handle.is_null() {
+        return Err(TransformError::Apply(
+            "create libjxl encoder: out of memory".to_string(),
+        ));
+    }
+    let encoder = LibJxlEncoder(handle);
+
+    // SAFETY: encoder and runner are live. The runner is declared before the encoder, so it
+    // outlives the encoder and all encoding work.
+    encoder.check(
+        unsafe {
+            jxl_sys::JxlEncoderSetParallelRunner(
+                encoder.0,
+                Some(jxl_sys::JxlThreadParallelRunner),
+                runner.0,
+            )
+        },
+        "set libjxl parallel runner",
+    )?;
+
+    let mut info = jxl_sys::JxlBasicInfo::default();
+    // SAFETY: info points to valid writable storage initialized to a valid zero bit pattern.
+    unsafe { jxl_sys::JxlEncoderInitBasicInfo(&mut info) };
+    info.xsize = width;
+    info.ysize = height;
+    info.bits_per_sample = 8;
+    info.exponent_bits_per_sample = 0;
+    info.num_color_channels = 3;
+    info.num_extra_channels = u32::from(has_alpha);
+    info.alpha_bits = if has_alpha { 8 } else { 0 };
+    info.alpha_exponent_bits = 0;
+    info.alpha_premultiplied = 0;
+    info.uses_original_profile = i32::from(lossless);
+    // SAFETY: encoder and fully initialized info are valid; libjxl copies the value.
+    encoder.check(
+        unsafe { jxl_sys::JxlEncoderSetBasicInfo(encoder.0, &info) },
+        "set libjxl basic info",
+    )?;
+
+    let mut color = jxl_sys::JxlColorEncoding::default();
+    // SAFETY: color is writable and libjxl fully initializes it as nonlinear sRGB.
+    unsafe { jxl_sys::JxlColorEncodingSetToSRGB(&mut color, 0) };
+    // SAFETY: encoder and color are valid; libjxl copies the value.
+    encoder.check(
+        unsafe { jxl_sys::JxlEncoderSetColorEncoding(encoder.0, &color) },
+        "set libjxl color encoding",
+    )?;
+
+    // SAFETY: encoder is valid and a null source requests default frame settings.
+    let frame_settings =
+        unsafe { jxl_sys::JxlEncoderFrameSettingsCreate(encoder.0, std::ptr::null()) };
+    if frame_settings.is_null() {
+        return Err(TransformError::Apply(
+            "create libjxl frame settings: out of memory".to_string(),
+        ));
+    }
+    if lossless {
+        // SAFETY: frame_settings belongs to the live encoder.
+        encoder.check(
+            unsafe { jxl_sys::JxlEncoderSetFrameLossless(frame_settings, 1) },
+            "enable lossless libjxl encoding",
+        )?;
+    } else {
+        // SAFETY: quality is validated in the documented range and frame_settings is live.
+        let distance = unsafe { jxl_sys::JxlEncoderDistanceFromQuality(f32::from(quality)) };
+        encoder.check(
+            unsafe { jxl_sys::JxlEncoderSetFrameDistance(frame_settings, distance) },
+            "set lossy libjxl quality",
+        )?;
+    }
+    // SAFETY: config validation limits effort to libjxl's valid 1 through 10 range.
+    encoder.check(
+        unsafe {
+            jxl_sys::JxlEncoderFrameSettingsSetOption(
+                frame_settings,
+                jxl_sys::JxlEncoderFrameSettingId::JXL_ENC_FRAME_SETTING_EFFORT,
+                i64::from(effort),
+            )
+        },
+        "set libjxl encoding effort",
+    )?;
+
+    let pixel_format = jxl_sys::JxlPixelFormat {
+        num_channels: channels,
+        data_type: jxl_sys::JxlDataType::JXL_TYPE_UINT8,
+        endianness: jxl_sys::JxlEndianness::JXL_NATIVE_ENDIAN,
+        align: 0,
+    };
+    // SAFETY: pixel_format describes the owned pixels buffer exactly; libjxl copies its contents.
+    encoder.check(
+        unsafe {
+            jxl_sys::JxlEncoderAddImageFrame(
+                frame_settings,
+                &pixel_format,
+                pixels.as_ptr().cast::<std::ffi::c_void>(),
+                pixels.len(),
+            )
+        },
+        "add libjxl image frame",
+    )?;
+    // SAFETY: no more input will be added to this live encoder.
+    unsafe { jxl_sys::JxlEncoderCloseInput(encoder.0) };
+
+    const INITIAL_CHUNK: usize = 65_536;
+    const MAX_CHUNK: usize = 67_108_864;
+    let mut output = Vec::new();
+    let mut chunk = INITIAL_CHUNK;
+    loop {
+        let offset = output.len();
+        output.resize(offset + chunk, 0);
+        // SAFETY: resize established a writable region of chunk bytes starting at offset.
+        let mut next_out = unsafe { output.as_mut_ptr().add(offset) };
+        let mut available = chunk;
+        // SAFETY: encoder is live and the output pointers describe the writable region above.
+        let status =
+            unsafe { jxl_sys::JxlEncoderProcessOutput(encoder.0, &mut next_out, &mut available) };
+        output.truncate(offset + chunk - available);
+        match status {
+            jxl_sys::JxlEncoderStatus::JXL_ENC_SUCCESS => return Ok(output),
+            jxl_sys::JxlEncoderStatus::JXL_ENC_NEED_MORE_OUTPUT => {
+                chunk = chunk.saturating_mul(2).min(MAX_CHUNK);
+            }
+            _ => {
+                // SAFETY: encoder is still live and owns the detailed error state.
+                let detail = unsafe { jxl_sys::JxlEncoderGetError(encoder.0) };
+                return Err(TransformError::Apply(format!(
+                    "encode jpeg xl: libjxl status {status:?}, error {detail:?}"
+                )));
+            }
+        }
+    }
 }
 
 fn encode_jpeg_with_mozjpeg(
@@ -518,9 +965,8 @@ fn encode_jpeg_with_mozjpeg(
     std::panic::catch_unwind(|| {
         let mut compressor = Compress::new(ColorSpace::JCS_RGB);
         compressor.set_size(width as usize, height as usize);
+        compressor.set_fastest_defaults();
         compressor.set_quality(quality as f32);
-        compressor.set_progressive_mode();
-        compressor.set_scan_optimization_mode(ScanMode::AllComponentsTogether);
         let mut compressor = compressor
             .start_compress(Vec::new())
             .map_err(|err| TransformError::Apply(format!("start mozjpeg compression: {err}")))?;
@@ -541,7 +987,10 @@ fn optimize_png_losslessly(bytes: &[u8]) -> Result<Vec<u8>, TransformError> {
         .map_err(|err| TransformError::Apply(format!("optimize png with oxipng: {err}")))
 }
 
-fn resize_if_needed(image: DynamicImage, max_edge_px: u32) -> DynamicImage {
+fn resize_if_needed(image: DynamicImage, max_edge_px: Option<u32>) -> DynamicImage {
+    let Some(max_edge_px) = max_edge_px else {
+        return image;
+    };
     let (width, height) = image.dimensions();
     if width.max(height) <= max_edge_px {
         return image;
@@ -571,11 +1020,28 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn compression_defaults_preserve_dimensions_and_format() {
+        let cfg: Config = serde_json::from_value(json!({})).expect("default config");
+
+        assert_eq!(cfg.max_edge_px, None);
+        assert_eq!(cfg.output_format, OutputFormat::Original);
+        assert_eq!(cfg.jpeg_quality, 80);
+        assert_eq!(cfg.jpegxl_quality, 90);
+        assert_eq!(cfg.jpegxl_effort, 7);
+        assert_eq!(cfg.webp_quality, 80);
+        assert!(cfg.skip_if_smaller);
+    }
+
+    #[test]
     fn image_cache_key_uses_128_bit_hex_digest_material() {
         let cfg = Config {
-            max_edge_px: 1568,
+            max_edge_px: None,
             jpeg_quality: 80,
+            jpegxl_quality: 90,
+            jpegxl_effort: 7,
+            webp_quality: 80,
             skip_if_smaller: true,
+            output_format: OutputFormat::Original,
         };
         let key = build_cache_key("image/png", &cfg, b"original bytes");
         let same = build_cache_key("image/png", &cfg, b"original bytes");
@@ -588,6 +1054,22 @@ mod tests {
             b"original bytes",
         );
         let changed_original = build_cache_key("image/png", &cfg, b"different bytes");
+        let changed_jpegxl_effort = build_cache_key(
+            "image/png",
+            &Config {
+                jpegxl_effort: 8,
+                ..cfg.clone()
+            },
+            b"original bytes",
+        );
+        let changed_output_format = build_cache_key(
+            "image/png",
+            &Config {
+                output_format: OutputFormat::Webp,
+                ..cfg.clone()
+            },
+            b"original bytes",
+        );
 
         assert_eq!(key.len(), 32);
         assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
@@ -595,6 +1077,159 @@ mod tests {
         assert_eq!(key, same);
         assert_ne!(key, changed_config);
         assert_ne!(key, changed_original);
+        assert_ne!(key, changed_jpegxl_effort);
+        assert_ne!(key, changed_output_format);
+    }
+
+    #[test]
+    fn encodes_explicit_jpegxl_modes_with_libjxl() {
+        let original = STANDARD
+            .decode(build_png_base64(64, 48))
+            .expect("decode png fixture");
+        for output_format in [OutputFormat::JpegxlLossless, OutputFormat::Jpegxl] {
+            let transformed = compress_image_bytes(
+                "image/png",
+                &original,
+                &Config {
+                    max_edge_px: None,
+                    jpeg_quality: 80,
+                    jpegxl_quality: 90,
+                    jpegxl_effort: 7,
+                    webp_quality: 80,
+                    skip_if_smaller: false,
+                    output_format,
+                },
+            )
+            .expect("compress image")
+            .expect("supported image");
+
+            assert_eq!(transformed.media_type, "image/jxl");
+            assert_eq!(transformed.bytes.get(..2), Some([0xff, 0x0a].as_slice()));
+        }
+    }
+
+    #[test]
+    fn encodes_explicit_lossy_webp_output_with_libwebp() {
+        let original = STANDARD
+            .decode(build_png_base64(64, 48))
+            .expect("decode png fixture");
+        let transformed = compress_image_bytes(
+            "image/png",
+            &original,
+            &Config {
+                max_edge_px: None,
+                jpeg_quality: 80,
+                jpegxl_quality: 90,
+                jpegxl_effort: 7,
+                webp_quality: 100,
+                skip_if_smaller: false,
+                output_format: OutputFormat::Webp,
+            },
+        )
+        .expect("compress image")
+        .expect("supported image");
+
+        assert_eq!(transformed.media_type, "image/webp");
+        assert_eq!(transformed.bytes.get(..4), Some(b"RIFF".as_slice()));
+        assert_eq!(
+            image::load_from_memory(&transformed.bytes)
+                .expect("decode lossy webp")
+                .dimensions(),
+            (64, 48)
+        );
+    }
+
+    #[test]
+    fn jpeg_quality_changes_mozjpeg_output() {
+        let original = STANDARD
+            .decode(build_png_base64(64, 48))
+            .expect("decode png fixture");
+        let cfg = Config {
+            max_edge_px: None,
+            jpeg_quality: 30,
+            jpegxl_quality: 90,
+            jpegxl_effort: 7,
+            webp_quality: 80,
+            skip_if_smaller: false,
+            output_format: OutputFormat::Jpg,
+        };
+        let low_quality = compress_image_bytes("image/png", &original, &cfg)
+            .expect("compress low-quality jpeg")
+            .expect("supported image");
+        let high_quality = compress_image_bytes(
+            "image/png",
+            &original,
+            &Config {
+                jpeg_quality: 90,
+                ..cfg
+            },
+        )
+        .expect("compress high-quality jpeg")
+        .expect("supported image");
+
+        assert_ne!(low_quality.bytes, high_quality.bytes);
+        assert!(low_quality.bytes.len() < high_quality.bytes.len());
+    }
+
+    #[test]
+    #[ignore = "manual benchmark; set MONOIZE_BENCH_IMAGE"]
+    fn benchmark_image_formats() {
+        let path = std::env::var("MONOIZE_BENCH_IMAGE").expect("MONOIZE_BENCH_IMAGE");
+        let selected_format = std::env::var("MONOIZE_BENCH_FORMAT").ok();
+        let read_u8 = |name: &str, default: u8| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let jpeg_quality = read_u8("MONOIZE_BENCH_JPEG_QUALITY", 100);
+        let jpegxl_quality = read_u8("MONOIZE_BENCH_JPEGXL_QUALITY", 99);
+        let jpegxl_effort = read_u8("MONOIZE_BENCH_JPEGXL_EFFORT", 7);
+        let webp_quality = read_u8("MONOIZE_BENCH_WEBP_QUALITY", 100);
+        let original = std::fs::read(&path).expect("read benchmark image");
+        println!(
+            "source\tpath={path}\tbytes={}\tjpeg_quality={jpeg_quality}\tjpegxl_quality={jpegxl_quality}\tjpegxl_effort={jpegxl_effort}\twebp_quality={webp_quality}",
+            original.len()
+        );
+
+        for (label, output_format) in [
+            ("jpg", OutputFormat::Jpg),
+            ("jpegxl_lossless", OutputFormat::JpegxlLossless),
+            ("jpegxl", OutputFormat::Jpegxl),
+            ("webp_lossless", OutputFormat::WebpLossless),
+            ("webp", OutputFormat::Webp),
+            ("png", OutputFormat::Png),
+        ] {
+            if selected_format
+                .as_deref()
+                .is_some_and(|selected| selected != label)
+            {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let transformed = compress_image_bytes(
+                "image/png",
+                &original,
+                &Config {
+                    max_edge_px: None,
+                    jpeg_quality,
+                    jpegxl_quality,
+                    jpegxl_effort,
+                    webp_quality,
+                    skip_if_smaller: false,
+                    output_format,
+                },
+            )
+            .expect("compress benchmark image")
+            .expect("supported benchmark image");
+            let ratio = transformed.bytes.len() as f64 / original.len() as f64;
+            println!(
+                "{label}\tbytes={}\tratio={ratio:.6}\tsaved={:.2}%\telapsed_ms={}",
+                transformed.bytes.len(),
+                (1.0 - ratio) * 100.0,
+                started.elapsed().as_millis()
+            );
+        }
     }
 
     #[tokio::test]
@@ -611,7 +1246,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             upstream_provider_type: None,
         };
-        let input_png = build_png_data_url_source();
+        let input_png = build_png_base64(2048, 128);
         let mut req = UrpRequest {
             model: "gpt-test".to_string(),
             input: items_to_nodes(vec![Item::Message {
@@ -645,7 +1280,7 @@ mod tests {
             enabled: true,
             models: None,
             phase: Phase::Request,
-            config: json!({"max_edge_px": 256, "jpeg_quality": 65}),
+            config: json!({"skip_if_smaller": false}),
         }];
         let registry = registry();
         let mut states = build_states_for_rules(&rules, &registry).expect("states");
@@ -672,7 +1307,7 @@ mod tests {
         let ImageSource::Base64 { media_type, data } = source else {
             panic!("expected base64 image source");
         };
-        assert_eq!(media_type, "image/jpeg");
+        assert_eq!(media_type, "image/png");
         let compressed = STANDARD
             .decode(data.as_bytes())
             .expect("decode transformed image");
@@ -680,6 +1315,12 @@ mod tests {
             .decode(input_png.as_bytes())
             .expect("decode original image");
         assert!(compressed.len() < original.len());
+        assert_eq!(
+            image::load_from_memory(&compressed)
+                .expect("decode compressed image")
+                .dimensions(),
+            (2048, 128)
+        );
 
         let entries = std::fs::read_dir(context.image_transform_cache.root())
             .expect("cache dir entries")
@@ -737,7 +1378,11 @@ mod tests {
             enabled: true,
             models: None,
             phase: Phase::Request,
-            config: json!({"max_edge_px": 256, "jpeg_quality": 65}),
+            config: json!({
+                "max_edge_px": 256,
+                "jpeg_quality": 65,
+                "output_format": "jpg"
+            }),
         }];
         let registry = registry();
         let mut states = build_states_for_rules(&rules, &registry).expect("states");
@@ -776,6 +1421,12 @@ mod tests {
             .decode(input_png.as_bytes())
             .expect("decode original image");
         assert!(compressed.len() < original.len());
+        assert_eq!(
+            image::load_from_memory(&compressed)
+                .expect("decode compressed image")
+                .dimensions(),
+            (256, 192)
+        );
     }
 
     #[tokio::test]
@@ -792,7 +1443,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             upstream_provider_type: None,
         };
-        let input_png = build_png_data_url_source();
+        let input_png = build_png_base64(2048, 128);
         let mut resp = UrpResponse {
             id: "resp-test".to_string(),
             model: "gpt-test".to_string(),
@@ -815,7 +1466,7 @@ mod tests {
             enabled: true,
             models: None,
             phase: Phase::Response,
-            config: json!({"max_edge_px": 256, "jpeg_quality": 65}),
+            config: json!({"skip_if_smaller": false}),
         }];
         let registry = registry();
         let mut states = build_states_for_rules(&rules, &registry).expect("states");
@@ -838,7 +1489,7 @@ mod tests {
         let ImageSource::Base64 { media_type, data } = source else {
             panic!("expected base64 image source");
         };
-        assert_eq!(media_type, "image/jpeg");
+        assert_eq!(media_type, "image/png");
         let compressed = STANDARD
             .decode(data.as_bytes())
             .expect("decode transformed image");
@@ -846,6 +1497,12 @@ mod tests {
             .decode(input_png.as_bytes())
             .expect("decode original image");
         assert!(compressed.len() < original.len());
+        assert_eq!(
+            image::load_from_memory(&compressed)
+                .expect("decode compressed image")
+                .dimensions(),
+            (2048, 128)
+        );
     }
 
     #[tokio::test]
@@ -867,7 +1524,11 @@ mod tests {
             enabled: true,
             models: None,
             phase: Phase::Response,
-            config: json!({"max_edge_px": 256, "jpeg_quality": 65}),
+            config: json!({
+                "max_edge_px": 256,
+                "jpeg_quality": 65,
+                "output_format": "jpg"
+            }),
         }];
         let registry = registry();
         let mut states = build_states_for_rules(&rules, &registry).expect("states");
@@ -931,7 +1592,11 @@ mod tests {
     }
 
     fn build_png_data_url_source() -> String {
-        let image = ImageBuffer::from_fn(512, 384, |x, y| {
+        build_png_base64(512, 384)
+    }
+
+    fn build_png_base64(width: u32, height: u32) -> String {
+        let image = ImageBuffer::from_fn(width, height, |x, y| {
             let r = ((x * 13 + y * 3) % 255) as u8;
             let g = ((x * 7 + y * 11) % 255) as u8;
             let b = ((x * 17 + y * 5) % 255) as u8;

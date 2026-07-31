@@ -45,9 +45,11 @@ jsonwebtoken = "9"
 inventory = "0.3.21"
 dashmap = "6.1.0"
 image = "0.25.8"
+jxl-sys = "0.1.11"
 mozjpeg = "0.10.13"
 oxipng = "10.1.0"
 percent-encoding = "2.3.2"
+webp = { version = "0.3.1", default-features = false }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [dev-dependencies]
