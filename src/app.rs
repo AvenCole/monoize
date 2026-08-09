@@ -282,9 +282,8 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         })?;
 
     {
-        use sea_orm_migration::MigratorTrait;
         let _write_guard = db.write().await;
-        crate::migration::Migrator::up(&*_write_guard, None)
+        crate::migration::run_startup_migrations(&*_write_guard)
             .await
             .map_err(|err| {
                 AppError::new(

@@ -85,7 +85,20 @@ DB15. `stmt()` MUST pass SQL through unchanged when `backend == DbBackend::Postg
 
 ## 6. Automatic Schema Migration
 
-DB16. On startup, after `DbPool::connect()` succeeds, the application MUST run `Migrator::up(db.write(), None)` to apply all pending Sea ORM migrations.
+DB16. On startup, after `DbPool::connect()` succeeds, the application MUST acquire the database write guard and call `run_startup_migrations(&*write_guard)`.
+
+DB16a. `run_startup_migrations` MUST compare the complete set of applied version names in `seaql_migrations` with the ordered version names returned by the embedded `Migrator::migrations()` list.
+
+DB16b. If every applied version is embedded in the current binary, `run_startup_migrations` MUST run `Migrator::up(db, None)` on the connection passed to the wrapper and propagate its result. This includes a new database and a database with pending embedded migrations.
+
+DB16c. If one or more applied versions are not embedded in the current binary, `run_startup_migrations` MUST return success without running `Migrator::up` if and only if both conditions are true:
+
+1. every embedded version is present in the applied-version set;
+2. every non-embedded applied version compares lexicographically greater than the last embedded version.
+
+When this exception is used, the application MUST emit a warning that identifies the last embedded version and every non-embedded applied version. This exception permits a rollback binary to start after a newer binary applied only strictly later migrations; it does not reverse or re-run a migration.
+
+DB16d. `run_startup_migrations` MUST return `DbErr` without running `Migrator::up` when a non-embedded applied version exists and either an embedded version is not applied or a non-embedded version is lexicographically less than or equal to the last embedded version. An empty, duplicate, or non-strictly-ordered embedded migration list MUST also return `DbErr`. Application startup MUST map this error to `database_migration_failed` and stop initialization.
 
 DB17. The migration system is defined in `src/migration/` per the `initial-seaorm-migration.spec.md`.
 
@@ -152,7 +165,7 @@ DB18. All store constructors MUST accept `DbPool` and use `db.read()` for querie
 DB19. Application initialization order:
 
 1. `DbPool::connect(&runtime.database_dsn)`
-2. `Migrator::up(db.write(), None)` — auto-migrate
+2. Acquire `db.write()` and call `run_startup_migrations(&*write_guard)` — apply embedded migrations or accept only the DB16c forward-compatible rollback state
 3. Construct stores: `UserStore`, `SettingsStore`, `MonoizeRoutingStore`, `ModelRegistryStore`
 
 ## 10. Cross-Backend SQL Compatibility

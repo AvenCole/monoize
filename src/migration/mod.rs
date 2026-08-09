@@ -1,4 +1,5 @@
 use sea_orm_migration::prelude::*;
+use std::collections::BTreeSet;
 
 pub struct Migrator;
 
@@ -39,6 +40,99 @@ impl MigratorTrait for Migrator {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum StartupMigrationDecision {
+    RunEmbedded,
+    AcceptNewerApplied {
+        newest_embedded: String,
+        newer_applied: Vec<String>,
+    },
+}
+
+fn startup_migration_decision(
+    embedded: &[String],
+    applied: &[String],
+) -> Result<StartupMigrationDecision, DbErr> {
+    if embedded.is_empty() {
+        return Err(DbErr::Custom(
+            "embedded migration list must not be empty".to_string(),
+        ));
+    }
+    for versions in embedded.windows(2) {
+        if versions[0] >= versions[1] {
+            return Err(DbErr::Custom(format!(
+                "embedded migration versions must be strictly ordered: '{}' is not before '{}'",
+                versions[0], versions[1]
+            )));
+        }
+    }
+
+    let embedded_set = embedded.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let applied_set = applied.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let newer_applied = applied_set
+        .difference(&embedded_set)
+        .map(|version| (*version).to_string())
+        .collect::<Vec<_>>();
+    if newer_applied.is_empty() {
+        return Ok(StartupMigrationDecision::RunEmbedded);
+    }
+
+    let missing_embedded = embedded_set
+        .difference(&applied_set)
+        .map(|version| (*version).to_string())
+        .collect::<Vec<_>>();
+    let newest_embedded = embedded
+        .last()
+        .expect("non-empty embedded migration list")
+        .clone();
+    let non_later_applied = newer_applied
+        .iter()
+        .filter(|version| version.as_str() <= newest_embedded.as_str())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if !missing_embedded.is_empty() || !non_later_applied.is_empty() {
+        return Err(DbErr::Custom(format!(
+            "database migration history is incompatible with this binary: missing embedded versions [{}]; non-embedded versions not later than '{}' [{}]",
+            missing_embedded.join(", "),
+            newest_embedded,
+            non_later_applied.join(", ")
+        )));
+    }
+
+    Ok(StartupMigrationDecision::AcceptNewerApplied {
+        newest_embedded,
+        newer_applied,
+    })
+}
+
+pub async fn run_startup_migrations(db: &sea_orm::DatabaseConnection) -> Result<(), DbErr> {
+    let embedded = Migrator::migrations()
+        .into_iter()
+        .map(|migration| migration.name().to_string())
+        .collect::<Vec<_>>();
+    let applied = Migrator::get_migration_models(db)
+        .await?
+        .into_iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+
+    match startup_migration_decision(&embedded, &applied)? {
+        StartupMigrationDecision::RunEmbedded => Migrator::up(db, None).await,
+        StartupMigrationDecision::AcceptNewerApplied {
+            newest_embedded,
+            newer_applied,
+        } => {
+            tracing::warn!(
+                newest_embedded_version = %newest_embedded,
+                newer_applied_versions = ?newer_applied,
+                "skipping startup migration because the database contains only strictly newer applied migrations"
+            );
+            Ok(())
+        }
+    }
+}
+
 mod m20250101_000001_create_tables;
 mod m20260229_000002_pg_request_logs_native_shadow;
 mod m20260307_000003_drop_pg_request_logs_shadow;
@@ -68,3 +162,112 @@ mod m20260809_000026_exact_multiplier_text;
 mod m20260809_000027_request_log_legacy_time_index;
 mod m20260809_000028_channel_model_name_index;
 mod m20260809_000029_sessions_expires_at_index;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+
+    fn versions(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn normal_history_runs_embedded_migrator() {
+        let decision = startup_migration_decision(
+            &versions(&["m001_initial", "m002_current"]),
+            &versions(&["m001_initial"]),
+        )
+        .expect("normal history is accepted");
+
+        assert_eq!(decision, StartupMigrationDecision::RunEmbedded);
+    }
+
+    #[test]
+    fn complete_history_with_only_later_versions_is_accepted() {
+        let decision = startup_migration_decision(
+            &versions(&["m001_initial", "m002_current"]),
+            &versions(&["m001_initial", "m002_current", "m003_future", "m004_future"]),
+        )
+        .expect("strictly newer history is accepted");
+
+        assert_eq!(
+            decision,
+            StartupMigrationDecision::AcceptNewerApplied {
+                newest_embedded: "m002_current".to_string(),
+                newer_applied: versions(&["m003_future", "m004_future"]),
+            }
+        );
+    }
+
+    #[test]
+    fn later_version_with_missing_embedded_version_fails_closed() {
+        let error = startup_migration_decision(
+            &versions(&["m001_initial", "m002_current"]),
+            &versions(&["m001_initial", "m003_future"]),
+        )
+        .expect_err("known migration gap must fail");
+
+        assert!(error.to_string().contains("m002_current"));
+    }
+
+    #[test]
+    fn non_embedded_version_inside_known_range_fails_closed() {
+        let error = startup_migration_decision(
+            &versions(&["m001_initial", "m003_current"]),
+            &versions(&["m001_initial", "m002_unknown", "m003_current"]),
+        )
+        .expect_err("unknown migration inside known range must fail");
+
+        assert!(error.to_string().contains("m002_unknown"));
+    }
+
+    #[test]
+    fn unordered_embedded_versions_fail_closed() {
+        let error = startup_migration_decision(
+            &versions(&["m002_current", "m001_initial"]),
+            &versions(&[]),
+        )
+        .expect_err("unordered embedded history must fail");
+
+        assert!(error.to_string().contains("strictly ordered"));
+    }
+
+    #[tokio::test]
+    async fn startup_wrapper_accepts_history_that_seaorm_rejects_as_too_new() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::install(&db)
+            .await
+            .expect("install migration table");
+
+        let mut applied = Migrator::migrations()
+            .into_iter()
+            .map(|migration| migration.name().to_string())
+            .collect::<Vec<_>>();
+        applied.push("m99999999_999999_future_migration".to_string());
+        for version in applied {
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO seaql_migrations (version, applied_at) VALUES (?, ?)",
+                [version.into(), 0_i64.into()],
+            ))
+            .await
+            .expect("record applied migration");
+        }
+
+        let direct_error = Migrator::up(&db, None)
+            .await
+            .expect_err("SeaORM rejects migration versions missing from this binary");
+        assert!(
+            direct_error
+                .to_string()
+                .contains("m99999999_999999_future_migration")
+        );
+
+        run_startup_migrations(&db)
+            .await
+            .expect("startup wrapper accepts only strictly newer versions");
+    }
+}
