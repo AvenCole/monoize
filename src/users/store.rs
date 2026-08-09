@@ -327,8 +327,8 @@ impl UserStore {
                 Some(cursor) => {
                     tx.query_all(self.db.stmt(
                         &format!(
-                            "SELECT id, key FROM api_keys
-                             WHERE (key_hash IS NULL OR key_hash = '') AND id > $1
+                            "SELECT id, key, key_hash FROM api_keys
+                             WHERE id > $1
                              ORDER BY id LIMIT {HASH_BACKFILL_CHUNK_SIZE}"
                         ),
                         vec![cursor.into()],
@@ -338,8 +338,7 @@ impl UserStore {
                 None => {
                     tx.query_all(self.db.stmt(
                         &format!(
-                            "SELECT id, key FROM api_keys
-                             WHERE key_hash IS NULL OR key_hash = ''
+                            "SELECT id, key, key_hash FROM api_keys
                              ORDER BY id LIMIT {HASH_BACKFILL_CHUNK_SIZE}"
                         ),
                         vec![],
@@ -356,9 +355,18 @@ impl UserStore {
             for row in rows {
                 let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
                 let key: String = row.try_get("", "key").map_err(|e| e.to_string())?;
-                updates.push((id, api_key_lookup_hash(&key)));
+                cursor = Some(id.clone());
+                let stored_hash: Option<String> =
+                    row.try_get("", "key_hash").map_err(|e| e.to_string())?;
+                let expected_hash = api_key_lookup_hash(&key);
+                if stored_hash.as_deref() != Some(expected_hash.as_str()) {
+                    updates.push((id, expected_hash));
+                }
             }
-            cursor = updates.last().map(|(id, _)| id.clone());
+            if updates.is_empty() {
+                tx.commit().await.map_err(|e| e.to_string())?;
+                continue;
+            }
             let mut values: Vec<SeaValue> = Vec::with_capacity(updates.len() * 3);
             let mut cases = Vec::with_capacity(updates.len());
             let mut ids = Vec::with_capacity(updates.len());
@@ -378,7 +386,7 @@ impl UserStore {
                 &format!(
                     "UPDATE api_keys
                      SET key_hash = CASE id {} ELSE key_hash END
-                     WHERE id IN ({}) AND (key_hash IS NULL OR key_hash = '')",
+                     WHERE id IN ({})",
                     cases.join(" "),
                     ids.join(", ")
                 ),

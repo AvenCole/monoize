@@ -34,7 +34,7 @@ AKP2. If AKP1 holds, Monoize MUST:
 
 1. Reject a token longer than 512 bytes as invalid before hashing or querying it.
 2. Compute the deterministic complete-token lookup hash and look up candidate API-key rows through the indexed `api_keys.key_hash` column.
-   Existing rows whose `key_hash` is null or empty MUST be backfilled from the full token before indexed authentication. Startup backfill MUST use ascending-ID keyset batches of at most 300 rows. Each non-empty batch MUST select, hash, update through one CASE statement, and commit before the next batch begins. Memory use and one transaction's row count MUST therefore remain bounded by 300. The backfill MUST NOT issue one UPDATE statement per API key.
+   Before indexed authentication, startup compatibility migration MUST recompute the current lookup hash from the full token for every existing row and MUST replace any null, empty, legacy, or otherwise mismatched `key_hash`. Startup migration MUST use ascending-ID keyset batches of at most 300 rows. Each non-empty batch MUST select at most 300 rows, update all mismatches through one CASE statement, and commit before the next batch begins. A batch whose hashes already match MUST perform no UPDATE. Memory use and one transaction's row count MUST therefore remain bounded by 300. The migration MUST NOT issue one UPDATE statement per API key.
 3. Read the candidate API-key row and its owning user in the same database query.
 4. Compare the complete supplied token with the stored full token before accepting a hash candidate. A hash match alone MUST NOT authenticate a request.
 5. Use the complete token as the in-memory authentication-cache identity. The first 12 characters MUST NOT identify a cache entry.
