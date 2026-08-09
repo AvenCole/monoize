@@ -52,7 +52,7 @@ fn build_models_list_url_avoids_duplicate_v1_suffix() {
 fn provider_pricing_model_uses_redirect_when_present() {
     let entry = MonoizeModelEntry {
         redirect: Some("  gpt-5-target  ".to_string()),
-        multiplier: 1.0,
+        multiplier: crate::exact_decimal::Multiplier::ONE,
     };
     assert_eq!(
         provider_pricing_model("gpt-5-logical", &entry),
@@ -64,7 +64,7 @@ fn provider_pricing_model_uses_redirect_when_present() {
 fn provider_pricing_model_falls_back_to_logical_when_redirect_blank() {
     let entry = MonoizeModelEntry {
         redirect: Some("   ".to_string()),
-        multiplier: 1.0,
+        multiplier: crate::exact_decimal::Multiplier::ONE,
     };
     assert_eq!(
         provider_pricing_model("gpt-5-logical", &entry),
@@ -198,7 +198,7 @@ fn dashboard_provider_response_includes_groups_and_channel_hides_api_key() {
             "gpt-5".to_string(),
             crate::monoize_routing::MonoizeModelEntry {
                 redirect: None,
-                multiplier: 1.0,
+                multiplier: crate::exact_decimal::Multiplier::ONE,
             },
         )]),
         active_probe_enabled_override: None,
@@ -585,6 +585,7 @@ async fn dashboard_api_key_allowed_groups_round_trip_through_store_and_responses
                 name: create_body.name,
                 expires_in_days: create_body.expires_in_days,
                 sub_account_enabled: create_body.sub_account_enabled,
+                sub_account_balance_nano_usd: create_body.sub_account_balance_nano_usd,
                 model_limits_enabled: create_body.model_limits_enabled,
                 model_limits: create_body.model_limits,
                 ip_whitelist: create_body.ip_whitelist,
@@ -605,7 +606,8 @@ async fn dashboard_api_key_allowed_groups_round_trip_through_store_and_responses
         vec!["alpha".to_string(), "beta".to_string()]
     );
 
-    let (nano, usd) = super::api_keys::nano_balance_fields(&created.sub_account_balance_nano);
+    let (nano, usd) = super::api_keys::nano_balance_fields(&created.sub_account_balance_nano)
+        .expect("stored balance is valid");
     let created_value = serde_json::to_value(ApiKeyCreatedResponse {
         id: created.id.clone(),
         name: created.name.clone(),
@@ -651,6 +653,7 @@ async fn dashboard_api_key_allowed_groups_round_trip_through_store_and_responses
                 name: None,
                 enabled: None,
                 sub_account_enabled: None,
+                sub_account_balance_nano_usd: None,
                 model_limits_enabled: None,
                 model_limits: None,
                 ip_whitelist: None,
@@ -689,7 +692,8 @@ async fn dashboard_api_key_allowed_groups_round_trip_through_store_and_responses
         .expect("listed api key exists");
     assert_eq!(listed_key.allowed_groups, vec!["beta".to_string()]);
 
-    let (fnano, fusd) = super::api_keys::nano_balance_fields(&fetched.sub_account_balance_nano);
+    let (fnano, fusd) = super::api_keys::nano_balance_fields(&fetched.sub_account_balance_nano)
+        .expect("stored balance is valid");
     let response_value = serde_json::to_value(ApiKeyResponse {
         id: fetched.id,
         name: fetched.name,
@@ -717,6 +721,135 @@ async fn dashboard_api_key_allowed_groups_round_trip_through_store_and_responses
     assert_eq!(
         response_value.get("request_capture_mode"),
         Some(&json!("capture-all"))
+    );
+}
+
+#[tokio::test]
+async fn admin_sub_account_adjustment_records_initial_credit_and_refund() {
+    let db = DbPool::connect("sqlite::memory:")
+        .await
+        .expect("db connects");
+    {
+        let write = db.write().await;
+        Migrator::up(&*write, None).await.expect("migrates");
+    }
+
+    let (log_tx, _) = tokio::sync::broadcast::channel(1);
+    let store = UserStore::new(db.clone(), log_tx)
+        .await
+        .expect("store creates");
+    let user = store
+        .create_user("admin", "password123", UserRole::Admin, &[])
+        .await
+        .expect("admin created");
+
+    let (created, _) = store
+        .create_api_key_extended(
+            &user.id,
+            CreateApiKeyInput {
+                name: "funded key".to_string(),
+                expires_in_days: None,
+                sub_account_enabled: true,
+                sub_account_balance_nano_usd: Some("200".to_string()),
+                model_limits_enabled: false,
+                model_limits: Vec::new(),
+                ip_whitelist: Vec::new(),
+                allowed_groups: Vec::new(),
+                max_multiplier: None,
+                transforms: Vec::new(),
+                model_redirects: Vec::new(),
+                reasoning_envelope_enabled: true,
+                request_capture_mode: crate::users::RequestCaptureMode::Off,
+            },
+            true,
+        )
+        .await
+        .expect("funded key created");
+    assert_eq!(created.sub_account_balance_nano, "200");
+
+    let updated = store
+        .update_api_key(
+            &created.id,
+            UpdateApiKeyInput {
+                name: None,
+                enabled: None,
+                sub_account_enabled: None,
+                sub_account_balance_nano_usd: Some("50".to_string()),
+                model_limits_enabled: None,
+                model_limits: None,
+                ip_whitelist: None,
+                allowed_groups: None,
+                max_multiplier: None,
+                transforms: None,
+                model_redirects: None,
+                reasoning_envelope_enabled: None,
+                request_capture_mode: None,
+                expires_at: None,
+            },
+            true,
+        )
+        .await
+        .expect("balance reduced");
+    assert_eq!(updated.sub_account_balance_nano, "50");
+    assert_eq!(
+        store
+            .get_user_balance(&user.id)
+            .await
+            .expect("balance lookup succeeds")
+            .expect("balance exists")
+            .balance_nano_usd,
+        150
+    );
+
+    let rows = db
+        .read()
+        .query_all(db.stmt(
+            "SELECT kind, delta_nano_usd FROM billing_ledger WHERE user_id = $1 ORDER BY created_at, id",
+            vec![user.id.clone().into()],
+        ))
+        .await
+        .expect("ledger query succeeds");
+    let entries = rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "kind").expect("kind"),
+                row.try_get::<String>("", "delta_nano_usd").expect("delta"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries,
+        vec![
+            (
+                "admin_sub_account_adjustment".to_string(),
+                "200".to_string()
+            ),
+            ("sub_account_refund".to_string(), "150".to_string()),
+        ]
+    );
+
+    store
+        .delete_api_key(&created.id)
+        .await
+        .expect("key deletion consolidates its balance");
+    store
+        .charge_sub_account_balance_nano(
+            &created.id,
+            &user.id,
+            250,
+            &json!({ "request_id": "request-admitted-before-delete" }),
+        )
+        .await
+        .expect("admitted request settles to user after key deletion");
+    assert_eq!(
+        store
+            .get_user_balance(&user.id)
+            .await
+            .expect("balance lookup succeeds")
+            .expect("balance exists")
+            .balance_nano_usd,
+        -50
     );
 }
 
@@ -757,6 +890,7 @@ async fn dashboard_api_key_allowed_groups_enforces_user_ceiling() {
                 name: invalid_create_body.name,
                 expires_in_days: invalid_create_body.expires_in_days,
                 sub_account_enabled: invalid_create_body.sub_account_enabled,
+                sub_account_balance_nano_usd: invalid_create_body.sub_account_balance_nano_usd,
                 model_limits_enabled: invalid_create_body.model_limits_enabled,
                 model_limits: invalid_create_body.model_limits,
                 ip_whitelist: invalid_create_body.ip_whitelist,
@@ -781,6 +915,7 @@ async fn dashboard_api_key_allowed_groups_enforces_user_ceiling() {
                 name: "valid key".to_string(),
                 expires_in_days: None,
                 sub_account_enabled: false,
+                sub_account_balance_nano_usd: None,
                 model_limits_enabled: false,
                 model_limits: Vec::new(),
                 ip_whitelist: Vec::new(),
@@ -814,6 +949,7 @@ async fn dashboard_api_key_allowed_groups_enforces_user_ceiling() {
                 name: None,
                 enabled: None,
                 sub_account_enabled: None,
+                sub_account_balance_nano_usd: None,
                 model_limits_enabled: None,
                 model_limits: None,
                 ip_whitelist: None,
@@ -843,6 +979,7 @@ async fn dashboard_api_key_allowed_groups_enforces_user_ceiling() {
                 name: "open key".to_string(),
                 expires_in_days: None,
                 sub_account_enabled: false,
+                sub_account_balance_nano_usd: None,
                 model_limits_enabled: false,
                 model_limits: Vec::new(),
                 ip_whitelist: Vec::new(),
@@ -894,6 +1031,7 @@ async fn dashboard_api_key_model_redirects_round_trip_and_validate() {
                 name: create_body.name,
                 expires_in_days: create_body.expires_in_days,
                 sub_account_enabled: create_body.sub_account_enabled,
+                sub_account_balance_nano_usd: create_body.sub_account_balance_nano_usd,
                 model_limits_enabled: create_body.model_limits_enabled,
                 model_limits: create_body.model_limits,
                 ip_whitelist: create_body.ip_whitelist,
@@ -920,6 +1058,7 @@ async fn dashboard_api_key_model_redirects_round_trip_and_validate() {
                 name: None,
                 enabled: None,
                 sub_account_enabled: None,
+                sub_account_balance_nano_usd: None,
                 model_limits_enabled: None,
                 model_limits: None,
                 ip_whitelist: None,
@@ -949,6 +1088,7 @@ async fn dashboard_api_key_model_redirects_round_trip_and_validate() {
                 name: "invalid redirect key".to_string(),
                 expires_in_days: None,
                 sub_account_enabled: false,
+                sub_account_balance_nano_usd: None,
                 model_limits_enabled: false,
                 model_limits: Vec::new(),
                 ip_whitelist: Vec::new(),
@@ -988,7 +1128,7 @@ fn request_log_timing_serializes_compatibility_aliases() {
         provider: RequestLogProvider {
             id: Some("provider-1".to_string()),
             name: Some("Provider".to_string()),
-            multiplier: Some(1.0),
+            multiplier: Some(crate::exact_decimal::Multiplier::ONE),
         },
         channel: RequestLogChannel {
             id: Some("channel-1".to_string()),

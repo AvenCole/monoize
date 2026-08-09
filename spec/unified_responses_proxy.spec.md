@@ -1179,14 +1179,16 @@ PG5. Monoize MUST decode Gemini responses from `candidates[].content.parts[]` an
 
 PG6. Monoize MUST map Gemini usage metadata to URP usage fields using:
 
-- `promptTokenCount -> input_tokens`
-- `candidatesTokenCount -> output_tokens`
+- `checked_add(promptTokenCount, toolUsePromptTokenCount) -> input_tokens`
+- `checked_add(candidatesTokenCount, thoughtsTokenCount) -> output_tokens`
 - `thoughtsTokenCount -> output_details.reasoning_tokens` when present
 - `cachedContentTokenCount -> input_details.cache_read_tokens` when present
 - `cacheCreationTokenCount -> input_details.cache_creation_tokens` when present
-- `toolPromptInputTokenCount -> input_details.tool_prompt_tokens` when present
+- `toolUsePromptTokenCount -> input_details.tool_prompt_tokens` when present
 - `acceptedPredictionOutputTokenCount -> output_details.accepted_prediction_tokens` when present
 - `rejectedPredictionOutputTokenCount -> output_details.rejected_prediction_tokens` when present
+
+PG6a. `promptTokenCount` and `candidatesTokenCount` exclude the disjoint Gemini tool-result prompt and thought counters named in PG6. A checked-add overflow while constructing either inclusive URP total MUST fail usage decoding; Monoize MUST NOT wrap or saturate the total.
 
 PG7. Monoize MUST preserve unknown Gemini request and response fields in URP v2 passthrough state according to §3 and §7.6.
 

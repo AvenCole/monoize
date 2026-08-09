@@ -74,21 +74,22 @@ DH-8. Row C analysis charts MUST be driven by the server-side analytics endpoint
   "buckets": [
     {
       "label": "MM-DD HH:00",
-      "cost_by_model": { "model-a": 12345, "model-b": 678 },
+      "cost_by_model": { "model-a": "12345", "model-b": "678" },
       "calls_by_model": { "model-a": 5, "model-b": 2 },
       "calls_by_provider": { "provider-x": 4, "provider-y": 3 }
     }
   ],
   "time_from": "ISO 8601 string",
   "time_to": "ISO 8601 string",
-  "total_cost_nano_usd": 13023,
+  "total_cost_nano_usd": "13023",
   "total_calls": 7,
-  "today_cost_nano_usd": 8000,
+  "today_cost_nano_usd": "8000",
   "today_calls": 4
 }
 ```
 
-- `cost_by_model` values are integers in nano-USD.
+- `cost_by_model`, `total_cost_nano_usd`, and `today_cost_nano_usd` values are signed base-10 integer strings in nano-USD. The server MUST aggregate them with checked `i128` arithmetic and MUST NOT narrow through a JSON number, SQL floating-point value, or Rust `i64`. The frontend MUST NOT narrow these values through JavaScript `Number` before exact totals and comparisons are complete.
+- The dashboard MUST parse, sum, and format monetary strings with `BigInt`. Chart libraries MAY receive a derived bounded display number, but that number MUST NOT be reused for totals, comparisons, persistence, or API requests.
 - `calls_by_provider` keys use the human-readable provider name (from `monoize_providers.name`) when available, falling back to `provider_id`.
 - Models/providers with zero total cost or zero total calls across ALL buckets MUST be omitted from the response entirely.
 

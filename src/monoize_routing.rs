@@ -1,4 +1,5 @@
 use crate::db::DbPool;
+use crate::exact_decimal::Multiplier;
 use crate::transforms::{TransformRuleConfig, canonicalize_transform_rules};
 use crate::users::{canonicalize_groups, parse_groups_json};
 use chrono::{DateTime, Utc};
@@ -90,7 +91,7 @@ pub struct ApiTypeOverride {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonoizeModelEntry {
     pub redirect: Option<String>,
-    pub multiplier: f64,
+    pub multiplier: Multiplier,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -988,7 +989,7 @@ impl MonoizeRoutingStore {
                         id.clone().into(),
                         model.into(),
                         entry.redirect.into(),
-                        SeaValue::Double(Some(entry.multiplier)),
+                        entry.multiplier.to_string().into(),
                         Utc::now().to_rfc3339().into(),
                     ],
                 ))
@@ -1061,8 +1062,12 @@ impl MonoizeRoutingStore {
                             .try_get("", "redirect")
                             .map_err(|e| e.to_string())?,
                         multiplier: model_row
-                            .try_get("", "multiplier")
-                            .map_err(|e| e.to_string())?,
+                            .try_get::<String>("", "multiplier")
+                            .map_err(|e| e.to_string())?
+                            .parse()
+                            .map_err(|e: String| {
+                                format!("channel {channel_id} invalid multiplier: {e}")
+                            })?,
                     },
                 );
             }
@@ -1353,12 +1358,9 @@ fn canonicalize_models(
 }
 
 fn validate_models(models: &HashMap<String, MonoizeModelEntry>) -> Result<(), String> {
-    for (model, entry) in models {
+    for model in models.keys() {
         if model.trim().is_empty() {
             return Err("model key must not be empty".to_string());
-        }
-        if !(entry.multiplier.is_finite() && entry.multiplier > 0.0) {
-            return Err("model multiplier must be > 0".to_string());
         }
     }
     Ok(())

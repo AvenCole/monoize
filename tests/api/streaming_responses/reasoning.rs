@@ -102,7 +102,7 @@ async fn responses_streaming_omits_multiple_reasoning_items_emptied_by_response_
                     model.to_string(),
                     monoize::monoize_routing::MonoizeModelEntry {
                         redirect: None,
-                        multiplier: 1.0,
+                        multiplier: monoize::exact_decimal::Multiplier::ONE,
                     },
                 )]),
                 active_probe_enabled_override: None,
@@ -298,7 +298,7 @@ async fn responses_streaming_applies_response_transform_from_provider() {
         "gpt-5-mini".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: None,
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     let create_input = monoize::monoize_routing::CreateMonoizeProviderInput {
@@ -392,7 +392,7 @@ async fn responses_streaming_split_sse_frames_breaks_large_delta_frames() {
         "gpt-5-mini".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: None,
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     let create_input = monoize::monoize_routing::CreateMonoizeProviderInput {

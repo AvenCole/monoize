@@ -39,6 +39,11 @@ import {
 	usePricingProfilePatterns
 } from '@/lib/swr'
 import type { BillingRateRecord, PricingProfilePattern } from '@/lib/api'
+import {
+	formatNanoPerTokenPerMillion,
+	nanoPerTokenToUsdPerMillion,
+	usdPerMillionToNanoPerToken
+} from '@/lib/exact-decimal'
 import { cn } from '@/lib/utils'
 
 type UsageClass = 'input_uncached' | 'cache_read' | 'output'
@@ -50,24 +55,17 @@ const visibleUsageClasses: Array<{ id: UsageClass; label: string }> = [
 ]
 
 function nanoToPerMillion(value?: string | null): string {
-	if (value == null) return '—'
-	const number = Number(value)
-	if (!Number.isFinite(number)) return '—'
-	const price = number / 1000
-	if (price === 0) return '$0'
-	if (price < 0.01) return `$${price.toFixed(4)}`
-	return `$${price.toLocaleString(undefined, { maximumFractionDigits: 4 })}`
+	return formatNanoPerTokenPerMillion(value)
 }
 
 function nanoToInput(value?: string | null): string {
-	if (value == null || !Number.isFinite(Number(value))) return ''
-	return String(Number(value) / 1000)
+	return nanoPerTokenToUsdPerMillion(value) ?? ''
 }
 
 function perMillionToNano(value: string): string {
-	const number = Number(value)
-	if (!Number.isFinite(number) || number < 0) throw new Error('Price must be zero or greater')
-	return String(Math.round(number * 1000))
+	const converted = usdPerMillionToNanoPerToken(value)
+	if (converted == null) throw new Error('Price must be a non-negative decimal')
+	return converted
 }
 
 function effectiveRate(rates: BillingRateRecord[], usageClass: UsageClass) {
@@ -312,7 +310,7 @@ export function BillingProfilesTab() {
 		</div>
 
 		<Dialog open={!!overrideTarget} onOpenChange={open => { if (!open) setOverrideTarget(null) }}>
-			<DialogContent className='max-w-lg'><DialogHeader><DialogTitle>{c('手动价格覆盖', 'Manual price override')}</DialogTitle><DialogDescription>{overrideTarget ? `${overrideTarget.profile} / ${overrideTarget.model}` : ''}</DialogDescription></DialogHeader><div className='flex flex-col gap-4 py-2'><p className='text-sm text-muted-foreground'>{c('输入 USD / 100 万 tokens。留空 Cache 表示不覆盖缓存价格。', 'Enter USD per 1M tokens. Leave cache blank to keep it unspecified.')}</p><div className='grid gap-4 sm:grid-cols-3'>{[{ key: 'input', label: 'Input' }, { key: 'cache', label: 'Cache read' }, { key: 'output', label: 'Output' }].map(item => <div key={item.key} className='flex flex-col gap-2'><Label>{item.label}</Label><div className='relative'><span className='absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground'>$</span><Input type='number' min='0' step='0.0001' className='pl-7' value={overrideForm[item.key as keyof typeof overrideForm]} onChange={event => setOverrideForm(previous => ({ ...previous, [item.key]: event.target.value }))} /></div></div>)}</div></div><DialogFooter><Button variant='outline' onClick={() => setOverrideTarget(null)}>{c('取消', 'Cancel')}</Button><Button disabled={savingOverride} onClick={() => void saveOverride()}>{savingOverride ? c('保存中…', 'Saving…') : c('保存覆盖', 'Save override')}</Button></DialogFooter></DialogContent>
+			<DialogContent className='max-w-lg'><DialogHeader><DialogTitle>{c('手动价格覆盖', 'Manual price override')}</DialogTitle><DialogDescription>{overrideTarget ? `${overrideTarget.profile} / ${overrideTarget.model}` : ''}</DialogDescription></DialogHeader><div className='flex flex-col gap-4 py-2'><p className='text-sm text-muted-foreground'>{c('输入 USD / 100 万 tokens。留空 Cache 表示不覆盖缓存价格。', 'Enter USD per 1M tokens. Leave cache blank to keep it unspecified.')}</p><div className='grid gap-4 sm:grid-cols-3'>{[{ key: 'input', label: 'Input' }, { key: 'cache', label: 'Cache read' }, { key: 'output', label: 'Output' }].map(item => <div key={item.key} className='flex flex-col gap-2'><Label>{item.label}</Label><div className='relative'><span className='absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground'>$</span><Input type='text' inputMode='decimal' className='pl-7' value={overrideForm[item.key as keyof typeof overrideForm]} onChange={event => setOverrideForm(previous => ({ ...previous, [item.key]: event.target.value }))} /></div></div>)}</div></div><DialogFooter><Button variant='outline' onClick={() => setOverrideTarget(null)}>{c('取消', 'Cancel')}</Button><Button disabled={savingOverride} onClick={() => void saveOverride()}>{savingOverride ? c('保存中…', 'Saving…') : c('保存覆盖', 'Save override')}</Button></DialogFooter></DialogContent>
 		</Dialog>
 	</>
 }

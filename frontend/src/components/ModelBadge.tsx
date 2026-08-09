@@ -31,6 +31,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
 import { Box } from 'lucide-react'
+import { normalizeMultiplier } from '@/lib/exact-decimal'
 
 const PROVIDER_ICONS: Record<
 	string,
@@ -87,7 +88,7 @@ export interface ModelBadgeProps {
 export function ModelBadge({
 	model,
 	provider,
-	multiplier = 1,
+	multiplier = '1',
 	redirect,
 	detailTarget,
 	showDetails = true,
@@ -98,11 +99,8 @@ export function ModelBadge({
 	const normalizedProvider = provider ? normalizeProvider(provider) : undefined
 	const lowerModel = model.toLowerCase()
 	const resolvedTarget = (detailTarget ?? redirect ?? model).trim()
-	const numericMultiplier = Number(multiplier)
-	const hasCustomMultiplier =
-		Number.isFinite(numericMultiplier) ?
-			numericMultiplier !== 1
-		:	String(multiplier).trim() !== '1'
+	const normalizedMultiplier = normalizeMultiplier(String(multiplier))
+	const hasCustomMultiplier = normalizedMultiplier == null || normalizedMultiplier !== '1'
 	const hasRedirectTarget =
 		resolvedTarget.length > 0 && resolvedTarget !== model
 	const shouldRenderDetails =

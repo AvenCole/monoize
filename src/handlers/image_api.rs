@@ -184,8 +184,7 @@ pub async fn create_image_edit(
     let max_multiplier_val = {
         let ceiling = auth.max_multiplier;
         let requested = max_multiplier_raw
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
+            .and_then(|s| s.parse::<Multiplier>().ok())
             .or_else(|| parse_max_multiplier_header(&headers));
         match (ceiling, requested) {
             (Some(c), Some(r)) => Some(r.min(c)),
@@ -303,17 +302,11 @@ fn resolve_image_max_multiplier(
     body_value: Option<&Value>,
     headers: &HeaderMap,
     auth: &crate::auth::AuthResult,
-) -> Option<f64> {
+) -> Option<Multiplier> {
     let ceiling = auth.max_multiplier;
     let requested = body_value
-        .and_then(|v| {
-            v.as_f64().or_else(|| {
-                v.as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .filter(|n| n.is_finite())
-            })
-        })
-        .filter(|n| *n > 0.0)
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
         .or_else(|| parse_max_multiplier_header(headers));
 
     match (ceiling, requested) {
@@ -365,7 +358,7 @@ async fn fan_out_subrequests(
     model: &str,
     input: &[urp::Node],
     extra_body: &HashMap<String, Value>,
-    max_multiplier: Option<f64>,
+    max_multiplier: Option<Multiplier>,
     n: usize,
     request_id: Option<String>,
     request_ip: Option<String>,
@@ -420,7 +413,7 @@ async fn execute_image_subrequest_typed(
     state: &AppState,
     auth: &crate::auth::AuthResult,
     req: urp::UrpRequest,
-    max_multiplier: Option<f64>,
+    max_multiplier: Option<Multiplier>,
     request_id: Option<String>,
     request_ip: Option<String>,
 ) -> AppResult<(urp::UrpResponse, String)> {
@@ -463,7 +456,7 @@ async fn execute_stream_collected_image_typed(
     state: &AppState,
     auth: &crate::auth::AuthResult,
     mut req: urp::UrpRequest,
-    max_multiplier: Option<f64>,
+    max_multiplier: Option<Multiplier>,
     request_id: Option<String>,
     request_ip: Option<String>,
 ) -> AppResult<(urp::UrpResponse, String)> {
@@ -711,8 +704,15 @@ async fn execute_stream_collected_image_typed(
                         )
                     })?;
 
-                    let charge =
-                        maybe_charge_response(state, auth, &attempt, &logical_model, &resp).await?;
+                    let charge = maybe_charge_response(
+                        state,
+                        auth,
+                        &attempt,
+                        &logical_model,
+                        &resp,
+                        request_id.as_deref(),
+                    )
+                    .await?;
                     refresh_channel_affinity(state, &attempt).await;
                     spawn_request_log(
                         state,

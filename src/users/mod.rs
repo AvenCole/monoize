@@ -3,6 +3,7 @@ mod store;
 mod utils;
 
 use crate::db::DbPool;
+use crate::exact_decimal::Multiplier;
 use crate::transforms::TransformRuleConfig;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -155,7 +156,7 @@ pub struct ApiKey {
     pub allowed_groups: Vec<String>,
     /// Maximum accepted multiplier for routing
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_multiplier: Option<f64>,
+    pub max_multiplier: Option<Multiplier>,
     /// Ordered transform rules applied for this API key
     #[serde(default)]
     pub transforms: Vec<TransformRuleConfig>,
@@ -222,6 +223,8 @@ pub struct CreateApiKeyInput {
     #[serde(default)]
     pub sub_account_enabled: bool,
     #[serde(default)]
+    pub sub_account_balance_nano_usd: Option<String>,
+    #[serde(default)]
     pub model_limits_enabled: bool,
     #[serde(default)]
     pub model_limits: Vec<String>,
@@ -230,7 +233,7 @@ pub struct CreateApiKeyInput {
     #[serde(default)]
     pub allowed_groups: Vec<String>,
     #[serde(default)]
-    pub max_multiplier: Option<f64>,
+    pub max_multiplier: Option<Multiplier>,
     #[serde(default)]
     pub transforms: Vec<TransformRuleConfig>,
     #[serde(default)]
@@ -349,11 +352,12 @@ pub struct UpdateApiKeyInput {
     pub name: Option<String>,
     pub enabled: Option<bool>,
     pub sub_account_enabled: Option<bool>,
+    pub sub_account_balance_nano_usd: Option<String>,
     pub model_limits_enabled: Option<bool>,
     pub model_limits: Option<Vec<String>>,
     pub ip_whitelist: Option<Vec<String>>,
     pub allowed_groups: Option<Vec<String>>,
-    pub max_multiplier: Option<f64>,
+    pub max_multiplier: Option<Multiplier>,
     pub transforms: Option<Vec<TransformRuleConfig>>,
     pub model_redirects: Option<Vec<ModelRedirectRule>>,
     pub reasoning_envelope_enabled: Option<bool>,
@@ -390,7 +394,7 @@ pub struct InsertRequestLog {
     pub reasoning_tokens: Option<u64>,
     pub accepted_prediction_tokens: Option<u64>,
     pub rejected_prediction_tokens: Option<u64>,
-    pub provider_multiplier: Option<f64>,
+    pub provider_multiplier: Option<Multiplier>,
     pub charge_nano_usd: Option<i128>,
     pub status: String,
     pub usage_breakdown_json: Option<Value>,
@@ -424,7 +428,7 @@ pub const REQUEST_LOG_STATUS_ERROR: &str = "error";
 pub struct RequestLogProvider {
     pub id: Option<String>,
     pub name: Option<String>,
-    pub multiplier: Option<f64>,
+    pub multiplier: Option<Multiplier>,
 }
 
 #[derive(Debug, Serialize)]
@@ -526,7 +530,7 @@ pub struct RequestLogRow {
 pub struct AnalyticsModelBucketRow {
     pub bucket_idx: i64,
     pub model: String,
-    pub cost_nano: i64,
+    pub cost_nano: i128,
     pub call_count: i64,
 }
 
@@ -539,9 +543,9 @@ pub struct AnalyticsProviderBucketRow {
 pub struct DashboardAnalyticsRaw {
     pub model_buckets: Vec<AnalyticsModelBucketRow>,
     pub provider_buckets: Vec<AnalyticsProviderBucketRow>,
-    pub total_cost_nano_usd: i64,
+    pub total_cost_nano_usd: i128,
     pub total_calls: i64,
-    pub today_cost_nano_usd: i64,
+    pub today_cost_nano_usd: i128,
     pub today_calls: i64,
 }
 

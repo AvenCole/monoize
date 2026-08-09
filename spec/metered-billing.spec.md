@@ -36,6 +36,8 @@ MB-D2. `billing_rate_records` MUST contain these columns:
 
 MB-D3. `unit_price_nano_usd` MUST be an integer string denominated in nano-USD per one `unit`.
 
+MB-D3a. `unit_price_nano_usd` MUST be non-negative and representable as `i128`. Create, update, sync, and metadata-mirror paths MUST reject a negative or malformed rate before persistence.
+
 MB-D4. `match_json` and `raw_json` MUST be JSON object strings. Invalid JSON MUST be treated as `{}` when reading legacy rows.
 
 MB-D5. `model_metadata_records` MUST continue to store model capabilities, limits, Models.dev raw data, and legacy token prices. Billing computation MUST read `billing_rate_records`. Metadata writes and Models.dev sync MAY mirror token prices into `billing_rate_records`.
@@ -109,9 +111,15 @@ MB-R7. If a tiered matrix has no deterministic tier selector under MB-R6, prefli
 
 MB-R8. For a context-tiered matrix, every non-default context tier present for a requested token class MUST have a matching rate for that token class. Missing tier rows MUST reject with HTTP `403` and code `model_pricing_required`.
 
+MB-R9. Preflight MUST parse `unit_price_nano_usd` for every candidate row as a canonical non-negative `i128` string. One malformed, non-canonical, or negative candidate row MUST make the matrix incomplete.
+
+MB-R10. A complete matrix MUST contain dimensionless fallback rows for `input_uncached` and `output`. A dimensionless fallback row has `modality = null`, `cache_ttl = null`, and `service_tier` equal to null or `default`. For a non-tiered matrix, its `context_tier` MUST equal null or `default`. For a context-tiered matrix, each tier required by MB-R8 MUST contain such a fallback row. Preflight MUST reject a matrix that lacks one of these rows.
+
 ## 4. Token Billing
 
 MB-T1. Token quantities MUST be read from normalized upstream `Usage`. Monoize MUST NOT estimate token quantities when upstream usage is available.
+
+MB-T1a. `Usage.input_tokens` and `Usage.output_tokens` MUST be inclusive totals before billing starts. If a provider reports tool-result prompt tokens or reasoning tokens as disjoint counters, its decoder MUST add those counters to the corresponding total with checked integer addition while retaining the counters in `input_details` or `output_details`. Billing MUST NOT add a retained detail counter to an inclusive total a second time.
 
 MB-T2. `Usage.input_tokens` is the aggregate prompt total. The uncached input quantity is:
 
@@ -123,7 +131,7 @@ with saturation at zero.
 
 MB-T3. `cache_read_tokens` MUST charge against `usage_class = "cache_read"` when the quantity is non-zero. A rate row with `usage_class = "input_cached"` is an accepted alias for the same quantity.
 
-MB-T3a. When eligible rows for cached input have non-null `modality`, billing MUST require `Usage.input_details.cache_read_modality_breakdown`. Billing MUST NOT derive the cached modality split from aggregate `cache_read_tokens` or from total input modality counts.
+MB-T3a. When eligible rows for cached input have non-null `modality` and `Usage.input_details.cache_read_modality_breakdown` is present, billing MUST use that breakdown. Billing MUST NOT derive the cached modality split from aggregate `cache_read_tokens` or from total input modality counts. When the breakdown is absent, billing MUST use the first matching dimensionless `cache_read` or `input_cached` row; if neither exists, billing MUST use the dimensionless `input_uncached` fallback row.
 
 MB-T4. `cache_creation_5m_tokens` MUST charge against `usage_class = "cache_write_5m"` and `cache_ttl = "5m"` when the quantity is non-zero.
 
@@ -131,11 +139,13 @@ MB-T5. `cache_creation_1h_tokens` MUST charge against `usage_class = "cache_writ
 
 MB-T6. If `cache_creation_tokens > 0`, both 5-minute and 1-hour cache-write rates are eligible, and `cache_creation_5m_tokens = cache_creation_1h_tokens = 0`, billing MUST reject with HTTP `403` and code `model_pricing_required`. Monoize MUST NOT split aggregate cache-creation usage between 5-minute and 1-hour buckets.
 
+MB-T6a. For each cache-read or cache-write bucket whose selected dimensions have no matching specialized rate, billing MUST charge that bucket with the matching dimensionless `input_uncached` fallback rate. An unsplit aggregate cache-write bucket for which MB-T6 does not select a TTL-specific rate MUST be charged once with that fallback rate.
+
 MB-T7. Output tokens excluding reasoning tokens MUST charge against `usage_class = "output"`.
 
 MB-T8. Reasoning output tokens MUST charge against `usage_class = "reasoning_output"` when the quantity is non-zero and a matching rate exists. If no matching reasoning rate exists, those tokens MUST be included in the base output bucket.
 
-MB-T9. When eligible rows for a token class have non-null `modality`, billing MUST require a modality breakdown for that class and MUST charge each non-zero modality quantity using its matching modality row. The modality quantities used for a token class MUST sum exactly to the quantity billed for that token class.
+MB-T9. When eligible rows for a token class have non-null `modality` and a modality breakdown is present, billing MUST charge each non-zero modality quantity using its matching modality row. The modality quantities used for that token class MUST sum exactly to the quantity billed for that token class. When the breakdown is absent, billing MUST charge the aggregate quantity with the first matching dimensionless row.
 
 MB-T10. For `gpt-image-2`, Monoize MUST bill text/image input tokens, cached input tokens, and image output tokens from upstream usage. Monoize MUST add an output-item fixed fee only when `billing_rate_records` contains an enabled meter row for that fee.
 
@@ -154,6 +164,10 @@ MB-M4. Call-count meters MAY use decoded native provider events when no authorit
 
 MB-M5. If a request enables a server-native tool and no eligible meter rate exists for its `usage_class`, preflight MUST reject the request with HTTP `403` and code `model_pricing_required`.
 
+MB-M6. For each meter `usage_class`, billing MUST apply only the first eligible row under MB-R2 whose context tier, service tier, modality, and cache-TTL dimensions match the settled usage. A lower-priority duplicate row for the same class and selected dimensions MUST NOT create another line item.
+
+MB-M7. Pass-through streaming MUST retain the decoded terminal URP output nodes until settlement. When authoritative provider meter usage is absent, MB-M4 MUST count call meters from those retained nodes using the same rule as non-stream settlement.
+
 ## 6. Charge Formula
 
 MB-C1. Base charge is:
@@ -168,6 +182,8 @@ MB-C2. Final charge is:
 final_charge = trunc(base_charge * provider_multiplier)
 ```
 
+`provider_multiplier` MUST be an exact positive decimal sourced from a decimal string. Multiplication MUST use checked decimal/integer arithmetic and truncate toward zero without conversion through `f32` or `f64`.
+
 MB-C3. If any required rate is missing, the request MUST be rejected for all roles, including `admin` and `super_admin`.
 
 MB-C4. A successful billing snapshot MUST persist `billing_breakdown_json` with:
@@ -180,6 +196,10 @@ MB-C4. A successful billing snapshot MUST persist `billing_breakdown_json` with:
 - `provider_multiplier`
 - `base_charge_nano`
 - `final_charge_nano`
+
+MB-C5. A billable non-stream response without normalized usage MUST be rejected before delivery. A pass-through stream without terminal normalized usage MUST settle from an estimate whose input quantity is `ceil(serialized_upstream_request_utf8_bytes / 4)` and whose output quantity is `ceil(decoded_visible_output_utf8_bytes / 4)`. The resulting billing snapshot MUST contain `estimated = true`.
+
+MB-C6. Once pass-through stream bytes have been delivered, a settlement error MUST NOT be converted into a successful zero-charge snapshot. Monoize MUST finalize the request log as an explicit billing failure containing the billing error code. The server MUST NOT claim that an error response was delivered downstream after the terminal stream event has already been sent.
 
 ## 7. Dashboard APIs
 

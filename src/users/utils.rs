@@ -66,7 +66,7 @@ pub fn parse_usd_to_nano(value: &str) -> Result<i128, String> {
 
 pub fn format_nano_to_usd(nano: i128) -> String {
     let negative = nano < 0;
-    let abs = nano.abs();
+    let abs = nano.unsigned_abs();
     let whole = abs / 1_000_000_000;
     let frac = abs % 1_000_000_000;
     if frac == 0 {
@@ -84,5 +84,18 @@ pub fn format_nano_to_usd(nano: i128) -> String {
         format!("-{whole}.{frac_str}")
     } else {
         format!("{whole}.{frac_str}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_nano_to_usd;
+
+    #[test]
+    fn formats_i128_min_without_panicking() {
+        assert_eq!(
+            format_nano_to_usd(i128::MIN),
+            "-170141183460469231731687303715.884105728"
+        );
     }
 }

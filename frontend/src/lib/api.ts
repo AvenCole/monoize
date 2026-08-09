@@ -61,7 +61,7 @@ export interface ApiKey {
   model_limits: string[];
   ip_whitelist: string[];
   allowed_groups: string[];
-  max_multiplier?: number;
+  max_multiplier?: string;
   transforms: TransformRuleConfig[];
   model_redirects: ModelRedirectRule[];
   reasoning_envelope_enabled: boolean;
@@ -74,11 +74,12 @@ export interface CreateApiKeyInput {
   name: string;
   expires_in_days?: number;
   sub_account_enabled?: boolean;
+  sub_account_balance_nano_usd?: string;
   model_limits_enabled?: boolean;
   model_limits?: string[];
   ip_whitelist?: string[];
   allowed_groups?: string[];
-  max_multiplier?: number;
+  max_multiplier?: string;
   transforms?: TransformRuleConfig[];
   model_redirects?: ModelRedirectRule[];
   reasoning_envelope_enabled?: boolean;
@@ -89,11 +90,12 @@ export interface UpdateApiKeyInput {
   name?: string;
   enabled?: boolean;
   sub_account_enabled?: boolean;
+  sub_account_balance_nano_usd?: string;
   model_limits_enabled?: boolean;
   model_limits?: string[];
   ip_whitelist?: string[];
   allowed_groups?: string[];
-  max_multiplier?: number;
+  max_multiplier?: string;
   transforms?: TransformRuleConfig[];
   expires_at?: string;
   model_redirects?: ModelRedirectRule[];
@@ -182,7 +184,7 @@ export interface ConfigOverview {
 
 export interface MonoizeModelEntry {
   redirect: string | null;
-  multiplier: number;
+  multiplier: string;
 }
 
 export interface MonoizeChannel {
@@ -408,7 +410,7 @@ export interface PricingProfilePatternsResponse {
 export interface RequestLogProvider {
   id?: string;
   name?: string;
-  multiplier?: number;
+  multiplier?: string;
 }
 
 export interface RequestLogChannel {
@@ -491,7 +493,7 @@ export interface RequestLog {
 
 export interface DashboardAnalyticsBucket {
   label: string;
-  cost_by_model: Record<string, number>;
+  cost_by_model: Record<string, string>;
   calls_by_model: Record<string, number>;
   calls_by_provider: Record<string, number>;
 }
@@ -500,9 +502,9 @@ export interface DashboardAnalytics {
   buckets: DashboardAnalyticsBucket[];
   time_from: string;
   time_to: string;
-  total_cost_nano_usd: number;
+  total_cost_nano_usd: string;
   total_calls: number;
-  today_cost_nano_usd: number;
+  today_cost_nano_usd: string;
   today_calls: number;
 }
 

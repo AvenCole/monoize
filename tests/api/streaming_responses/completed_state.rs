@@ -10,7 +10,7 @@ async fn responses_streaming_plaintext_reasoning_to_summary_rewrites_reasoning_e
         "gpt-5-mini".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: None,
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     ctx.state
@@ -272,7 +272,7 @@ async fn responses_streaming_markdown_image_transforms_emit_image_part_and_appen
         "gpt-5-mini".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: None,
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     ctx.state

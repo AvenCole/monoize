@@ -48,6 +48,7 @@ async fn enable_request_capture(ctx: &TestContext) {
                 name: None,
                 enabled: None,
                 sub_account_enabled: None,
+                sub_account_balance_nano_usd: None,
                 model_limits_enabled: None,
                 model_limits: None,
                 ip_whitelist: None,

@@ -129,6 +129,8 @@ DBO1.1. `users` MUST include billing fields:
 - `balance_nano_usd` (`TEXT`, default `"0"`)
 - `balance_unlimited` (`INTEGER`, default `0`)
 
+DBO1.2. Every persisted user or API-key balance MUST be parsed as a signed `i128` before it is returned or used. A missing or malformed balance MUST return an explicit internal storage error. Dashboard reads MUST NOT silently replace malformed balance data with zero.
+
 DBO2. `model_registry_records` is the persistent source of dashboard-managed model registry rows merged into in-memory registry at startup.
 
 DBO2.1. `model_metadata_records` is the persistent source of per-model pricing/capability metadata used by billing and dashboard diagnostics.
@@ -137,7 +139,7 @@ DBO3. `monoize_providers`, `monoize_channels`, and `monoize_channel_models` are 
 
 DBO3.0. `monoize_provider_models` MUST NOT exist after migration. Channel model rows are the only persistent owner of logical model, redirect, and multiplier configuration.
 
-DBO3.1. `billing_ledger` is append-only request charge / admin adjustment history.
+DBO3.1. `billing_ledger` is append-only request charge / admin adjustment history. A ledger row MUST remain after its referenced user or API key is deleted. `billing_ledger.user_id` stores the historical user identifier and MUST NOT have a cascading foreign key to `users`.
 
 DBO4. Legacy provider tables MUST NOT exist after the Provider/Channel model-routing migration completes.
 
@@ -160,6 +162,7 @@ DB20. All SQL statements MUST be compatible with both SQLite and PostgreSQL. Spe
 - Store dates as RFC 3339 TEXT strings.
 - Store i128 nano-USD values as TEXT strings.
 - Store booleans as INTEGER `0/1`.
+- Logical integer fields decoded into Rust `i64`, including request-log token/timing counters and model-metadata maximum-token counters, MUST map to SQLite `INTEGER` and PostgreSQL `BIGINT`. PostgreSQL `INTEGER`/`INT4` MUST NOT back a Rust `i64` field.
 - Use `TEXT`, `INTEGER`, `REAL`, `BLOB` logical types only. Logical `REAL` MUST map to SQLite `REAL` and PostgreSQL `DOUBLE PRECISION`; PostgreSQL `REAL`/`FLOAT4` MUST NOT back a Rust `f64` field.
 
 DB21. Request-log storage MUST use a single canonical table schema across SQLite and PostgreSQL. PostgreSQL-specific shadow columns for type-specialized mirrors are forbidden. If an older PostgreSQL database still contains such shadow columns, migrations MUST remove them while preserving canonical data.

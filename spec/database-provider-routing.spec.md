@@ -12,6 +12,8 @@ R-IN-1. Routing input MUST include requested `model`.
 
 R-IN-2. Routing input MAY include `max_multiplier`.
 
+R-IN-2a. `max_multiplier` and Channel model multipliers MUST use exact decimal values sourced from decimal strings. Routing comparisons MUST NOT use binary floating point.
+
 R-IN-3. Router MUST read providers from dashboard database in `priority ASC` order.
 
 R-IN-4. Routing input MUST include request-scoped `effective_groups: string[] | null` as resolved by `api-key-authentication.spec.md` §4.

@@ -47,6 +47,10 @@ pub struct UserResponse {
 
 impl From<User> for UserResponse {
     fn from(u: User) -> Self {
+        let balance_nano = u
+            .balance_nano_usd
+            .parse::<i128>()
+            .expect("UserStore must validate persisted user balances");
         Self {
             id: u.id,
             username: u.username,
@@ -54,7 +58,7 @@ impl From<User> for UserResponse {
             created_at: u.created_at.to_rfc3339(),
             last_login_at: u.last_login_at.map(|d| d.to_rfc3339()),
             enabled: u.enabled,
-            balance_usd: format_nano_to_usd(u.balance_nano_usd.parse::<i128>().unwrap_or(0)),
+            balance_usd: format_nano_to_usd(balance_nano),
             balance_nano_usd: u.balance_nano_usd,
             balance_unlimited: u.balance_unlimited,
             email: u.email,

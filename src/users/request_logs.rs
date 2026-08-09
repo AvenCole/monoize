@@ -5,8 +5,6 @@ use super::{
     UserStore,
 };
 use chrono::{Duration, Utc};
-use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 use sea_orm::ConnectionTrait;
 use sea_orm::Value as SeaValue;
 use serde_json::Value;
@@ -25,66 +23,8 @@ fn parse_optional_json_text(value: Option<String>) -> Option<Value> {
     value.and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
 }
 
-fn parse_optional_charge_decimal(value: Option<String>) -> Option<String> {
-    value.and_then(|raw| {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        Decimal::from_str_exact(trimmed)
-            .ok()
-            .map(|v| v.trunc().to_string())
-    })
-}
-
-fn decimal_to_nano_i64(value: Decimal) -> Option<i64> {
-    value.trunc().to_i64()
-}
-
-fn row_decimal_to_string(row: &sea_orm::QueryResult, col: &str) -> Option<String> {
-    row.try_get::<Option<Decimal>>("", col)
-        .ok()
-        .flatten()
-        .map(|v| v.trunc().to_string())
-        .or_else(|| {
-            parse_optional_charge_decimal(row.try_get::<Option<String>>("", col).unwrap_or(None))
-        })
-}
-
-fn row_decimal_to_nano_i64(row: &sea_orm::QueryResult, col: &str) -> i64 {
-    row.try_get::<Option<Decimal>>("", col)
-        .ok()
-        .flatten()
-        .and_then(decimal_to_nano_i64)
-        .or_else(|| {
-            parse_optional_charge_decimal(row.try_get::<Option<String>>("", col).unwrap_or(None))
-                .and_then(|v| decimal_to_nano_i64(Decimal::from_str_exact(&v).ok()?))
-        })
-        .unwrap_or(0)
-}
-
-fn postgres_charge_expr(column: &str) -> String {
-    format!(
-        "CASE WHEN {column} IS NULL OR btrim({column}) = '' THEN NULL WHEN {column} ~ '^-?[0-9]+$' THEN CAST({column} AS NUMERIC(39,0)) ELSE NULL END"
-    )
-}
-
 fn request_log_time_filter_column() -> &'static str {
     "COALESCE(rl.created_at_unix_ms, -9223372036854775808)"
-}
-
-fn parse_decimal_query_to_i64(value: Option<String>) -> i64 {
-    value
-        .and_then(|v| {
-            let trimmed = v.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            Decimal::from_str_exact(trimmed)
-                .ok()
-                .and_then(decimal_to_nano_i64)
-        })
-        .unwrap_or(0)
 }
 
 fn row_optional_i64(row: &sea_orm::QueryResult, col: &str) -> Option<i64> {
@@ -97,6 +37,60 @@ fn row_optional_i64(row: &sea_orm::QueryResult, col: &str) -> Option<i64> {
                 .flatten()
                 .map(i64::from)
         })
+}
+
+fn add_charge_text(total: &mut i128, raw: Option<&str>) -> Result<(), String> {
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let trimmed = raw.trim();
+    let (negative, digits) = match trimmed.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, trimmed),
+    };
+    if raw != trimmed
+        || digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+        || (negative && digits == "0")
+    {
+        return Ok(());
+    }
+    let charge = trimmed
+        .parse::<i128>()
+        .map_err(|_| "request log charge is outside the signed i128 domain".to_string())?;
+    if charge.to_string() != trimmed {
+        return Ok(());
+    }
+    *total = total
+        .checked_add(charge)
+        .ok_or_else(|| "request log charge aggregate overflow".to_string())?;
+    Ok(())
+}
+
+fn sum_charge_rows(rows: Vec<sea_orm::QueryResult>) -> Result<String, String> {
+    let mut total = 0i128;
+    for row in rows {
+        let raw = row
+            .try_get::<Option<String>>("", "charge_nano_usd")
+            .map_err(|e| e.to_string())?;
+        add_charge_text(&mut total, raw.as_deref())?;
+    }
+    Ok(total.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add_charge_text;
+
+    #[test]
+    fn charge_aggregation_exceeds_i64_without_losing_precision() {
+        let mut total = 0i128;
+        add_charge_text(&mut total, Some("9223372036854775807")).unwrap();
+        add_charge_text(&mut total, Some("1")).unwrap();
+        add_charge_text(&mut total, Some("+1")).unwrap();
+        assert_eq!(total.to_string(), "9223372036854775808");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -229,7 +223,10 @@ fn row_to_request_log(row: &sea_orm::QueryResult) -> RequestLogRow {
         provider: RequestLogProvider {
             id: row.try_get("", "provider_id").unwrap_or(None),
             name: row.try_get("", "provider_name").unwrap_or(None),
-            multiplier: row.try_get("", "provider_multiplier").unwrap_or(None),
+            multiplier: row
+                .try_get::<Option<String>>("", "provider_multiplier")
+                .unwrap_or(None)
+                .and_then(|value| value.parse().ok()),
         },
         channel: RequestLogChannel {
             id: row.try_get("", "channel_id").unwrap_or(None),
@@ -343,7 +340,7 @@ impl UserStore {
         _provider_id: &str,
         _channel_id: &str,
         _upstream_model: &str,
-        _provider_multiplier: f64,
+        _provider_multiplier: crate::exact_decimal::Multiplier,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -390,8 +387,6 @@ impl UserStore {
         time_to: Option<&str>,
     ) -> Result<(Vec<RequestLogRow>, i64, String), String> {
         let is_postgres = self.db.is_postgres();
-        let postgres_charge = postgres_charge_expr("rl.charge_nano_usd");
-
         let model = normalize_request_log_filter(model);
         let status = normalize_request_log_filter(status);
         let api_key_id = normalize_request_log_filter(api_key_id);
@@ -427,13 +422,8 @@ impl UserStore {
             .map_err(|e| e.to_string())?;
 
         // Sum query
-        let mut sum_sql = if is_postgres {
-            format!(
-                "SELECT COALESCE(SUM(COALESCE({postgres_charge}, 0)), 0) as total_charge FROM request_logs rl WHERE rl.user_id = $1"
-            )
-        } else {
-            "SELECT CAST(COALESCE(SUM(CAST(rl.charge_nano_usd AS BIGINT)), 0) AS BIGINT) as total_charge FROM request_logs rl WHERE rl.user_id = $1".to_string()
-        };
+        let mut sum_sql =
+            "SELECT rl.charge_nano_usd FROM request_logs rl WHERE rl.user_id = $1".to_string();
         let mut sum_values: Vec<SeaValue> = vec![user_id.into()];
         let mut sum_idx = 2usize;
         append_request_log_filters(
@@ -449,22 +439,13 @@ impl UserStore {
             time_from,
             time_to,
         );
-        let sum_row = self
+        let sum_rows = self
             .db
             .read()
-            .query_one(self.db.stmt(&sum_sql, sum_values))
+            .query_all(self.db.stmt(&sum_sql, sum_values))
             .await
             .map_err(|e| e.to_string())?;
-        let total_charge_row = sum_row.ok_or_else(|| "no sum row".to_string())?;
-        let total_charge_nano_usd = if is_postgres {
-            row_decimal_to_string(&total_charge_row, "total_charge")
-                .unwrap_or_else(|| "0".to_string())
-        } else {
-            total_charge_row
-                .try_get::<i64>("", "total_charge")
-                .map(|v| v.to_string())
-                .map_err(|e| e.to_string())?
-        };
+        let total_charge_nano_usd = sum_charge_rows(sum_rows)?;
 
         // Rows query
         let mut rows_sql = r#"SELECT rl.id, rl.request_id, rl.user_id, rl.api_key_id, rl.model, rl.provider_id, rl.upstream_model,
@@ -548,8 +529,6 @@ impl UserStore {
         time_to: Option<&str>,
     ) -> Result<(Vec<RequestLogRow>, i64, String), String> {
         let is_postgres = self.db.is_postgres();
-        let postgres_charge = postgres_charge_expr("rl.charge_nano_usd");
-
         let model = normalize_request_log_filter(model);
         let status = normalize_request_log_filter(status);
         let api_key_id = normalize_request_log_filter(api_key_id);
@@ -587,14 +566,7 @@ impl UserStore {
             .map_err(|e| e.to_string())?;
 
         // Sum query
-        let mut sum_sql = if is_postgres {
-            format!(
-                "SELECT COALESCE(SUM(COALESCE({postgres_charge}, 0)), 0) as total_charge FROM request_logs rl WHERE 1 = 1"
-            )
-        } else {
-            r#"SELECT CAST(COALESCE(SUM(CAST(rl.charge_nano_usd AS BIGINT)), 0) AS BIGINT) as total_charge FROM request_logs rl
-               WHERE 1 = 1"#.to_string()
-        };
+        let mut sum_sql = "SELECT rl.charge_nano_usd FROM request_logs rl WHERE 1 = 1".to_string();
         let mut sum_values: Vec<SeaValue> = Vec::new();
         let mut sum_idx = 1usize;
         append_request_log_filters(
@@ -610,22 +582,13 @@ impl UserStore {
             time_from,
             time_to,
         );
-        let sum_row = self
+        let sum_rows = self
             .db
             .read()
-            .query_one(self.db.stmt(&sum_sql, sum_values))
+            .query_all(self.db.stmt(&sum_sql, sum_values))
             .await
             .map_err(|e| e.to_string())?;
-        let total_charge_row = sum_row.ok_or_else(|| "no sum row".to_string())?;
-        let total_charge_nano_usd = if is_postgres {
-            row_decimal_to_string(&total_charge_row, "total_charge")
-                .unwrap_or_else(|| "0".to_string())
-        } else {
-            total_charge_row
-                .try_get::<i64>("", "total_charge")
-                .map(|v| v.to_string())
-                .map_err(|e| e.to_string())?
-        };
+        let total_charge_nano_usd = sum_charge_rows(sum_rows)?;
 
         // Rows query
         let mut rows_sql = r#"SELECT rl.id, rl.request_id, rl.user_id, rl.api_key_id, rl.model, rl.provider_id, rl.upstream_model,
@@ -705,52 +668,30 @@ impl UserStore {
         bucket_width_days: f64,
     ) -> Result<DashboardAnalyticsRaw, String> {
         let is_sqlite = self.db.is_sqlite();
-        let charge_expr = if is_sqlite {
-            "CAST(rl.charge_nano_usd AS BIGINT)"
-        } else {
-            "CASE WHEN rl.charge_nano_usd IS NULL OR btrim(rl.charge_nano_usd) = '' THEN NULL WHEN rl.charge_nano_usd ~ '^-?[0-9]+$' THEN CAST(rl.charge_nano_usd AS NUMERIC(39,0)) ELSE NULL END"
-        };
-
-        // 1. Model bucketed aggregation (cost + calls)
-        let bucket_expr = if is_sqlite {
-            "CAST(((rl.created_at_unix_ms - $1) / 86400000.0) / $2 AS BIGINT)".to_string()
-        } else {
-            "CAST(((rl.created_at_unix_ms - $1)::DOUBLE PRECISION / 86400000.0) / $2 AS BIGINT)"
-                .to_string()
-        };
-
-        let mut model_sql = format!(
-            r#"SELECT
-                 {bucket_expr} AS bucket_idx,
-                 rl.model,
-                 COALESCE(SUM({charge_expr}), 0) AS cost_nano,
-                 COUNT(*) AS call_count
-               FROM request_logs rl
-               WHERE {time_col} >= $3 AND {time_col} < $4"#,
-            time_col = "rl.created_at_unix_ms"
-        );
-        model_sql.push_str(" AND rl.created_at_unix_ms IS NOT NULL");
         let time_from_unix_ms = chrono::DateTime::parse_from_rfc3339(time_from)
             .map_err(|e| e.to_string())?
             .timestamp_millis();
         let time_to_unix_ms = chrono::DateTime::parse_from_rfc3339(time_to)
             .map_err(|e| e.to_string())?
             .timestamp_millis();
-        let mut model_values: Vec<SeaValue> = vec![
-            time_from_unix_ms.into(),
-            SeaValue::Double(Some(bucket_width_days)),
-            time_from_unix_ms.into(),
-            time_to_unix_ms.into(),
-        ];
-        let mut model_idx = 5usize;
+        let range_ms = time_to_unix_ms
+            .checked_sub(time_from_unix_ms)
+            .ok_or_else(|| "analytics time range overflow".to_string())?;
+        if range_ms <= 0 || bucket_count <= 0 {
+            return Err("analytics time range and bucket count must be positive".to_string());
+        }
+
+        let mut model_sql = "SELECT rl.created_at_unix_ms, rl.model, rl.charge_nano_usd
+             FROM request_logs rl
+             WHERE rl.created_at_unix_ms >= $1 AND rl.created_at_unix_ms < $2"
+            .to_string();
+        let mut model_values: Vec<SeaValue> =
+            vec![time_from_unix_ms.into(), time_to_unix_ms.into()];
 
         if let Some(uid) = user_id {
-            model_sql.push_str(&format!(" AND rl.user_id = ${model_idx}"));
+            model_sql.push_str(" AND rl.user_id = $3");
             model_values.push(uid.into());
-            model_idx += 1;
         }
-        let _ = model_idx;
-        model_sql.push_str(" GROUP BY bucket_idx, rl.model");
 
         let model_rows = self
             .db
@@ -759,23 +700,48 @@ impl UserStore {
             .await
             .map_err(|e| e.to_string())?;
 
-        let model_buckets: Vec<AnalyticsModelBucketRow> = model_rows
+        let mut grouped = std::collections::BTreeMap::<(i64, String), (i128, i64)>::new();
+        for row in model_rows {
+            let created_at_unix_ms: i64 = row
+                .try_get("", "created_at_unix_ms")
+                .map_err(|e| e.to_string())?;
+            let offset = created_at_unix_ms
+                .checked_sub(time_from_unix_ms)
+                .ok_or_else(|| "analytics bucket offset overflow".to_string())?;
+            let bucket_idx = (i128::from(offset)
+                .checked_mul(i128::from(bucket_count))
+                .ok_or_else(|| "analytics bucket calculation overflow".to_string())?
+                / i128::from(range_ms))
+            .clamp(0, i128::from(bucket_count - 1)) as i64;
+            let model: String = row.try_get("", "model").map_err(|e| e.to_string())?;
+            let raw_charge: Option<String> = row
+                .try_get("", "charge_nano_usd")
+                .map_err(|e| e.to_string())?;
+            let entry = grouped.entry((bucket_idx, model)).or_insert((0, 0));
+            add_charge_text(&mut entry.0, raw_charge.as_deref())?;
+            entry.1 = entry
+                .1
+                .checked_add(1)
+                .ok_or_else(|| "analytics call count overflow".to_string())?;
+        }
+        let model_buckets = grouped
             .into_iter()
-            .map(|row| {
-                let idx: i64 = row.try_get("", "bucket_idx").unwrap_or(0);
-                let cost_nano = if is_sqlite {
-                    row.try_get::<i64>("", "cost_nano").unwrap_or(0)
-                } else {
-                    row_decimal_to_nano_i64(&row, "cost_nano")
-                };
-                AnalyticsModelBucketRow {
-                    bucket_idx: idx.clamp(0, bucket_count - 1),
-                    model: row.try_get("", "model").unwrap_or_default(),
+            .map(
+                |((bucket_idx, model), (cost_nano, call_count))| AnalyticsModelBucketRow {
+                    bucket_idx,
+                    model,
                     cost_nano,
-                    call_count: row.try_get("", "call_count").unwrap_or(0),
-                }
-            })
-            .collect();
+                    call_count,
+                },
+            )
+            .collect::<Vec<_>>();
+
+        let bucket_expr = if is_sqlite {
+            "CAST(((rl.created_at_unix_ms - $1) / 86400000.0) / $2 AS BIGINT)".to_string()
+        } else {
+            "CAST(((rl.created_at_unix_ms - $1)::DOUBLE PRECISION / 86400000.0) / $2 AS BIGINT)"
+                .to_string()
+        };
 
         // 2. Provider bucketed aggregation (calls only)
         let mut prov_sql = format!(
@@ -824,101 +790,42 @@ impl UserStore {
             })
             .collect();
 
-        // 3. Total stats for the range
-        let mut total_sql = format!(
-            r#"SELECT
-                 COALESCE(SUM({charge_expr}), 0) AS total_cost,
-                 COUNT(*) AS total_calls
-               FROM request_logs rl
-               WHERE {time_col} >= $1 AND {time_col} < $2"#,
-            time_col = "rl.created_at_unix_ms"
-        );
-        total_sql.push_str(" AND rl.created_at_unix_ms IS NOT NULL");
-        let mut total_values: Vec<SeaValue> =
-            vec![time_from_unix_ms.into(), time_to_unix_ms.into()];
-        let mut total_idx = 3usize;
+        let (total_cost_nano_usd, total_calls) = model_buckets.iter().try_fold(
+            (0i128, 0i64),
+            |(cost, calls), row| -> Result<(i128, i64), String> {
+                Ok((
+                    cost.checked_add(row.cost_nano)
+                        .ok_or_else(|| "analytics cost aggregate overflow".to_string())?,
+                    calls
+                        .checked_add(row.call_count)
+                        .ok_or_else(|| "analytics call count overflow".to_string())?,
+                ))
+            },
+        )?;
 
-        if let Some(uid) = user_id {
-            total_sql.push_str(&format!(" AND rl.user_id = ${total_idx}"));
-            total_values.push(uid.into());
-            total_idx += 1;
-        }
-        let _ = total_idx;
-
-        let total_row = self
-            .db
-            .read()
-            .query_one(self.db.stmt(&total_sql, total_values))
-            .await
-            .map_err(|e| e.to_string())?;
-        let total_row = total_row.ok_or_else(|| "no total row".to_string())?;
-
-        let total_cost_nano_usd: i64 = if is_sqlite {
-            total_row.try_get("", "total_cost").unwrap_or(0)
-        } else {
-            total_row
-                .try_get::<Option<Decimal>>("", "total_cost")
-                .ok()
-                .flatten()
-                .and_then(decimal_to_nano_i64)
-                .unwrap_or_else(|| {
-                    parse_decimal_query_to_i64(
-                        total_row
-                            .try_get::<Option<String>>("", "total_cost")
-                            .unwrap_or(None),
-                    )
-                })
-        };
-        let total_calls: i64 = total_row.try_get("", "total_calls").unwrap_or(0);
-
-        // 4. Today stats
-        let mut today_sql = format!(
-            r#"SELECT
-                 COALESCE(SUM({charge_expr}), 0) AS today_cost,
-                 COUNT(*) AS today_calls
-               FROM request_logs rl
-               WHERE {time_col} >= $1"#,
-            time_col = "rl.created_at_unix_ms"
-        );
-        today_sql.push_str(" AND rl.created_at_unix_ms IS NOT NULL");
+        let mut today_sql = "SELECT rl.charge_nano_usd FROM request_logs rl
+             WHERE rl.created_at_unix_ms >= $1 AND rl.created_at_unix_ms IS NOT NULL"
+            .to_string();
         let today_start_unix_ms = chrono::DateTime::parse_from_rfc3339(today_start)
             .map_err(|e| e.to_string())?
             .timestamp_millis();
         let mut today_values: Vec<SeaValue> = vec![today_start_unix_ms.into()];
-        let mut today_idx = 2usize;
 
         if let Some(uid) = user_id {
-            today_sql.push_str(&format!(" AND rl.user_id = ${today_idx}"));
+            today_sql.push_str(" AND rl.user_id = $2");
             today_values.push(uid.into());
-            today_idx += 1;
         }
-        let _ = today_idx;
-
-        let today_row = self
+        let today_rows = self
             .db
             .read()
-            .query_one(self.db.stmt(&today_sql, today_values))
+            .query_all(self.db.stmt(&today_sql, today_values))
             .await
             .map_err(|e| e.to_string())?;
-        let today_row = today_row.ok_or_else(|| "no today row".to_string())?;
-
-        let today_cost_nano_usd: i64 = if is_sqlite {
-            today_row.try_get("", "today_cost").unwrap_or(0)
-        } else {
-            today_row
-                .try_get::<Option<Decimal>>("", "today_cost")
-                .ok()
-                .flatten()
-                .and_then(decimal_to_nano_i64)
-                .unwrap_or_else(|| {
-                    parse_decimal_query_to_i64(
-                        today_row
-                            .try_get::<Option<String>>("", "today_cost")
-                            .unwrap_or(None),
-                    )
-                })
-        };
-        let today_calls: i64 = today_row.try_get("", "today_calls").unwrap_or(0);
+        let today_calls = i64::try_from(today_rows.len())
+            .map_err(|_| "analytics call count overflow".to_string())?;
+        let today_cost_nano_usd = sum_charge_rows(today_rows)?
+            .parse::<i128>()
+            .map_err(|_| "request log charge is outside the signed i128 domain".to_string())?;
 
         Ok(DashboardAnalyticsRaw {
             model_buckets,

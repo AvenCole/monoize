@@ -29,7 +29,7 @@ pub(super) fn resolve_max_multiplier(
     req: &urp::UrpRequest,
     headers: &HeaderMap,
     auth: &crate::auth::AuthResult,
-) -> Option<f64> {
+) -> Option<Multiplier> {
     let ceiling = auth.max_multiplier;
     let requested =
         read_max_multiplier_from_extra(req).or_else(|| parse_max_multiplier_header(headers));
@@ -88,17 +88,11 @@ pub(super) fn extract_request_id(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-pub(super) fn read_max_multiplier_from_extra(req: &urp::UrpRequest) -> Option<f64> {
+pub(super) fn read_max_multiplier_from_extra(req: &urp::UrpRequest) -> Option<Multiplier> {
     req.extra_body
         .get("max_multiplier")
-        .and_then(|v| {
-            v.as_f64().or_else(|| {
-                v.as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .filter(|n| n.is_finite())
-            })
-        })
-        .filter(|n| *n > 0.0)
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
 }
 
 pub(super) fn inject_monoize_context(auth: &crate::auth::AuthResult, req: &mut urp::UrpRequest) {
@@ -335,12 +329,15 @@ pub(super) async fn transform_urp_stream(
 #[allow(clippy::result_large_err)]
 pub(crate) fn typed_request_to_legacy(
     req: &urp::UrpRequest,
-    max_multiplier: Option<f64>,
+    max_multiplier: Option<Multiplier>,
 ) -> AppResult<UrpRequest> {
     let encoded = urp::encode::openai_responses::encode_request(req, &req.model);
     let mut extra = Map::new();
     if let Some(limit) = max_multiplier {
-        extra.insert("max_multiplier".to_string(), Value::from(limit));
+        extra.insert(
+            "max_multiplier".to_string(),
+            Value::String(limit.to_string()),
+        );
     }
     parse_urp_request(&encoded, extra)
 }
@@ -422,7 +419,10 @@ fn affinity_prefix_hash(req: &urp::UrpRequest) -> String {
     short_xxh3_hex(truncate_utf8_bytes(&material, 16 * 1024))
 }
 
-pub(super) fn build_routing_stub(req: &urp::UrpRequest, max_multiplier: Option<f64>) -> UrpRequest {
+pub(super) fn build_routing_stub(
+    req: &urp::UrpRequest,
+    max_multiplier: Option<Multiplier>,
+) -> UrpRequest {
     UrpRequest {
         model: req.model.clone(),
         max_multiplier,
@@ -434,7 +434,7 @@ pub(super) fn build_routing_stub(req: &urp::UrpRequest, max_multiplier: Option<f
 
 pub(super) fn build_embeddings_routing_stub(
     model: &str,
-    max_multiplier: Option<f64>,
+    max_multiplier: Option<Multiplier>,
 ) -> UrpRequest {
     UrpRequest {
         model: model.to_string(),
@@ -481,24 +481,18 @@ pub(super) fn is_valid_embeddings_input(input: &Value) -> bool {
         .is_some_and(|arr| arr.iter().all(|item| item.as_str().is_some()))
 }
 
-pub(super) fn read_max_multiplier_from_embeddings_body(body: &Value) -> Option<f64> {
+pub(super) fn read_max_multiplier_from_embeddings_body(body: &Value) -> Option<Multiplier> {
     body.as_object()
         .and_then(|obj| obj.get("max_multiplier"))
-        .and_then(|v| {
-            v.as_f64().or_else(|| {
-                v.as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .filter(|n| n.is_finite())
-            })
-        })
-        .filter(|n| *n > 0.0)
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
 }
 
 pub(super) fn resolve_max_multiplier_for_embeddings(
     body: &Value,
     headers: &HeaderMap,
     auth: &crate::auth::AuthResult,
-) -> Option<f64> {
+) -> Option<Multiplier> {
     let ceiling = auth.max_multiplier;
     let requested = read_max_multiplier_from_embeddings_body(body)
         .or_else(|| parse_max_multiplier_header(headers));

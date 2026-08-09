@@ -117,6 +117,7 @@ mod tests {
                     name: "reader key".to_string(),
                     expires_in_days: None,
                     sub_account_enabled: false,
+                    sub_account_balance_nano_usd: None,
                     model_limits_enabled: false,
                     model_limits: Vec::new(),
                     ip_whitelist: Vec::new(),
@@ -160,7 +161,7 @@ mod tests {
                         "gpt-5".to_string(),
                         crate::monoize_routing::MonoizeModelEntry {
                             redirect: None,
-                            multiplier: 1.0,
+                            multiplier: crate::exact_decimal::Multiplier::ONE,
                         },
                     )]),
                     active_probe_enabled_override: None,

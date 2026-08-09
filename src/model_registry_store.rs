@@ -1,9 +1,12 @@
 use crate::db::DbPool;
 use crate::model_registry::{ModelCapabilities, ModelRecord};
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbModelRecord {
@@ -85,16 +88,34 @@ pub struct ModelPricing {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpsertModelMetadataInput {
-    pub models_dev_provider: Option<String>,
-    pub mode: Option<String>,
-    pub input_cost_per_token_nano: Option<String>,
-    pub output_cost_per_token_nano: Option<String>,
-    pub cache_read_input_cost_per_token_nano: Option<String>,
-    pub cache_creation_input_cost_per_token_nano: Option<String>,
-    pub output_cost_per_reasoning_token_nano: Option<String>,
-    pub max_input_tokens: Option<i64>,
-    pub max_output_tokens: Option<i64>,
-    pub max_tokens: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_nullable_field")]
+    pub models_dev_provider: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_field")]
+    pub mode: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_field")]
+    pub input_cost_per_token_nano: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_field")]
+    pub output_cost_per_token_nano: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_field")]
+    pub cache_read_input_cost_per_token_nano: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_field")]
+    pub cache_creation_input_cost_per_token_nano: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_field")]
+    pub output_cost_per_reasoning_token_nano: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_field")]
+    pub max_input_tokens: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_field")]
+    pub max_output_tokens: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_field")]
+    pub max_tokens: Option<Option<i64>>,
+}
+
+fn deserialize_nullable_field<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,79 +498,149 @@ impl ModelRegistryStore {
         model_id: &str,
         input: UpsertModelMetadataInput,
     ) -> Result<DbModelMetadataRecord, String> {
+        validate_optional_price(
+            "input_cost_per_token_nano",
+            input.input_cost_per_token_nano.as_ref(),
+        )?;
+        validate_optional_price(
+            "output_cost_per_token_nano",
+            input.output_cost_per_token_nano.as_ref(),
+        )?;
+        validate_optional_price(
+            "cache_read_input_cost_per_token_nano",
+            input.cache_read_input_cost_per_token_nano.as_ref(),
+        )?;
+        validate_optional_price(
+            "cache_creation_input_cost_per_token_nano",
+            input.cache_creation_input_cost_per_token_nano.as_ref(),
+        )?;
+        validate_optional_price(
+            "output_cost_per_reasoning_token_nano",
+            input.output_cost_per_reasoning_token_nano.as_ref(),
+        )?;
+
         let now = Utc::now().to_rfc3339();
-        self.db
-            .write().await
-            .execute(self.db.stmt(
+        let write_guard = self.db.write().await;
+        let txn = write_guard.begin().await.map_err(|e| e.to_string())?;
+        let existing = get_model_metadata_with(&self.db, &txn, model_id).await?;
+
+        let models_dev_provider = merge_nullable(
+            input.models_dev_provider,
+            existing
+                .as_ref()
+                .and_then(|record| record.models_dev_provider.clone()),
+        );
+        let mode = merge_nullable(
+            input.mode,
+            existing.as_ref().and_then(|record| record.mode.clone()),
+        );
+        let input_cost_per_token_nano = merge_nullable(
+            input.input_cost_per_token_nano,
+            existing
+                .as_ref()
+                .and_then(|record| record.input_cost_per_token_nano.clone()),
+        );
+        let output_cost_per_token_nano = merge_nullable(
+            input.output_cost_per_token_nano,
+            existing
+                .as_ref()
+                .and_then(|record| record.output_cost_per_token_nano.clone()),
+        );
+        let cache_read_input_cost_per_token_nano = merge_nullable(
+            input.cache_read_input_cost_per_token_nano,
+            existing
+                .as_ref()
+                .and_then(|record| record.cache_read_input_cost_per_token_nano.clone()),
+        );
+        let cache_creation_input_cost_per_token_nano = merge_nullable(
+            input.cache_creation_input_cost_per_token_nano,
+            existing
+                .as_ref()
+                .and_then(|record| record.cache_creation_input_cost_per_token_nano.clone()),
+        );
+        let output_cost_per_reasoning_token_nano = merge_nullable(
+            input.output_cost_per_reasoning_token_nano,
+            existing
+                .as_ref()
+                .and_then(|record| record.output_cost_per_reasoning_token_nano.clone()),
+        );
+        let max_input_tokens = merge_nullable(
+            input.max_input_tokens,
+            existing.as_ref().and_then(|record| record.max_input_tokens),
+        );
+        let max_output_tokens = merge_nullable(
+            input.max_output_tokens,
+            existing
+                .as_ref()
+                .and_then(|record| record.max_output_tokens),
+        );
+        let max_tokens = merge_nullable(
+            input.max_tokens,
+            existing.as_ref().and_then(|record| record.max_tokens),
+        );
+
+        txn.execute(self.db.stmt(
                 "INSERT INTO model_metadata_records
                  (model_id, models_dev_provider, mode, input_cost_per_token_nano, output_cost_per_token_nano,
                   cache_read_input_cost_per_token_nano, cache_creation_input_cost_per_token_nano, output_cost_per_reasoning_token_nano,
                   max_input_tokens, max_output_tokens, max_tokens, raw_json, source, updated_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '{}', 'manual', $12)
                  ON CONFLICT(model_id) DO UPDATE SET
-                   models_dev_provider = COALESCE($13, model_metadata_records.models_dev_provider),
-                   mode = COALESCE($14, model_metadata_records.mode),
-                   input_cost_per_token_nano = $15,
-                   output_cost_per_token_nano = $16,
-                   cache_read_input_cost_per_token_nano = $17,
-                   cache_creation_input_cost_per_token_nano = $18,
-                   output_cost_per_reasoning_token_nano = $19,
-                   max_input_tokens = COALESCE($20, model_metadata_records.max_input_tokens),
-                   max_output_tokens = COALESCE($21, model_metadata_records.max_output_tokens),
-                   max_tokens = COALESCE($22, model_metadata_records.max_tokens),
+                   models_dev_provider = excluded.models_dev_provider,
+                   mode = excluded.mode,
+                   input_cost_per_token_nano = excluded.input_cost_per_token_nano,
+                   output_cost_per_token_nano = excluded.output_cost_per_token_nano,
+                   cache_read_input_cost_per_token_nano = excluded.cache_read_input_cost_per_token_nano,
+                   cache_creation_input_cost_per_token_nano = excluded.cache_creation_input_cost_per_token_nano,
+                   output_cost_per_reasoning_token_nano = excluded.output_cost_per_reasoning_token_nano,
+                   max_input_tokens = excluded.max_input_tokens,
+                   max_output_tokens = excluded.max_output_tokens,
+                   max_tokens = excluded.max_tokens,
                    source = 'manual',
-                   updated_at = $23",
+                   updated_at = excluded.updated_at",
                 vec![
-                    // INSERT binds
                     model_id.into(),
-                    input.models_dev_provider.clone().into(),
-                    input.mode.clone().into(),
-                    input.input_cost_per_token_nano.clone().into(),
-                    input.output_cost_per_token_nano.clone().into(),
-                    input.cache_read_input_cost_per_token_nano.clone().into(),
-                    input.cache_creation_input_cost_per_token_nano.clone().into(),
-                    input.output_cost_per_reasoning_token_nano.clone().into(),
-                    input.max_input_tokens.into(),
-                    input.max_output_tokens.into(),
-                    input.max_tokens.into(),
-                    now.clone().into(),
-                    // UPDATE binds
-                    input.models_dev_provider.into(),
-                    input.mode.into(),
-                    input.input_cost_per_token_nano.into(),
-                    input.output_cost_per_token_nano.into(),
-                    input.cache_read_input_cost_per_token_nano.into(),
-                    input.cache_creation_input_cost_per_token_nano.into(),
-                    input.output_cost_per_reasoning_token_nano.into(),
-                    input.max_input_tokens.into(),
-                    input.max_output_tokens.into(),
-                    input.max_tokens.into(),
+                    models_dev_provider.into(),
+                    mode.into(),
+                    input_cost_per_token_nano.into(),
+                    output_cost_per_token_nano.into(),
+                    cache_read_input_cost_per_token_nano.into(),
+                    cache_creation_input_cost_per_token_nano.into(),
+                    output_cost_per_reasoning_token_nano.into(),
+                    max_input_tokens.into(),
+                    max_output_tokens.into(),
+                    max_tokens.into(),
                     now.into(),
                 ],
             ))
             .await
             .map_err(|e| e.to_string())?;
 
-        let record = self
-            .get_model_metadata(model_id)
+        let record = get_model_metadata_with(&self.db, &txn, model_id)
             .await?
             .ok_or_else(|| "upsert succeeded but record not found".to_string())?;
-        upsert_model_metadata_billing_rates(&self.db, &record).await?;
+        upsert_model_metadata_billing_rates(&self.db, &txn, &record).await?;
+        txn.commit().await.map_err(|e| e.to_string())?;
         Ok(record)
     }
 
     pub async fn delete_model_metadata(&self, model_id: &str) -> Result<bool, String> {
-        let result = self
-            .db
-            .write()
-            .await
+        let write_guard = self.db.write().await;
+        let txn = write_guard.begin().await.map_err(|e| e.to_string())?;
+        let result = txn
             .execute(self.db.stmt(
                 "DELETE FROM model_metadata_records WHERE model_id = $1",
                 vec![model_id.into()],
             ))
             .await
             .map_err(|e| e.to_string())?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() == 0 {
+            txn.rollback().await.map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        delete_model_metadata_billing_rates(&self.db, &txn, model_id).await?;
+        txn.commit().await.map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
     pub async fn sync_from_models_dev(
@@ -627,7 +718,7 @@ impl ModelRegistryStore {
                             .and_then(|l| l.get("output"))
                             .and_then(value_to_i64),
                         max_tokens: limit.and_then(|l| l.get("context")).and_then(value_to_i64),
-                        raw: model_val.clone(),
+                        raw: models_dev_variant_for_dashboard(model_val),
                     });
             }
         }
@@ -817,6 +908,47 @@ fn row_to_model_metadata(row: &sea_orm::QueryResult) -> Result<DbModelMetadataRe
     })
 }
 
+async fn get_model_metadata_with<C: ConnectionTrait>(
+    db: &DbPool,
+    conn: &C,
+    model_id: &str,
+) -> Result<Option<DbModelMetadataRecord>, String> {
+    let row = conn
+        .query_one(db.stmt(
+            "SELECT model_id, models_dev_provider, mode, input_cost_per_token_nano,
+                    output_cost_per_token_nano, cache_read_input_cost_per_token_nano,
+                    cache_creation_input_cost_per_token_nano,
+                    output_cost_per_reasoning_token_nano, max_input_tokens, max_output_tokens,
+                    max_tokens, raw_json, source, updated_at
+             FROM model_metadata_records
+             WHERE model_id = $1",
+            vec![model_id.into()],
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    row.as_ref().map(row_to_model_metadata).transpose()
+}
+
+fn merge_nullable<T>(update: Option<Option<T>>, existing: Option<T>) -> Option<T> {
+    update.unwrap_or(existing)
+}
+
+fn validate_optional_price(field: &str, update: Option<&Option<String>>) -> Result<(), String> {
+    let Some(Some(value)) = update else {
+        return Ok(());
+    };
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+        || value.parse::<i128>().is_err()
+    {
+        return Err(format!(
+            "invalid_request: {field} must be a canonical non-negative integer string"
+        ));
+    }
+    Ok(())
+}
+
 struct SyncProviderVariant {
     provider_id: String,
     family: Option<String>,
@@ -893,16 +1025,10 @@ async fn upsert_models_dev_billing_rates(
 
 async fn upsert_model_metadata_billing_rates(
     db: &DbPool,
+    conn: &DatabaseTransaction,
     record: &DbModelMetadataRecord,
 ) -> Result<(), String> {
-    let _write_guard = db.write().await;
-    _write_guard
-        .execute(db.stmt(
-            "DELETE FROM billing_rate_records WHERE id LIKE $1",
-            vec![format!("model_metadata:{}:%", record.model_id).into()],
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
+    delete_model_metadata_billing_rates(db, conn, &record.model_id).await?;
 
     let pricing_profile = record
         .models_dev_provider
@@ -928,9 +1054,8 @@ async fn upsert_model_metadata_billing_rates(
             continue;
         };
         let id = format!("model_metadata:{}:{usage_class}", record.model_id);
-        _write_guard
-            .execute(db.stmt(
-                "INSERT INTO billing_rate_records
+        conn.execute(db.stmt(
+            "INSERT INTO billing_rate_records
                  (id, source, pricing_profile, model_pattern, provider_type, rate_kind, usage_class,
                   unit, unit_price_nano_usd, match_json, priority, enabled, raw_json, updated_at)
                  VALUES ($1, $2, $3, $4, NULL, 'token', $5, 'token', $6, '{}', 0, 1, $7, $8)
@@ -942,7 +1067,7 @@ async fn upsert_model_metadata_billing_rates(
                    unit_price_nano_usd = excluded.unit_price_nano_usd,
                    raw_json = excluded.raw_json,
                    updated_at = excluded.updated_at",
-                vec![
+            vec![
                     id.into(),
                     record.source.clone().into(),
                     pricing_profile.clone().into(),
@@ -954,10 +1079,25 @@ async fn upsert_model_metadata_billing_rates(
                         .into(),
                     record.updated_at.to_rfc3339().into(),
                 ],
-            ))
-            .await
-            .map_err(|e| e.to_string())?;
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+async fn delete_model_metadata_billing_rates(
+    db: &DbPool,
+    conn: &DatabaseTransaction,
+    model_id: &str,
+) -> Result<(), String> {
+    conn.execute(db.stmt(
+        "DELETE FROM billing_rate_records
+             WHERE model_pattern = $1 AND id LIKE 'model_metadata:%'",
+        vec![model_id.into()],
+    ))
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1057,19 +1197,46 @@ fn is_embedding_family(family: Option<&str>) -> bool {
 }
 
 fn cost_per_1m_to_nano_string(value: &Value) -> Option<String> {
-    let f = value.as_f64()?;
-    if !f.is_finite() {
+    let raw = match value {
+        Value::Number(number) => number.to_string(),
+        Value::String(value) => value.clone(),
+        _ => return None,
+    };
+    if raw.contains(['e', 'E']) || raw.starts_with('+') {
         return None;
     }
-    let nano = (f * 1000.0) as i128;
+    let decimal = Decimal::from_str(&raw).ok()?;
+    if decimal.is_sign_negative() {
+        return None;
+    }
+    let nano = decimal
+        .checked_mul(Decimal::from(1000u32))?
+        .trunc()
+        .to_i128()?;
     Some(nano.to_string())
+}
+
+fn models_dev_variant_for_dashboard(value: &Value) -> Value {
+    let mut value = value.clone();
+    let Some(cost) = value
+        .as_object_mut()
+        .and_then(|model| model.get_mut("cost"))
+        .and_then(Value::as_object_mut)
+    else {
+        return value;
+    };
+    for price in cost.values_mut() {
+        if let Value::Number(number) = price {
+            *price = Value::String(number.to_string());
+        }
+    }
+    value
 }
 
 fn value_to_i64(value: &Value) -> Option<i64> {
     value
         .as_i64()
         .or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok()))
-        .or_else(|| value.as_f64().map(|v| v as i64))
 }
 
 const KNOWN_PROVIDER_PREFIXES: &[&str] = &[
@@ -1144,4 +1311,53 @@ pub fn normalize_model_id(raw: &str, provider_hint: Option<&str>) -> String {
     }
 
     segment
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        cost_per_1m_to_nano_string, deserialize_nullable_field, models_dev_variant_for_dashboard,
+    };
+    use serde::Deserialize;
+    use serde_json::json;
+
+    #[test]
+    fn models_dev_decimal_price_conversion_is_exact() {
+        assert_eq!(
+            cost_per_1m_to_nano_string(&json!(1.001)),
+            Some("1001".to_string())
+        );
+        assert_eq!(
+            cost_per_1m_to_nano_string(&json!("0.0009")),
+            Some("0".to_string())
+        );
+        assert_eq!(cost_per_1m_to_nano_string(&json!(-1)), None);
+    }
+
+    #[test]
+    fn dashboard_raw_variant_keeps_costs_as_decimal_strings() {
+        let variant = models_dev_variant_for_dashboard(&json!({
+            "cost": { "input": 1.001, "output": 2 },
+            "limit": { "context": 128000 }
+        }));
+        assert_eq!(variant["cost"]["input"], json!("1.001"));
+        assert_eq!(variant["cost"]["output"], json!("2"));
+        assert_eq!(variant["limit"]["context"], json!(128000));
+    }
+
+    #[derive(Deserialize)]
+    struct NullableProbe {
+        #[serde(default, deserialize_with = "deserialize_nullable_field")]
+        value: Option<Option<String>>,
+    }
+
+    #[test]
+    fn nullable_fields_distinguish_omitted_and_explicit_null() {
+        let omitted: NullableProbe = serde_json::from_value(json!({})).unwrap();
+        let cleared: NullableProbe = serde_json::from_value(json!({ "value": null })).unwrap();
+        let assigned: NullableProbe = serde_json::from_value(json!({ "value": "1001" })).unwrap();
+        assert_eq!(omitted.value, None);
+        assert_eq!(cleared.value, Some(None));
+        assert_eq!(assigned.value, Some(Some("1001".to_string())));
+    }
 }

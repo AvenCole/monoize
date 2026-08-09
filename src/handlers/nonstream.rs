@@ -41,7 +41,7 @@ pub(super) async fn execute_nonstream_typed(
     state: &AppState,
     auth: &crate::auth::AuthResult,
     mut req: urp::UrpRequest,
-    max_multiplier: Option<f64>,
+    max_multiplier: Option<Multiplier>,
     downstream: DownstreamProtocol,
     request_id: Option<String>,
     request_ip: Option<String>,
@@ -370,18 +370,24 @@ pub(super) async fn execute_nonstream_typed(
                     {
                         convert_assistant_images_to_markdown(&mut resp);
                     }
-                    let charge =
-                        match maybe_charge_response(state, auth, &attempt, &logical_model, &resp)
-                            .await
-                        {
-                            Ok(charge) => charge,
-                            Err(err) => {
-                                if let Some(session) = capture.session.as_ref() {
-                                    session.persist_with_result(None, false).await;
-                                }
-                                return Err(err);
+                    let charge = match maybe_charge_response(
+                        state,
+                        auth,
+                        &attempt,
+                        &logical_model,
+                        &resp,
+                        request_id.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(charge) => charge,
+                        Err(err) => {
+                            if let Some(session) = capture.session.as_ref() {
+                                session.persist_with_result(None, false).await;
                             }
-                        };
+                            return Err(err);
+                        }
+                    };
                     spawn_request_log(
                         state,
                         auth,
@@ -541,7 +547,7 @@ fn supports_nonstream_upstream_stream_collection(provider_type: ProviderType) ->
 
 async fn collect_streamed_upstream_response(
     req_attempt: &urp::UrpRequest,
-    max_multiplier: Option<f64>,
+    max_multiplier: Option<Multiplier>,
     provider_type: ProviderType,
     upstream_resp: reqwest::Response,
     started_at: std::time::Instant,
@@ -644,7 +650,7 @@ pub(super) async fn forward_nonstream_typed(
     state: &AppState,
     auth: &crate::auth::AuthResult,
     req: urp::UrpRequest,
-    max_multiplier: Option<f64>,
+    max_multiplier: Option<Multiplier>,
     downstream: DownstreamProtocol,
     request_id: Option<String>,
     request_ip: Option<String>,

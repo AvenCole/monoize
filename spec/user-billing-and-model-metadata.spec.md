@@ -4,7 +4,7 @@
 
 - Product name: Monoize.
 - Scope:
-  - user-level prepaid balance and billing on proxy requests;
+  - user-level balance and post-response billing on proxy requests;
   - model metadata storage and Models.dev metadata sync;
   - admin-only balance mutation.
 
@@ -16,9 +16,13 @@ B2. Persistent balance MUST use signed integer nano-dollar string storage in `us
 
 B3. User balance unlimited switch MUST be persisted in `users.balance_unlimited` (`INTEGER` column, `0|1`).
 
+B4. A persisted `balance_nano_usd` value that is not a signed base-10 `i128` integer MUST produce an explicit storage error. A read path MUST NOT substitute zero for an invalid persisted balance.
+
 B4. Decimal USD inputs MUST accept up to 9 fractional digits. Values with more than 9 fractional digits MUST be truncated toward zero when converted to nano-dollar.
 
 B5. Balance arithmetic MUST use checked integer operations. Overflow MUST return `500 internal_error`.
+
+B6. Settlement of an admitted request MAY make a finite user or API-key sub-account balance negative. Monoize MUST NOT reserve or pre-deduct an estimated request cost before upstream forwarding.
 
 ## 2. User data model
 
@@ -31,6 +35,8 @@ U1. User read model exposed by dashboard/auth APIs MUST include:
 - `allowed_groups: string[]`
 
 U2. `balance_usd` MUST be computed from `balance_nano_usd` with nano precision and no binary floating conversion.
+
+U2.1. Nano-dollar formatting MUST cover the complete signed `i128` domain, including `i128::MIN`, without panic or lossy conversion.
 
 U3. New users created by register or dashboard create-user MUST default to:
 
@@ -89,6 +95,10 @@ BE3. Before upstream forwarding, billing eligibility MUST be checked as follows:
 - If the authenticated API key has `sub_account_enabled = 1`: check `sub_account_balance_nano > 0`. If not, return HTTP `402` with code `insufficient_balance`. The user's balance is NOT checked.
 - Otherwise (API key inherits user balance): if `balance_unlimited = false` and `balance_nano_usd <= 0`, server MUST return HTTP `402` with code `insufficient_balance`.
 
+BE3.1. BE3 is an admission gate, not a final-cost affordability check. Multiple requests admitted while the same balance is positive MAY settle to a negative balance. Once the persisted balance is non-positive, a later request MUST fail BE3 until an administrator or transfer makes the balance positive again.
+
+BE3.2. The finite user-balance admission read MUST query the database. It MUST NOT authorize a request from a cached positive balance after a prior settlement has committed a non-positive balance.
+
 BE4. The legacy `ensure_quota_before_forward` per-call quota check MUST NOT exist. Sub-account billing replaces it entirely (see `api-key-sub-account-billing.spec.md`).
 
 BE5. Monoize MUST determine whether selected candidate attempts have billable pricing before enforcing the pre-forward balance gate. If no candidate attempt has billable pricing under C1.2, Monoize MUST reject the request with HTTP `403` and code `model_pricing_required` before the balance gate. This rule applies to all roles, including `admin` and `super_admin`.
@@ -133,6 +143,8 @@ C3-ii. Upstream providers whose native usage field excludes cache buckets (for e
 
 C3-iii. With C3-i and C3-ii in effect, all billing and logging code paths MUST treat `Usage.input_tokens` uniformly as aggregate/inclusive. Provider-type branching on the interpretation of `input_tokens` MUST NOT exist in billing computation, usage-breakdown construction, or request-log projection.
 
+C3-iii-a. If a provider reports tool-result prompt tokens as a disjoint counter, decode MUST add that counter to `Usage.input_tokens` and MUST also preserve it in `usage.input_details.tool_prompt_tokens`. Billing MUST NOT add the detail counter a second time.
+
 C3-iv. If `usage.input_details.cache_read_tokens` is present and a matching `cache_read` rate exists, input charge MUST be:
 
 ```
@@ -168,7 +180,7 @@ output_charge =
   + reasoning_tokens * reasoning_output_rate
 ```
 
-`output_tokens` in C4 MUST likewise be treated according to provider semantics. If a provider defines reasoning tokens as a subtype of the reported output total, Monoize MUST subtract them before applying the base output rate and then add the reasoning-rate subtotal. Monoize MUST NOT bill the same output token once at the base output rate and again at the reasoning rate.
+`Usage.output_tokens` MUST be an aggregate/inclusive output total. If a provider reports visible candidate tokens and reasoning/thinking tokens as disjoint counters, decode MUST set `Usage.output_tokens` to their checked sum and MUST preserve the reasoning counter in `usage.output_details.reasoning_tokens`. If a provider already reports an inclusive output total, decode MUST use it directly. Billing MUST subtract the reasoning detail once before applying the base output rate and MUST NOT bill the same output token twice.
 
 C5. Final charge MUST multiply by the selected Channel model multiplier and truncate toward zero:
 
@@ -204,7 +216,9 @@ L2.1. A downstream client disconnect MUST NOT by itself stop upstream stream con
 
 L2.2. If upstream terminal usage is received after downstream disconnect, Monoize MUST bill from that upstream usage using the same charge calculation as a normally completed stream.
 
-L2.3. If the upstream stream is fully consumed under L2 and usage still cannot be determined from stream payload, Monoize MAY skip billing only when estimated billing is disabled or no estimated usage basis exists. If estimated billing is enabled and an estimated usage basis exists, Monoize MUST apply estimated billing and mark the billing breakdown as estimated.
+L2.3. A billable successful response MUST NOT silently become free because authoritative usage is absent. Non-stream handling MUST reject such a response before delivering it when no deterministic estimate exists. Pass-through streaming MUST maintain an input/output estimate while forwarding; if terminal usage is absent, it MUST settle from that estimate and mark the billing breakdown as estimated.
+
+L2.4. A pass-through stream has already committed its HTTP status before post-response settlement. A settlement storage or pricing error therefore MUST be recorded as a billing failure and MUST NOT be replaced with a successful zero-charge computation. This rule does not permit an insufficient-balance error during settlement because L4 requires admitted requests to settle into negative balances.
 
 L2a. Requests that return a normal model response payload (including truncated/cutoff completions such as `finish_reason = "length"`) MUST be treated as billable-success requests, not failed requests.
 
@@ -216,14 +230,9 @@ L3. On successful deduction, server MUST append a ledger row with:
 - `kind = "request_charge"` (user balance) or `kind = "api_key_charge"` (sub-account)
 - `delta_nano_usd` (negative value)
 - `balance_after_nano_usd`
-- `meta_json` (at minimum model, provider_id, prompt/completion/reasoning/cached tokens; sub-account charges MUST also include `api_key_id`)
+- `meta_json` (at minimum request_id, model, provider_id, prompt/completion/reasoning/cached tokens; sub-account charges MUST also include `api_key_id`)
 
-L4. If deduction fails because resulting balance would be negative, server MUST return:
-
-- HTTP `402`
-- code `insufficient_balance`
-
-and MUST NOT write deduction.
+L4. Settlement of an admitted request MUST subtract the complete final charge with checked arithmetic even when the resulting finite balance is negative. Settlement MUST append the corresponding ledger row in the same transaction. HTTP `402 insufficient_balance` applies only to the pre-forward BE3 admission gate and MUST NOT be produced merely because settlement crosses zero.
 
 ## 6a. Billing concurrency control
 
@@ -234,6 +243,8 @@ LC2. All balance-mutating operations (request charges and admin adjustments) MUS
 LC3. Balance reads used for eligibility and analytics MAY execute on the read pool.
 
 LC4. The write pool's single connection is the required serialization mechanism for billing writes; an additional application-level billing mutex MUST NOT be required.
+
+LC4.1. PostgreSQL balance mutations MUST lock every user and API-key balance row that participates in the mutation with `SELECT ... FOR UPDATE` in deterministic user-then-API-key order. Each mutation MUST compute balances, write balances, and append all ledger rows in one transaction.
 
 LC5. The billing charge path (`charge_user_balance_nano`) MUST execute a single attempt and MUST NOT include an explicit retry loop. Error behavior for non-transient failures remains unchanged.
 

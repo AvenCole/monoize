@@ -73,29 +73,26 @@ import { DataTableShell, TableToolbarSearch, VirtualTableCell, VirtualTableHeade
 import { toast } from "sonner";
 import { TableVirtuoso } from "react-virtuoso";
 import { BillingProfilesTab } from "./model-metadata/BillingProfilesTab";
+import {
+  formatNanoPerTokenPerMillion,
+  nanoPerTokenToUsdPerMillion,
+  usdPerMillionToNanoPerToken,
+} from "@/lib/exact-decimal";
 
 function nanoToPerMillion(nano?: string | null): string {
-  if (!nano) return "-";
-  const n = Number(nano);
-  if (!Number.isFinite(n)) return "-";
-  const perM = n / 1000;
-  if (perM === 0) return "$0";
-  if (perM < 0.0001) return `$${perM.toFixed(6)}`;
-  return `$${perM.toFixed(4)}`;
+  const formatted = formatNanoPerTokenPerMillion(nano);
+  return formatted === "—" ? "-" : formatted;
 }
 
 function perMillionToNano(value: string): string | null {
   if (!value.trim()) return null;
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  return Math.trunc(n * 1000).toString();
+  const converted = usdPerMillionToNanoPerToken(value);
+  if (converted == null) throw new Error("Price must be a non-negative decimal");
+  return converted;
 }
 
 function nanoToPerMillionInput(nano?: string | null): string {
-  if (!nano) return "";
-  const n = Number(nano);
-  if (!Number.isFinite(n)) return "";
-  return (n / 1000).toString();
+  return nanoPerTokenToUsdPerMillion(nano) ?? "";
 }
 
 function formatTokens(tokens?: number | null): string {
@@ -198,10 +195,8 @@ function extractProviderVariants(rawJson: Record<string, unknown>): ProviderVari
     const cost = obj.cost as Record<string, unknown> | undefined;
     const limit = obj.limit as Record<string, unknown> | undefined;
     const costStr = (v: unknown): string => {
-      if (v == null) return "";
-      const n = Number(v);
-      if (!Number.isFinite(n)) return "";
-      return n.toString();
+      if (typeof v !== "string") return "";
+      return usdPerMillionToNanoPerToken(v) == null ? "" : v;
     };
     const toStr = (v: unknown): string => (v != null ? String(v) : "");
     result.push({
@@ -276,11 +271,20 @@ export function ModelMetadataPage() {
   const handleSave = async (isCreate: boolean) => {
     const modelId = isCreate ? form.modelId.trim() : editRecord?.model_id;
     if (!modelId) return;
+    let input: UpsertModelMetadataInput;
+    try {
+      input = formToInput(form);
+    } catch (error) {
+      toast.error(t("modelMetadata.saveFailed"), {
+        description: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
     setSaving(true);
     try {
       await upsertModelMetadataOptimistic(
         modelId,
-        formToInput(form),
+        input,
         records,
         (error) =>
           toast.error(t("modelMetadata.saveFailed"), { description: error.message })
@@ -407,8 +411,8 @@ export function ModelMetadataPage() {
               <div className="space-y-1">
                 <Label className="text-xs">{t("modelMetadata.inputCost")}</Label>
                 <Input
-                  type="number"
-                  step="any"
+                  type="text"
+                  inputMode="decimal"
                   value={form.inputCostPerM}
                   onChange={(e) => setForm({ ...form, inputCostPerM: e.target.value })}
                   placeholder="0"
@@ -417,8 +421,8 @@ export function ModelMetadataPage() {
               <div className="space-y-1">
                 <Label className="text-xs">{t("modelMetadata.outputCost")}</Label>
                 <Input
-                  type="number"
-                  step="any"
+                  type="text"
+                  inputMode="decimal"
                   value={form.outputCostPerM}
                   onChange={(e) => setForm({ ...form, outputCostPerM: e.target.value })}
                   placeholder="0"
@@ -427,8 +431,8 @@ export function ModelMetadataPage() {
               <div className="space-y-1">
                 <Label className="text-xs">{t("modelMetadata.cacheReadCost")}</Label>
                 <Input
-                  type="number"
-                  step="any"
+                  type="text"
+                  inputMode="decimal"
                   value={form.cacheReadCostPerM}
                   onChange={(e) => setForm({ ...form, cacheReadCostPerM: e.target.value })}
                   placeholder="0"
@@ -437,8 +441,8 @@ export function ModelMetadataPage() {
               <div className="space-y-1">
                 <Label className="text-xs">{t("modelMetadata.cacheWriteCost")}</Label>
                 <Input
-                  type="number"
-                  step="any"
+                  type="text"
+                  inputMode="decimal"
                   value={form.cacheWriteCostPerM}
                   onChange={(e) => setForm({ ...form, cacheWriteCostPerM: e.target.value })}
                   placeholder="0"
@@ -447,8 +451,8 @@ export function ModelMetadataPage() {
               <div className="space-y-1">
                 <Label className="text-xs">{t("modelMetadata.reasoningCost")}</Label>
                 <Input
-                  type="number"
-                  step="any"
+                  type="text"
+                  inputMode="decimal"
                   value={form.reasoningCostPerM}
                   onChange={(e) => setForm({ ...form, reasoningCostPerM: e.target.value })}
                   placeholder="0"
@@ -825,8 +829,8 @@ function formToBillingRateInput(form: BillingRateFormData): UpsertBillingRateInp
   if (!form.pricingProfile.trim()) throw new Error("pricing profile is required");
   if (!form.usageClass.trim()) throw new Error("usage class is required");
   if (!form.unit.trim()) throw new Error("unit is required");
-  if (!/^-?\d+$/.test(form.unitPriceNanoUsd.trim())) {
-    throw new Error("unit price must be an integer nano-USD string");
+  if (!/^(?:0|[1-9]\d*)$/.test(form.unitPriceNanoUsd.trim())) {
+    throw new Error("unit price must be a non-negative integer nano-USD string");
   }
   const priority = Number(form.priority || "0");
   if (!Number.isInteger(priority)) throw new Error("priority must be an integer");

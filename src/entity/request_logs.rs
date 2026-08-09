@@ -29,7 +29,8 @@ pub struct Model {
     pub reasoning_tokens: Option<i64>,
     pub accepted_prediction_tokens: Option<i64>,
     pub rejected_prediction_tokens: Option<i64>,
-    pub provider_multiplier: Option<f64>,
+    #[sea_orm(column_type = "Text")]
+    pub provider_multiplier: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub charge_nano_usd: Option<String>,
     #[sea_orm(column_type = "Text")]

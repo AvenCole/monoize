@@ -1,3 +1,4 @@
+use crate::exact_decimal::Multiplier;
 use crate::transforms::TransformRuleConfig;
 use crate::users::{RequestCaptureMode, UserStore, compute_effective_groups};
 
@@ -10,7 +11,7 @@ pub struct AuthResult {
     pub username: Option<String>,
     pub user_role: crate::users::UserRole,
     pub api_key_id: Option<String>,
-    pub max_multiplier: Option<f64>,
+    pub max_multiplier: Option<Multiplier>,
     pub transforms: Vec<TransformRuleConfig>,
     pub model_redirects: Vec<crate::users::ModelRedirectRule>,
     pub effective_groups: Option<Vec<String>>,
@@ -116,6 +117,7 @@ mod tests {
                     name: "default key".to_string(),
                     expires_in_days: None,
                     sub_account_enabled: false,
+                    sub_account_balance_nano_usd: None,
                     model_limits_enabled: false,
                     model_limits: Vec::new(),
                     ip_whitelist: Vec::new(),
@@ -160,6 +162,7 @@ mod tests {
                     name: "intersection key".to_string(),
                     expires_in_days: None,
                     sub_account_enabled: false,
+                    sub_account_balance_nano_usd: None,
                     model_limits_enabled: false,
                     model_limits: Vec::new(),
                     ip_whitelist: Vec::new(),
@@ -206,6 +209,7 @@ mod tests {
                     name: "disjoint key".to_string(),
                     expires_in_days: None,
                     sub_account_enabled: false,
+                    sub_account_balance_nano_usd: None,
                     model_limits_enabled: false,
                     model_limits: Vec::new(),
                     ip_whitelist: Vec::new(),

@@ -709,7 +709,7 @@ async fn responses_nonstream_markdown_image_transforms_extract_and_append_markdo
         "gpt-5-mini".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: None,
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     ctx.state

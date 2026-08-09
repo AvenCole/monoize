@@ -206,9 +206,14 @@ impl BillingRateStore {
             .unit_price_nano_usd
             .or_else(|| existing.as_ref().map(|r| r.unit_price_nano_usd.clone()))
             .ok_or_else(|| "unit_price_nano_usd is required".to_string())?;
-        unit_price_nano_usd
+        let parsed_unit_price = unit_price_nano_usd
             .parse::<i128>()
             .map_err(|_| "unit_price_nano_usd must be an integer string".to_string())?;
+        if parsed_unit_price < 0 || parsed_unit_price.to_string() != unit_price_nano_usd {
+            return Err(
+                "unit_price_nano_usd must be a canonical non-negative integer string".to_string(),
+            );
+        }
 
         let model_pattern = input
             .model_pattern

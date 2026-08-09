@@ -1133,7 +1133,7 @@ async fn chat_streaming_plaintext_reasoning_to_summary_rewrites_reasoning_events
         "gpt-5-mini".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: None,
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     ctx.state
@@ -1234,7 +1234,7 @@ async fn chat_streaming_plaintext_reasoning_to_summary_preserves_encrypted_reaso
         "gpt-5-mini".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: None,
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     ctx.state

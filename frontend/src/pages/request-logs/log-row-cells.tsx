@@ -10,6 +10,11 @@ import { ModelBadge } from '@/components/ModelBadge'
 import { cn } from '@/lib/utils'
 import type { RequestLog } from '@/lib/api'
 import {
+	formatNanoPerTokenPerMillion,
+	isZeroIntegerString,
+	normalizeMultiplier
+} from '@/lib/exact-decimal'
+import {
 	asObject,
 	billingValueTranslationKey,
 	computeTps,
@@ -99,7 +104,9 @@ export function LogRowCells({
 	const billingInput = asObject(billingSnapshot?.input)
 	const billingOutput = asObject(billingSnapshot?.output)
 	const billingTier = asObject(billingSnapshot?.tier)
-	const multiplier = readNumber(billingSnapshot?.provider_multiplier)
+	const multiplier = typeof billingSnapshot?.provider_multiplier === 'string' ?
+		normalizeMultiplier(billingSnapshot.provider_multiplier)
+	: null
 	const tokenLineItems = Array.isArray(billingSnapshot?.token_line_items) ?
 		billingSnapshot.token_line_items
 			.map(asObject)
@@ -141,12 +148,8 @@ export function LogRowCells({
 		value == null ? '-' : new Intl.NumberFormat('en-US').format(value)
 	const formatRatePerMillion = (nanoPerToken: string | null) => {
 		if (!nanoPerToken) return '-'
-		const parsed = Number(nanoPerToken)
-		if (!Number.isFinite(parsed)) return '-'
-		return `$${(parsed / 1000).toLocaleString('en-US', {
-			minimumFractionDigits: 2,
-			maximumFractionDigits: 6
-		})}/1M`
+		const formatted = formatNanoPerTokenPerMillion(nanoPerToken)
+		return formatted === '—' ? '-' : `${formatted}/1M`
 	}
 	const localizeBillingValue = (
 		dimension: Parameters<typeof billingValueTranslationKey>[0],
@@ -169,7 +172,7 @@ export function LogRowCells({
 		rateNano: string | null,
 		chargeNano: string | null
 	) => {
-		if (tokens == null || !rateNano || !chargeNano || Number(chargeNano) === 0) {
+		if (tokens == null || !rateNano || !chargeNano || isZeroIntegerString(chargeNano)) {
 			return null
 		}
 		return `${formatTokenCount(tokens)} × ${formatRatePerMillion(rateNano)} = ${formatCost(chargeNano)}`
@@ -178,7 +181,7 @@ export function LogRowCells({
 		const quantity = readNumber(item.quantity)
 		const unitPrice = readNanoString(item, 'unit_price_nano')
 		const charge = readNanoString(item, 'charge_nano')
-		if (quantity == null || !unitPrice || !charge || Number(charge) === 0) {
+		if (quantity == null || !unitPrice || !charge || isZeroIntegerString(charge)) {
 			return null
 		}
 		return `${formatTokenCount(quantity)} × ${formatUnitRate(unitPrice, item.unit)} = ${formatCost(charge)}`
@@ -410,6 +413,7 @@ export function LogRowCells({
 		: log.status === 'error' ? 'bg-destructive'
 		: 'bg-zinc-400'
 	const baseCharge = readNanoString(billingSnapshot, 'base_charge_nano')
+	const visibleBaseCharge = baseCharge != null && !isZeroIntegerString(baseCharge) ? baseCharge : null
 	const hasBreakdownContent = !!(
 		hasMatrixLineItems ||
 		contextTier ||
@@ -419,7 +423,7 @@ export function LogRowCells({
 		inputCacheCreationCostDetail ||
 		outputTextCostDetail ||
 		outputReasoningCostDetail ||
-		baseCharge ||
+		visibleBaseCharge ||
 		multiplier != null ||
 		isAdminUnpricedExemption ||
 		!billingSnapshot
@@ -525,7 +529,7 @@ export function LogRowCells({
 									</div>
 								)}
 								{log.provider.multiplier != null &&
-									log.provider.multiplier !== 1 && (
+								log.provider.multiplier !== '1' && (
 										<div className='flex items-center justify-between gap-3'>
 											<span>{t('requestLogs.multiplier')}</span>
 											<span className='font-mono'>
@@ -813,17 +817,17 @@ export function LogRowCells({
 											</span>
 										</div>
 									)}
-									{baseCharge && (
+									{visibleBaseCharge && (
 										<div className='flex items-center justify-between gap-3'>
 											<span>{t('requestLogs.baseCost')}</span>
-											<span className='font-mono'>{formatCost(baseCharge)}</span>
+											<span className='font-mono'>{formatCost(visibleBaseCharge)}</span>
 										</div>
 									)}
 									{multiplier != null && (
 										<div className='flex items-center justify-between gap-3'>
 											<span>{t('requestLogs.multiplier')}</span>
 											<span className='font-mono'>
-												{multiplier.toFixed(6)}x
+												{multiplier}x
 											</span>
 										</div>
 									)}

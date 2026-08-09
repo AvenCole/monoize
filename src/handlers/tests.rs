@@ -404,10 +404,10 @@ async fn seed_model_pricing(state: &AppState, model: &str) {
         .upsert_model_metadata(
             model,
             crate::model_registry_store::UpsertModelMetadataInput {
-                models_dev_provider: Some("openai".to_string()),
-                mode: Some("chat".to_string()),
-                input_cost_per_token_nano: Some("1000".to_string()),
-                output_cost_per_token_nano: Some("1000".to_string()),
+                models_dev_provider: Some(Some("openai".to_string())),
+                mode: Some(Some("chat".to_string())),
+                input_cost_per_token_nano: Some(Some("1000".to_string())),
+                output_cost_per_token_nano: Some(Some("1000".to_string())),
                 cache_read_input_cost_per_token_nano: None,
                 cache_creation_input_cost_per_token_nano: None,
                 output_cost_per_reasoning_token_nano: None,
@@ -430,7 +430,7 @@ async fn routing_uses_channel_model_multiplier_and_redirect_per_attempt() {
     let state = load_state_with_runtime(runtime).await.expect("state loads");
     seed_model_pricing(&state, "channel-owned-model").await;
 
-    let channel = |id: &str, multiplier: f64, redirect: &str| CreateMonoizeChannelInput {
+    let channel = |id: &str, multiplier: &str, redirect: &str| CreateMonoizeChannelInput {
         id: Some(id.to_string()),
         name: id.to_string(),
         provider_type: MonoizeProviderType::Responses,
@@ -446,7 +446,7 @@ async fn routing_uses_channel_model_multiplier_and_redirect_per_attempt() {
             "channel-owned-model".to_string(),
             MonoizeModelEntry {
                 redirect: Some(redirect.to_string()),
-                multiplier,
+                multiplier: multiplier.parse().unwrap(),
             },
         )]),
         active_probe_enabled_override: None,
@@ -464,8 +464,8 @@ async fn routing_uses_channel_model_multiplier_and_redirect_per_attempt() {
         .create_provider(CreateMonoizeProviderInput {
             name: "channel-owned-models".to_string(),
             channels: vec![
-                channel("cheap", 1.0, "cheap-upstream"),
-                channel("expensive", 2.0, "expensive-upstream"),
+                channel("cheap", "1", "cheap-upstream"),
+                channel("expensive", "2", "expensive-upstream"),
             ],
             max_retries: -1,
             channel_max_retries: 0,
@@ -489,7 +489,7 @@ async fn routing_uses_channel_model_multiplier_and_redirect_per_attempt() {
         .expect("provider created");
 
     let mut request = build_test_routing_request("channel-owned-model");
-    request.max_multiplier = Some(1.5);
+    request.max_multiplier = Some("1.5".parse().unwrap());
     let attempts = build_monoize_attempts(&state, &request, &build_test_auth(None))
         .await
         .expect("routing succeeds");
@@ -497,7 +497,7 @@ async fn routing_uses_channel_model_multiplier_and_redirect_per_attempt() {
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].channel_id, "cheap");
     assert_eq!(attempts[0].upstream_model, "cheap-upstream");
-    assert_eq!(attempts[0].model_multiplier, 1.0);
+    assert_eq!(attempts[0].model_multiplier, Multiplier::ONE);
 }
 
 fn attempt_channel_ids(attempts: &[MonoizeAttempt]) -> BTreeSet<&str> {
@@ -524,7 +524,11 @@ fn calculate_charge_nano_uses_model_price_and_multiplier() {
         output_cost_per_reasoning_token_nano: None,
     };
 
-    let charged = calculate_charge_nano(&usage, &pricing, 1.234_567_891);
+    let charged = calculate_charge_nano(
+        &usage,
+        &pricing,
+        Multiplier::parse("1.234567891").expect("valid multiplier"),
+    );
 
     assert_eq!(charged, Some(108_024));
 }
@@ -561,7 +565,7 @@ fn calculate_charge_nano_handles_cached_and_reasoning_tokens() {
         output_cost_per_reasoning_token_nano: Some(3000),
     };
 
-    let charged = calculate_charge_nano(&usage, &pricing, 1.0);
+    let charged = calculate_charge_nano(&usage, &pricing, Multiplier::ONE);
 
     assert_eq!(charged, Some(236_000));
 }
@@ -595,7 +599,7 @@ fn calculate_charge_nano_messages_treats_cache_creation_as_disjoint_bucket() {
         output_cost_per_reasoning_token_nano: None,
     };
 
-    let charged = calculate_charge_nano(&usage, &pricing, 1.0);
+    let charged = calculate_charge_nano(&usage, &pricing, Multiplier::ONE);
 
     assert_eq!(charged, Some(150_000));
 }
@@ -626,7 +630,7 @@ fn calculate_charge_nano_responses_excludes_cache_creation_from_inclusive_input_
         output_cost_per_reasoning_token_nano: None,
     };
 
-    let charged = calculate_charge_nano(&usage, &pricing, 1.0);
+    let charged = calculate_charge_nano(&usage, &pricing, Multiplier::ONE);
 
     assert_eq!(charged, Some(110_000));
 }
@@ -658,7 +662,7 @@ fn calculate_charge_nano_responses_avoids_double_count_when_cache_read_and_creat
         output_cost_per_reasoning_token_nano: None,
     };
 
-    let charged = calculate_charge_nano(&usage, &pricing, 1.0);
+    let charged = calculate_charge_nano(&usage, &pricing, Multiplier::ONE);
 
     assert_eq!(charged, Some(78_000));
 }
@@ -716,9 +720,14 @@ fn rate_matrix_selects_short_vs_long_context_tier() {
         extra_body: HashMap::new(),
     };
 
-    let components =
-        calculate_rate_matrix_charge_components(&usage, None, &resolution, 1.0, &Vec::new())
-            .expect("charge succeeds");
+    let components = calculate_rate_matrix_charge_components(
+        &usage,
+        None,
+        &resolution,
+        Multiplier::ONE,
+        &Vec::new(),
+    )
+    .expect("charge succeeds");
 
     assert_eq!(components.context_tier.as_deref(), Some("long"));
     assert_eq!(components.base_charge, 1_280_210);
@@ -790,9 +799,14 @@ fn rate_matrix_bills_anthropic_cache_ttl_split_and_read() {
         extra_body: HashMap::new(),
     };
 
-    let components =
-        calculate_rate_matrix_charge_components(&usage, None, &resolution, 1.0, &Vec::new())
-            .expect("charge succeeds");
+    let components = calculate_rate_matrix_charge_components(
+        &usage,
+        None,
+        &resolution,
+        Multiplier::ONE,
+        &Vec::new(),
+    )
+    .expect("charge succeeds");
 
     assert_eq!(components.base_charge, 1850);
     assert_eq!(components.token_line_items.len(), 5);
@@ -855,10 +869,134 @@ fn rate_matrix_rejects_aggregate_cache_creation_without_ttl_split() {
         extra_body: HashMap::new(),
     };
 
-    let err = calculate_rate_matrix_charge_components(&usage, None, &resolution, 1.0, &Vec::new())
-        .expect_err("aggregate cache write must not be guessed");
+    let err = calculate_rate_matrix_charge_components(
+        &usage,
+        None,
+        &resolution,
+        Multiplier::ONE,
+        &Vec::new(),
+    )
+    .expect_err("aggregate cache write must not be guessed");
 
     assert!(err.contains("requires 5m/1h split"));
+}
+
+#[test]
+fn rate_matrix_uses_dimensionless_defaults_for_cache_and_missing_modality_breakdown() {
+    let resolution = test_resolution(vec![
+        test_rate(
+            "input-default",
+            "input_uncached",
+            1,
+            None,
+            None,
+            None,
+            json!({}),
+        ),
+        test_rate(
+            "input-image",
+            "input_uncached",
+            9,
+            None,
+            Some("image"),
+            None,
+            json!({}),
+        ),
+        test_rate("output-default", "output", 2, None, None, None, json!({})),
+        test_rate(
+            "output-image",
+            "output",
+            9,
+            None,
+            Some("image"),
+            None,
+            json!({}),
+        ),
+    ]);
+    let usage = urp::Usage {
+        input_tokens: 100,
+        output_tokens: 10,
+        input_details: Some(urp::InputDetails {
+            standard_tokens: 0,
+            cache_read_tokens: 20,
+            cache_read_modality_breakdown: None,
+            cache_creation_tokens: 30,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            tool_prompt_tokens: 0,
+            modality_breakdown: None,
+        }),
+        output_details: None,
+        extra_body: HashMap::new(),
+    };
+
+    let components = calculate_rate_matrix_charge_components(
+        &usage,
+        None,
+        &resolution,
+        Multiplier::ONE,
+        &Vec::new(),
+    )
+    .expect("dimensionless fallback should settle every token bucket");
+
+    assert_eq!(components.base_charge, 120);
+    assert_eq!(
+        components
+            .token_line_items
+            .iter()
+            .filter(|line| line["rate_id"] == json!("input-default"))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn rate_matrix_preflight_rejects_invalid_prices_and_missing_dimensionless_defaults() {
+    let mut negative = test_rate(
+        "negative",
+        "input_uncached",
+        -1,
+        None,
+        None,
+        None,
+        json!({}),
+    );
+    negative.priority = 100;
+    let invalid_price = test_resolution(vec![
+        negative,
+        test_rate("input", "input_uncached", 1, None, None, None, json!({})),
+        test_rate("output", "output", 1, None, None, None, json!({})),
+    ]);
+    assert!(
+        billing_rate_matrix_allows_request(&invalid_price, &Vec::new())
+            .expect_err("negative candidate price must fail preflight")
+            .contains("negative unit_price")
+    );
+
+    let modality_only = test_resolution(vec![
+        test_rate(
+            "input-image",
+            "input_uncached",
+            1,
+            None,
+            Some("image"),
+            None,
+            json!({}),
+        ),
+        test_rate(
+            "output-image",
+            "output",
+            1,
+            None,
+            Some("image"),
+            None,
+            json!({}),
+        ),
+    ]);
+    assert_eq!(
+        billing_rate_matrix_allows_request(&modality_only, &Vec::new()),
+        Ok(false)
+    );
 }
 
 #[test]
@@ -951,9 +1089,14 @@ fn rate_matrix_bills_gpt_image_2_modality_token_lines() {
         extra_body: HashMap::new(),
     };
 
-    let components =
-        calculate_rate_matrix_charge_components(&usage, None, &resolution, 1.0, &Vec::new())
-            .expect("charge succeeds");
+    let components = calculate_rate_matrix_charge_components(
+        &usage,
+        None,
+        &resolution,
+        Multiplier::ONE,
+        &Vec::new(),
+    )
+    .expect("charge succeeds");
 
     assert_eq!(components.base_charge, 304);
     assert_eq!(components.token_line_items.len(), 5);
@@ -1007,15 +1150,86 @@ fn rate_matrix_supports_input_cached_usage_class_alias() {
         extra_body: HashMap::new(),
     };
 
-    let components =
-        calculate_rate_matrix_charge_components(&usage, None, &resolution, 1.0, &Vec::new())
-            .expect("charge succeeds");
+    let components = calculate_rate_matrix_charge_components(
+        &usage,
+        None,
+        &resolution,
+        Multiplier::ONE,
+        &Vec::new(),
+    )
+    .expect("charge succeeds");
 
     assert_eq!(components.base_charge, 170);
     assert_eq!(
         components.token_line_items[1]["usage_class"].as_str(),
         Some("input_cached")
     );
+}
+
+#[test]
+fn rate_matrix_does_not_double_add_inclusive_tool_prompt_or_reasoning_details() {
+    let resolution = test_resolution(vec![
+        test_rate(
+            "input",
+            "input_uncached",
+            1,
+            None,
+            None,
+            None,
+            serde_json::json!({}),
+        ),
+        test_rate(
+            "output",
+            "output",
+            2,
+            None,
+            None,
+            None,
+            serde_json::json!({}),
+        ),
+        test_rate(
+            "reasoning",
+            "reasoning_output",
+            3,
+            None,
+            None,
+            None,
+            serde_json::json!({}),
+        ),
+    ]);
+    let usage = urp::Usage {
+        input_tokens: 130,
+        output_tokens: 120,
+        input_details: Some(urp::InputDetails {
+            standard_tokens: 0,
+            cache_read_tokens: 0,
+            cache_read_modality_breakdown: None,
+            cache_creation_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            tool_prompt_tokens: 30,
+            modality_breakdown: None,
+        }),
+        output_details: Some(urp::OutputDetails {
+            standard_tokens: 0,
+            reasoning_tokens: 20,
+            accepted_prediction_tokens: 0,
+            rejected_prediction_tokens: 0,
+            modality_breakdown: None,
+        }),
+        extra_body: HashMap::new(),
+    };
+
+    let components = calculate_rate_matrix_charge_components(
+        &usage,
+        None,
+        &resolution,
+        Multiplier::ONE,
+        &Vec::new(),
+    )
+    .expect("charge succeeds");
+
+    assert_eq!(components.base_charge, 390);
 }
 
 #[test]
@@ -1061,7 +1275,7 @@ fn rate_matrix_counts_call_meter_from_decoded_native_events_and_requires_duratio
         &usage,
         Some(&output),
         &call_resolution,
-        1.0,
+        Multiplier::ONE,
         &["web_search".to_string()],
     )
     .expect("decoded call is billable");
@@ -1099,7 +1313,7 @@ fn rate_matrix_counts_call_meter_from_decoded_native_events_and_requires_duratio
         &usage,
         None,
         &duration_resolution,
-        1.0,
+        Multiplier::ONE,
         &["code_interpreter_duration".to_string()],
     )
     .expect_err("duration meter must require authoritative usage");
@@ -1108,10 +1322,64 @@ fn rate_matrix_counts_call_meter_from_decoded_native_events_and_requires_duratio
 }
 
 #[test]
-fn scale_charge_quantizes_multiplier_to_nano_precision() {
-    let base = 1_000_000_000i128;
-    let charged = scale_charge_with_multiplier(base, 1.000_000_000_9);
-    assert_eq!(charged, Some(1_000_000_000));
+fn rate_matrix_uses_only_first_dimension_matching_meter_row_per_usage_class() {
+    let mut wrong_service =
+        test_meter_rate("wrong-service", "web_search", "call", 10_000, json!({}));
+    wrong_service.service_tier = Some("priority".to_string());
+    let resolution = test_resolution(vec![
+        test_rate("input", "input_uncached", 1, None, None, None, json!({})),
+        test_rate("output", "output", 1, None, None, None, json!({})),
+        wrong_service,
+        test_meter_rate("selected", "web_search", "call", 100, json!({})),
+        test_meter_rate("duplicate", "web_search", "call", 500, json!({})),
+    ]);
+    let usage = urp::Usage {
+        input_tokens: 1,
+        output_tokens: 1,
+        input_details: None,
+        output_details: None,
+        extra_body: HashMap::from([("service_tier".to_string(), json!("batch"))]),
+    };
+    let output = vec![urp::Node::ProviderItem {
+        id: None,
+        origin_protocol: urp::ProviderProtocol::Responses,
+        role: urp::OrdinaryRole::Assistant,
+        item_type: "web_search_call".to_string(),
+        body: json!({}),
+        extra_body: HashMap::new(),
+    }];
+
+    let components = calculate_rate_matrix_charge_components(
+        &usage,
+        Some(&output),
+        &resolution,
+        Multiplier::ONE,
+        &["web_search".to_string()],
+    )
+    .expect("matching meter row should be selected once");
+
+    assert_eq!(components.base_charge, 102);
+    assert_eq!(components.meter_line_items.len(), 1);
+    assert_eq!(components.meter_line_items[0]["rate_id"], json!("selected"));
+}
+
+#[test]
+fn scale_charge_uses_exact_decimal_and_truncates_toward_zero() {
+    let base = 100_000_000i128;
+    let charged = scale_charge_with_multiplier(
+        base,
+        Multiplier::parse("1.000000009").expect("valid multiplier"),
+    );
+    assert_eq!(charged, Some(100_000_000));
+}
+
+#[test]
+fn scale_charge_avoids_overflow_when_final_value_is_representable() {
+    let base = i128::MAX / 2;
+    let charged =
+        scale_charge_with_multiplier(base, Multiplier::parse("1.1").expect("valid multiplier"));
+
+    assert_eq!(charged, base.checked_add(base / 10));
 }
 
 #[test]
@@ -1177,7 +1445,7 @@ async fn resolve_model_suffix_preserves_reasoning_effort_on_attempt_base_request
                     "gpt-5-mini".to_string(),
                     MonoizeModelEntry {
                         redirect: None,
-                        multiplier: 1.0,
+                        multiplier: Multiplier::ONE,
                     },
                 )]),
                 active_probe_enabled_override: None,
@@ -1211,7 +1479,7 @@ async fn resolve_model_suffix_preserves_reasoning_effort_on_attempt_base_request
 fn resolve_upstream_model_prefers_non_empty_redirect() {
     let entry = MonoizeModelEntry {
         redirect: Some("  gpt-5-target  ".to_string()),
-        multiplier: 1.0,
+        multiplier: Multiplier::ONE,
     };
     assert_eq!(
         resolve_upstream_model("gpt-5-logical", &entry),
@@ -1223,7 +1491,7 @@ fn resolve_upstream_model_prefers_non_empty_redirect() {
 fn resolve_upstream_model_falls_back_to_requested_when_redirect_blank() {
     let entry = MonoizeModelEntry {
         redirect: Some("   ".to_string()),
-        multiplier: 1.0,
+        multiplier: Multiplier::ONE,
     };
     assert_eq!(
         resolve_upstream_model("gpt-5-logical", &entry),
@@ -1277,7 +1545,7 @@ async fn build_monoize_attempts_rejects_unpriced_models_before_forwarding() {
                     "gpt-unpriced".to_string(),
                     MonoizeModelEntry {
                         redirect: Some("gpt-unpriced-upstream".to_string()),
-                        multiplier: 1.0,
+                        multiplier: Multiplier::ONE,
                     },
                 )]),
                 active_probe_enabled_override: None,
@@ -1350,7 +1618,7 @@ async fn build_monoize_attempts_rejects_admin_unpriced_models_without_pricing() 
                     "gpt-unpriced".to_string(),
                     MonoizeModelEntry {
                         redirect: Some("gpt-unpriced-upstream".to_string()),
-                        multiplier: 1.0,
+                        multiplier: Multiplier::ONE,
                     },
                 )]),
                 active_probe_enabled_override: None,
@@ -1422,7 +1690,7 @@ async fn build_monoize_attempts_rejects_admin_missing_server_tool_meter_rate() {
                     "gpt-priced".to_string(),
                     MonoizeModelEntry {
                         redirect: None,
-                        multiplier: 1.0,
+                        multiplier: Multiplier::ONE,
                     },
                 )]),
                 active_probe_enabled_override: None,
@@ -1497,7 +1765,7 @@ async fn build_monoize_attempts_accepts_redirected_model_when_logical_fallback_i
                     "gpt-fallback-src".to_string(),
                     MonoizeModelEntry {
                         redirect: Some("gpt-fallback-dest".to_string()),
-                        multiplier: 1.0,
+                        multiplier: Multiplier::ONE,
                     },
                 )]),
                 active_probe_enabled_override: None,
@@ -1518,10 +1786,10 @@ async fn build_monoize_attempts_accepts_redirected_model_when_logical_fallback_i
         .upsert_model_metadata(
             "gpt-fallback-src",
             crate::model_registry_store::UpsertModelMetadataInput {
-                models_dev_provider: Some("openai".to_string()),
-                mode: Some("chat".to_string()),
-                input_cost_per_token_nano: Some("1000".to_string()),
-                output_cost_per_token_nano: Some("1000".to_string()),
+                models_dev_provider: Some(Some("openai".to_string())),
+                mode: Some(Some("chat".to_string())),
+                input_cost_per_token_nano: Some(Some("1000".to_string())),
+                output_cost_per_token_nano: Some(Some("1000".to_string())),
                 cache_read_input_cost_per_token_nano: None,
                 cache_creation_input_cost_per_token_nano: None,
                 output_cost_per_reasoning_token_nano: None,
@@ -1538,9 +1806,9 @@ async fn build_monoize_attempts_accepts_redirected_model_when_logical_fallback_i
         .upsert_model_metadata(
             "gpt-fallback-dest",
             crate::model_registry_store::UpsertModelMetadataInput {
-                models_dev_provider: Some("openai".to_string()),
-                mode: Some("chat".to_string()),
-                input_cost_per_token_nano: Some("500".to_string()),
+                models_dev_provider: Some(Some("openai".to_string())),
+                mode: Some(Some("chat".to_string())),
+                input_cost_per_token_nano: Some(Some("500".to_string())),
                 output_cost_per_token_nano: None,
                 cache_read_input_cost_per_token_nano: None,
                 cache_creation_input_cost_per_token_nano: None,
@@ -1620,7 +1888,7 @@ async fn build_monoize_attempts_uses_metadata_pricing_profile_fallback() {
                     "claude-sonnet-4.6".to_string(),
                     MonoizeModelEntry {
                         redirect: None,
-                        multiplier: 1.0,
+                        multiplier: Multiplier::ONE,
                     },
                 )]),
                 active_probe_enabled_override: None,
@@ -1641,10 +1909,10 @@ async fn build_monoize_attempts_uses_metadata_pricing_profile_fallback() {
         .upsert_model_metadata(
             "claude-sonnet-4.6",
             crate::model_registry_store::UpsertModelMetadataInput {
-                models_dev_provider: Some("zenmux".to_string()),
-                mode: Some("chat".to_string()),
-                input_cost_per_token_nano: Some("3000".to_string()),
-                output_cost_per_token_nano: Some("15000".to_string()),
+                models_dev_provider: Some(Some("zenmux".to_string())),
+                mode: Some(Some("chat".to_string())),
+                input_cost_per_token_nano: Some(Some("3000".to_string())),
+                output_cost_per_token_nano: Some(Some("15000".to_string())),
                 cache_read_input_cost_per_token_nano: None,
                 cache_creation_input_cost_per_token_nano: None,
                 output_cost_per_reasoning_token_nano: None,
@@ -1696,7 +1964,7 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
                 GROUP_ROUTING_MODEL.to_string(),
                 MonoizeModelEntry {
                     redirect: None,
-                    multiplier: 1.0,
+                    multiplier: Multiplier::ONE,
                 },
             )]),
             active_probe_enabled_override: None,
@@ -1731,7 +1999,7 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
                 GROUP_ROUTING_MODEL.to_string(),
                 MonoizeModelEntry {
                     redirect: None,
-                    multiplier: 1.0,
+                    multiplier: Multiplier::ONE,
                 },
             )]),
             active_probe_enabled_override: None,
@@ -1766,7 +2034,7 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
                 GROUP_ROUTING_MODEL.to_string(),
                 MonoizeModelEntry {
                     redirect: None,
-                    multiplier: 1.0,
+                    multiplier: Multiplier::ONE,
                 },
             )]),
             active_probe_enabled_override: None,
@@ -1838,7 +2106,7 @@ async fn execute_nonstream_typed_keeps_bad_gateway_when_groups_filter_every_chan
                 GROUP_ROUTING_MODEL.to_string(),
                 MonoizeModelEntry {
                     redirect: None,
-                    multiplier: 1.0,
+                    multiplier: Multiplier::ONE,
                 },
             )]),
             active_probe_enabled_override: None,
@@ -1942,7 +2210,7 @@ fn affinity_test_attempt(
         api_key: "secret".to_string(),
         logical_model: "gpt-affinity".to_string(),
         upstream_model: "gpt-affinity".to_string(),
-        model_multiplier: 1.0,
+        model_multiplier: Multiplier::ONE,
         server_tool_usage_classes: Vec::new(),
         provider_transforms: Vec::new(),
         passive_failure_count_threshold: 3,

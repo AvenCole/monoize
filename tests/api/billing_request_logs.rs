@@ -1401,7 +1401,7 @@ async fn billing_model_field_does_not_affect_upstream_charge() {
         "alias-route-model".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: Some("gpt-5-mini".to_string()),
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     ctx.state
@@ -1456,10 +1456,10 @@ async fn billing_model_field_does_not_affect_upstream_charge() {
         .upsert_model_metadata(
             "alias-route-model",
             monoize::model_registry_store::UpsertModelMetadataInput {
-                models_dev_provider: Some("default".to_string()),
-                mode: Some("chat".to_string()),
-                input_cost_per_token_nano: Some("999999".to_string()),
-                output_cost_per_token_nano: Some("999999".to_string()),
+                models_dev_provider: Some(Some("default".to_string())),
+                mode: Some(Some("chat".to_string())),
+                input_cost_per_token_nano: Some(Some("999999".to_string())),
+                output_cost_per_token_nano: Some(Some("999999".to_string())),
                 cache_read_input_cost_per_token_nano: None,
                 cache_creation_input_cost_per_token_nano: None,
                 output_cost_per_reasoning_token_nano: None,
@@ -1549,7 +1549,7 @@ async fn redirected_model_pricing_falls_back_to_logical_model_when_upstream_unpr
         "alias-fallback-model".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: Some("gpt-5-unpriced-upstream".to_string()),
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     ctx.state
@@ -1604,10 +1604,10 @@ async fn redirected_model_pricing_falls_back_to_logical_model_when_upstream_unpr
         .upsert_model_metadata(
             "alias-fallback-model",
             monoize::model_registry_store::UpsertModelMetadataInput {
-                models_dev_provider: Some("default".to_string()),
-                mode: Some("chat".to_string()),
-                input_cost_per_token_nano: Some("2000".to_string()),
-                output_cost_per_token_nano: Some("3000".to_string()),
+                models_dev_provider: Some(Some("default".to_string())),
+                mode: Some(Some("chat".to_string())),
+                input_cost_per_token_nano: Some(Some("2000".to_string())),
+                output_cost_per_token_nano: Some(Some("3000".to_string())),
                 cache_read_input_cost_per_token_nano: None,
                 cache_creation_input_cost_per_token_nano: None,
                 output_cost_per_reasoning_token_nano: None,
@@ -1697,7 +1697,7 @@ async fn suffixed_model_pricing_uses_base_model_metadata_without_separate_alias_
         "gpt-5-mini-thinking".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: None,
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     ctx.state
@@ -1894,7 +1894,7 @@ async fn balance_exact_covers_request() {
 }
 
 #[tokio::test]
-async fn balance_insufficient_after_charge() {
+async fn admitted_charge_can_cross_zero_then_blocks_next_request() {
     let ctx = setup().await;
     let user = ctx
         .state
@@ -1942,7 +1942,17 @@ async fn balance_insufficient_after_charge() {
         .expect("get user")
         .expect("user exists");
     let after: i64 = user_after.balance_nano_usd.parse().unwrap();
-    assert_eq!(after, 10000);
+    assert_eq!(after, -10000);
+
+    let (next_status, next_body) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({"model":"gpt-5-mini","input":"blocked"}),
+    )
+    .await;
+    assert_eq!(next_status, StatusCode::PAYMENT_REQUIRED);
+    let next: Value = serde_json::from_str(&next_body).unwrap();
+    assert_eq!(next["error"]["code"].as_str(), Some("insufficient_balance"));
 }
 
 #[tokio::test]

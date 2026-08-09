@@ -35,7 +35,8 @@ pub struct Model {
     pub allowed_groups: String,
     #[sea_orm(column_type = "Text")]
     pub token_group: String,
-    pub max_multiplier: Option<f64>,
+    #[sea_orm(column_type = "Text")]
+    pub max_multiplier: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub transforms: String,
     #[sea_orm(column_type = "Text")]

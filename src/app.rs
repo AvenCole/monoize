@@ -1,7 +1,8 @@
 use crate::auth::AuthState;
-use crate::billing_rate_store::BillingRateStore;
+use crate::billing_rate_store::{BillingRateStore, DbBillingRateRecord};
 use crate::db::DbPool;
 use crate::error::{AppError, AppResult};
+use crate::exact_decimal::Multiplier;
 use crate::handlers::routing::health_key;
 use crate::image_transform_cache::ImageTransformCache;
 use crate::model_registry::ModelRegistry;
@@ -13,7 +14,7 @@ use crate::monoize_routing::{
 use crate::name_cache::NameCaches;
 use crate::rate_limit::RateLimiter;
 use crate::request_capture::RequestCaptureStore;
-use crate::settings::{SettingsStore, normalize_pricing_model_key};
+use crate::settings::{PricingProfilePattern, SettingsStore, normalize_pricing_model_key};
 use crate::transforms::TransformRegistry;
 use crate::users::{InsertRequestLog, UserRole, UserStore};
 use axum::Router;
@@ -280,6 +281,7 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
     let probe_routing_config_revision = routing_config_revision.clone();
     let probe_user_store = user_store.clone();
     let probe_model_registry_store = model_registry_store.clone();
+    let probe_billing_rate_store = billing_rate_store.clone();
     let probe_settings_store = settings_store.clone();
     tokio::spawn(async move {
         loop {
@@ -393,14 +395,16 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                     spawn_active_probe_request_log(
                         probe_user_store.clone(),
                         probe_model_registry_store.clone(),
+                        probe_billing_rate_store.clone(),
                         probe_settings_store.clone(),
                         active_probe_user_id.clone(),
                         provider.id.clone(),
-                        provider.name.clone(),
+                        channel.provider_type,
                         channel.models.get(model_name).map(|entry| entry.multiplier),
                         channel.id.clone(),
                         channel.name.clone(),
                         model_name.to_string(),
+                        upstream_model,
                         usage_snapshot,
                         probe_started_at.elapsed().as_millis() as u64,
                         ok,
@@ -606,31 +610,167 @@ async fn ensure_active_probe_system_user(user_store: &UserStore) -> Option<Strin
     }
 }
 
-fn parse_pricing_i128(raw: Option<String>) -> Option<i128> {
-    raw.and_then(|v| v.parse::<i128>().ok())
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveProbeRateResolution {
+    pricing_profile: String,
+    pricing_model: String,
+    input_rate_nano: i128,
+    output_rate_nano: i128,
 }
 
-fn scale_charge_with_multiplier(base_nano: i128, provider_multiplier: f64) -> Option<i128> {
-    if !provider_multiplier.is_finite() || provider_multiplier < 0.0 {
-        return None;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveProbeCharge {
+    prompt_charge_nano: i128,
+    completion_charge_nano: i128,
+    base_charge_nano: i128,
+    final_charge_nano: i128,
+}
+
+fn is_dimensionless_probe_rate(rate: &DbBillingRateRecord, usage_class: &str) -> bool {
+    rate.rate_kind == "token"
+        && rate.usage_class == usage_class
+        && rate.unit == "token"
+        && rate.modality.is_none()
+        && rate.cache_ttl.is_none()
+        && rate
+            .context_tier
+            .as_deref()
+            .is_none_or(|tier| tier == "default")
+        && rate
+            .service_tier
+            .as_deref()
+            .is_none_or(|tier| tier == "default")
+}
+
+fn first_dimensionless_probe_rate(
+    rates: &[DbBillingRateRecord],
+    usage_class: &str,
+) -> Result<Option<i128>, String> {
+    let Some(rate) = rates
+        .iter()
+        .find(|rate| is_dimensionless_probe_rate(rate, usage_class))
+    else {
+        return Ok(None);
+    };
+    let price = rate.unit_price_nano()?;
+    if price < 0 || price.to_string() != rate.unit_price_nano_usd {
+        return Err(format!(
+            "non-canonical or negative unit_price_nano_usd for billing rate {}",
+            rate.id
+        ));
+    }
+    Ok(Some(price))
+}
+
+async fn resolve_active_probe_rates_for_model(
+    billing_rate_store: &BillingRateStore,
+    model_registry_store: &ModelRegistryStore,
+    patterns: &[PricingProfilePattern],
+    pricing_model: &str,
+    provider_type: &str,
+) -> Result<Option<ActiveProbeRateResolution>, String> {
+    let mut candidate_profiles = Vec::new();
+    if let Some(profile) =
+        crate::billing_rate_store::select_pricing_profile(patterns, pricing_model)
+    {
+        candidate_profiles.push(profile.to_string());
+    }
+    if let Some(metadata_profile) = model_registry_store
+        .get_model_metadata(pricing_model)
+        .await?
+        .and_then(|record| record.models_dev_provider)
+        .map(|profile| profile.trim().to_string())
+        .filter(|profile| !profile.is_empty())
+        && !candidate_profiles.contains(&metadata_profile)
+    {
+        candidate_profiles.push(metadata_profile);
     }
 
-    const SCALE: i128 = 1_000_000_000;
-    let multiplier_repr = format!("{provider_multiplier:.18}");
-    let mut parts = multiplier_repr.split('.');
-    let whole = parts.next().unwrap_or("0").parse::<i128>().ok()?;
-    let frac_raw = parts.next().unwrap_or("0");
-    let mut frac_nano = String::with_capacity(9);
-    for ch in frac_raw.chars().take(9) {
-        frac_nano.push(ch);
+    for pricing_profile in candidate_profiles {
+        let rates = billing_rate_store
+            .list_matching_rates(&pricing_profile, Some(provider_type), pricing_model)
+            .await?;
+        let input_rate_nano = first_dimensionless_probe_rate(&rates, "input_uncached")?;
+        let output_rate_nano = first_dimensionless_probe_rate(&rates, "output")?;
+        if let (Some(input_rate_nano), Some(output_rate_nano)) = (input_rate_nano, output_rate_nano)
+        {
+            return Ok(Some(ActiveProbeRateResolution {
+                pricing_profile,
+                pricing_model: pricing_model.to_string(),
+                input_rate_nano,
+                output_rate_nano,
+            }));
+        }
     }
-    while frac_nano.len() < 9 {
-        frac_nano.push('0');
-    }
-    let frac = frac_nano.parse::<i128>().ok()?;
+    Ok(None)
+}
 
-    let multiplier_nano = whole.checked_mul(SCALE)?.checked_add(frac)?;
-    base_nano.checked_mul(multiplier_nano)?.checked_div(SCALE)
+async fn resolve_active_probe_rates(
+    billing_rate_store: &BillingRateStore,
+    model_registry_store: &ModelRegistryStore,
+    settings_store: &SettingsStore,
+    upstream_model: &str,
+    logical_model: &str,
+    provider_type: &str,
+) -> Result<Option<ActiveProbeRateResolution>, String> {
+    let reasoning_suffix_map = settings_store
+        .get_reasoning_suffix_map()
+        .await
+        .unwrap_or_default();
+    let patterns = settings_store.get_pricing_profile_model_patterns().await?;
+    let normalized_upstream_model =
+        normalize_pricing_model_key(upstream_model, &reasoning_suffix_map);
+    if let Some(resolution) = resolve_active_probe_rates_for_model(
+        billing_rate_store,
+        model_registry_store,
+        &patterns,
+        &normalized_upstream_model,
+        provider_type,
+    )
+    .await?
+    {
+        return Ok(Some(resolution));
+    }
+
+    let normalized_logical_model =
+        normalize_pricing_model_key(logical_model, &reasoning_suffix_map);
+    if normalized_logical_model == normalized_upstream_model {
+        return Ok(None);
+    }
+    resolve_active_probe_rates_for_model(
+        billing_rate_store,
+        model_registry_store,
+        &patterns,
+        &normalized_logical_model,
+        provider_type,
+    )
+    .await
+}
+
+fn calculate_active_probe_charge(
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    pricing: &ActiveProbeRateResolution,
+    provider_multiplier: Multiplier,
+) -> Result<ActiveProbeCharge, String> {
+    let prompt_charge_nano = i128::from(prompt_tokens)
+        .checked_mul(pricing.input_rate_nano)
+        .ok_or_else(|| "active probe prompt charge overflow".to_string())?;
+    let completion_charge_nano = i128::from(completion_tokens)
+        .checked_mul(pricing.output_rate_nano)
+        .ok_or_else(|| "active probe completion charge overflow".to_string())?;
+    let base_charge_nano = prompt_charge_nano
+        .checked_add(completion_charge_nano)
+        .ok_or_else(|| "active probe base charge overflow".to_string())?;
+    let final_charge_nano = provider_multiplier
+        .checked_scale_i128(base_charge_nano)
+        .ok_or_else(|| "active probe multiplier charge overflow".to_string())?;
+    Ok(ActiveProbeCharge {
+        prompt_charge_nano,
+        completion_charge_nano,
+        base_charge_nano,
+        final_charge_nano,
+    })
 }
 
 fn build_probe_usage_breakdown(prompt_tokens: u64, completion_tokens: u64) -> Value {
@@ -661,55 +801,47 @@ fn build_probe_usage_breakdown(prompt_tokens: u64, completion_tokens: u64) -> Va
 
 #[allow(clippy::too_many_arguments)]
 fn build_probe_billing_breakdown(
-    provider_name: String,
-    upstream_model: String,
-    provider_multiplier: f64,
+    provider_id: &str,
+    logical_model: &str,
+    upstream_model: &str,
+    provider_multiplier: Multiplier,
     prompt_tokens: u64,
     completion_tokens: u64,
-    input_rate_nano: i128,
-    output_rate_nano: i128,
-    final_charge_nano: i128,
+    pricing: &ActiveProbeRateResolution,
+    charge: ActiveProbeCharge,
 ) -> Value {
-    let prompt_charge = i128::from(prompt_tokens)
-        .checked_mul(input_rate_nano)
-        .unwrap_or_default();
-    let completion_charge = i128::from(completion_tokens)
-        .checked_mul(output_rate_nano)
-        .unwrap_or_default();
-    let base_charge = prompt_charge
-        .checked_add(completion_charge)
-        .unwrap_or_default();
     json!({
-        "version": 1,
+        "version": 2,
         "currency": "nano_usd",
-        "logical_model": upstream_model,
+        "logical_model": logical_model,
         "upstream_model": upstream_model,
-        "provider_id": provider_name,
+        "provider_id": provider_id,
+        "pricing_profile": pricing.pricing_profile,
+        "pricing_model": pricing.pricing_model,
         "provider_multiplier": provider_multiplier,
-        "input": {
-            "total_tokens": prompt_tokens,
-            "cached_tokens": 0,
-            "billed_uncached_tokens": prompt_tokens,
-            "billed_cached_tokens": 0,
-            "unit_price_nano": input_rate_nano.to_string(),
-            "cached_unit_price_nano": null,
-            "uncached_charge_nano": prompt_charge.to_string(),
-            "cached_charge_nano": "0",
-            "total_charge_nano": prompt_charge.to_string()
+        "token_line_items": [
+            {
+                "usage_class": "input_uncached",
+                "unit": "token",
+                "unit_price_nano": pricing.input_rate_nano.to_string(),
+                "quantity": prompt_tokens,
+                "charge_nano": charge.prompt_charge_nano.to_string()
+            },
+            {
+                "usage_class": "output",
+                "unit": "token",
+                "unit_price_nano": pricing.output_rate_nano.to_string(),
+                "quantity": completion_tokens,
+                "charge_nano": charge.completion_charge_nano.to_string()
+            }
+        ],
+        "meter_line_items": [],
+        "tier": {
+            "context_tier": null,
+            "service_tier": null
         },
-        "output": {
-            "total_tokens": completion_tokens,
-            "reasoning_tokens": 0,
-            "billed_non_reasoning_tokens": completion_tokens,
-            "billed_reasoning_tokens": 0,
-            "unit_price_nano": output_rate_nano.to_string(),
-            "reasoning_unit_price_nano": null,
-            "non_reasoning_charge_nano": completion_charge.to_string(),
-            "reasoning_charge_nano": "0",
-            "total_charge_nano": completion_charge.to_string()
-        },
-        "base_charge_nano": base_charge.to_string(),
-        "final_charge_nano": final_charge_nano.to_string()
+        "base_charge_nano": charge.base_charge_nano.to_string(),
+        "final_charge_nano": charge.final_charge_nano.to_string()
     })
 }
 
@@ -717,14 +849,16 @@ fn build_probe_billing_breakdown(
 fn spawn_active_probe_request_log(
     user_store: UserStore,
     model_registry_store: ModelRegistryStore,
+    billing_rate_store: BillingRateStore,
     settings_store: SettingsStore,
     user_id: Option<String>,
     provider_id: String,
-    provider_name: String,
-    provider_multiplier: Option<f64>,
+    provider_type: crate::monoize_routing::MonoizeProviderType,
+    provider_multiplier: Option<Multiplier>,
     channel_id: String,
     _channel_name: String,
-    model: String,
+    logical_model: String,
+    upstream_model: String,
     usage_snapshot: Option<Value>,
     duration_ms: u64,
     status_ok: bool,
@@ -735,7 +869,7 @@ fn spawn_active_probe_request_log(
     if !status_ok {
         return;
     }
-    let provider_multiplier = provider_multiplier.unwrap_or(1.0);
+    let provider_multiplier = provider_multiplier.unwrap_or(Multiplier::ONE);
     tokio::spawn(async move {
         let parsed_prompt_tokens = usage_snapshot
             .as_ref()
@@ -746,52 +880,61 @@ fn spawn_active_probe_request_log(
             .and_then(|v| v.get("completion_tokens"))
             .and_then(|v| v.as_u64());
         let usage_tokens = parsed_prompt_tokens.zip(parsed_completion_tokens);
-        let reasoning_suffix_map = settings_store
-            .get_reasoning_suffix_map()
-            .await
-            .unwrap_or_default();
-        let pricing_model_key = normalize_pricing_model_key(&model, &reasoning_suffix_map);
-
-        let (charge_nano_usd, billing_breakdown_json) = {
+        let (charge_nano_usd, billing_breakdown_json) =
             if let Some((prompt_tokens, completion_tokens)) = usage_tokens {
-                match model_registry_store
-                    .get_model_metadata(&pricing_model_key)
-                    .await
+                match resolve_active_probe_rates(
+                    &billing_rate_store,
+                    &model_registry_store,
+                    &settings_store,
+                    &upstream_model,
+                    &logical_model,
+                    provider_type.as_str(),
+                )
+                .await
                 {
-                    Ok(Some(meta)) => {
-                        let input_rate =
-                            parse_pricing_i128(meta.input_cost_per_token_nano).unwrap_or_default();
-                        let output_rate =
-                            parse_pricing_i128(meta.output_cost_per_token_nano).unwrap_or_default();
-                        let base_charge = i128::from(prompt_tokens)
-                            .checked_mul(input_rate)
-                            .and_then(|v| {
-                                v.checked_add(
-                                    i128::from(completion_tokens).checked_mul(output_rate)?,
-                                )
-                            })
-                            .unwrap_or_default();
-                        let final_charge =
-                            scale_charge_with_multiplier(base_charge, provider_multiplier)
-                                .unwrap_or(base_charge);
-                        let billing = build_probe_billing_breakdown(
-                            provider_name.clone(),
-                            model.clone(),
-                            provider_multiplier,
-                            prompt_tokens,
-                            completion_tokens,
-                            input_rate,
-                            output_rate,
-                            final_charge,
+                    Ok(Some(pricing)) => match calculate_active_probe_charge(
+                        prompt_tokens,
+                        completion_tokens,
+                        &pricing,
+                        provider_multiplier,
+                    ) {
+                        Ok(charge) => (
+                            Some(charge.final_charge_nano),
+                            Some(build_probe_billing_breakdown(
+                                &provider_id,
+                                &logical_model,
+                                &upstream_model,
+                                provider_multiplier,
+                                prompt_tokens,
+                                completion_tokens,
+                                &pricing,
+                                charge,
+                            )),
+                        ),
+                        Err(err) => {
+                            tracing::warn!(
+                                logical_model,
+                                upstream_model,
+                                error = %err,
+                                "active probe charge calculation failed"
+                            );
+                            (None, None)
+                        }
+                    },
+                    Ok(None) => (None, None),
+                    Err(err) => {
+                        tracing::warn!(
+                            logical_model,
+                            upstream_model,
+                            error = %err,
+                            "active probe pricing resolution failed"
                         );
-                        (Some(final_charge), Some(billing))
+                        (None, None)
                     }
-                    Ok(None) | Err(_) => (None, None),
                 }
             } else {
                 (None, None)
-            }
-        };
+            };
 
         let usage_breakdown_json = usage_tokens.map(|(prompt_tokens, completion_tokens)| {
             build_probe_usage_breakdown(prompt_tokens, completion_tokens)
@@ -801,9 +944,9 @@ fn spawn_active_probe_request_log(
             request_id: None,
             user_id,
             api_key_id: None,
-            model: model.clone(),
+            model: logical_model,
             provider_id: Some(provider_id),
-            upstream_model: Some(model),
+            upstream_model: Some(upstream_model),
             channel_id: Some(channel_id),
             is_stream: false,
             input_tokens: usage_tokens.map(|(prompt_tokens, _)| prompt_tokens),
@@ -833,7 +976,7 @@ fn spawn_active_probe_request_log(
             reasoning_effort: None,
             tried_providers_json: None,
             request_kind: Some(ACTIVE_PROBE_CONNECTIVITY_KIND.to_string()),
-            effective_provider_type: None,
+            effective_provider_type: Some(provider_type.as_str().to_string()),
             affinity_hit: None,
             affinity_key_hash: None,
             affinity_target: None,
@@ -844,6 +987,73 @@ fn spawn_active_probe_request_log(
             tracing::warn!("failed to insert active probe request log: {err}");
         }
     });
+}
+
+#[cfg(test)]
+mod active_probe_billing_tests {
+    use super::*;
+
+    fn rate(
+        id: &str,
+        usage_class: &str,
+        unit_price_nano_usd: &str,
+        modality: Option<&str>,
+    ) -> DbBillingRateRecord {
+        DbBillingRateRecord {
+            id: id.to_string(),
+            source: "test".to_string(),
+            pricing_profile: "test-profile".to_string(),
+            model_pattern: Some("test-model".to_string()),
+            provider_type: None,
+            rate_kind: "token".to_string(),
+            usage_class: usage_class.to_string(),
+            unit: "token".to_string(),
+            unit_price_nano_usd: unit_price_nano_usd.to_string(),
+            context_tier: None,
+            service_tier: None,
+            modality: modality.map(str::to_string),
+            cache_ttl: None,
+            match_json: json!({}),
+            priority: 0,
+            enabled: true,
+            raw_json: json!({}),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn probe_rate_selection_uses_first_dimensionless_row() {
+        let rates = vec![
+            rate("dimensioned", "input_uncached", "999", Some("image")),
+            rate("first", "input_uncached", "1001", None),
+            rate("second", "input_uncached", "2000", None),
+        ];
+        assert_eq!(
+            first_dimensionless_probe_rate(&rates, "input_uncached").unwrap(),
+            Some(1001)
+        );
+    }
+
+    #[test]
+    fn probe_charge_uses_exact_multiplier_and_checked_arithmetic() {
+        let pricing = ActiveProbeRateResolution {
+            pricing_profile: "test-profile".to_string(),
+            pricing_model: "test-model".to_string(),
+            input_rate_nano: 1000,
+            output_rate_nano: 2000,
+        };
+        let charge =
+            calculate_active_probe_charge(1, 1, &pricing, Multiplier::parse("1.001").unwrap())
+                .unwrap();
+        assert_eq!(charge.base_charge_nano, 3000);
+        assert_eq!(charge.final_charge_nano, 3003);
+
+        let overflowing = ActiveProbeRateResolution {
+            input_rate_nano: i128::MAX,
+            ..pricing
+        };
+        assert!(calculate_active_probe_charge(2, 0, &overflowing, Multiplier::ONE).is_err());
+    }
 }
 
 fn resolve_database_dsn() -> String {

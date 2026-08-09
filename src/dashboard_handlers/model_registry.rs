@@ -213,7 +213,13 @@ pub async fn upsert_model_metadata(
         .model_registry_store
         .upsert_model_metadata(model_id, input)
         .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+        .map_err(|e| {
+            if e.starts_with("invalid_request:") {
+                AppError::new(StatusCode::BAD_REQUEST, "invalid_request", e)
+            } else {
+                AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e)
+            }
+        })?;
     Ok(Json(record))
 }
 

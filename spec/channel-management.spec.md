@@ -49,7 +49,7 @@ A channel object MUST include:
 - `api_key: string` (write-only: MUST NOT be returned by list/get APIs)
 - `weight: integer >= 0`
 - `enabled: boolean`
-- `models: Record<string, { redirect: string | null, multiplier: number }>`
+- `models: Record<string, { redirect: string | null, multiplier: string }>`
 
 Runtime projection fields MAY be returned by list/get APIs:
 
@@ -84,7 +84,9 @@ CP-INV-1. `channels.length >= 1`.
 
 CP-INV-2. At least one Channel MUST have a non-empty `models` object.
 
-CP-INV-3. Every Channel model entry multiplier MUST be finite and satisfy `multiplier > 0`.
+CP-INV-3. Every Channel model entry `multiplier` MUST be a base-10 decimal string with at most 9 fractional digits, MUST be representable by the server decimal type, and MUST satisfy `multiplier > 0`. Exponent notation, a leading `+`, `NaN`, and infinity are invalid. The server MUST parse, compare, persist, and return the multiplier without converting it through `f32` or `f64`.
+
+CP-INV-3a. Read responses MUST return each multiplier as a canonical decimal string without exponent notation or trailing fractional zeroes. The canonical representation of one is `"1"`.
 
 CP-INV-4. Every channel weight MUST satisfy `weight >= 0`.
 
@@ -139,7 +141,7 @@ All endpoints require an authenticated dashboard admin session.
   - `channel_retry_interval_ms?: integer`
   - `circuit_breaker_enabled?: boolean`
   - `per_model_circuit_break?: boolean`
-  - `channels: Array<{ id?: string, name: string, provider_type: ProviderType, base_url: string, api_key: string, weight?: number, enabled?: boolean, models: Record<string, { redirect: string | null, multiplier: number }>, passive_failure_count_threshold_override?: integer | null, passive_window_seconds_override?: integer | null, passive_cooldown_seconds_override?: integer | null, passive_rate_limit_cooldown_seconds_override?: integer | null, active_probe_enabled_override?: boolean | null, active_probe_interval_seconds_override?: integer | null, active_probe_success_threshold_override?: integer | null, active_probe_model_override?: string | null, affinity_enabled_override?: boolean | null, affinity_idle_ttl_seconds_override?: integer | null, affinity_failback_mode_override?: "sticky" | "prefer_higher_priority" | null, affinity_failback_delay_seconds_override?: integer | null }>`
+  - `channels: Array<{ id?: string, name: string, provider_type: ProviderType, base_url: string, api_key: string, weight?: number, enabled?: boolean, models: Record<string, { redirect: string | null, multiplier: string }>, passive_failure_count_threshold_override?: integer | null, passive_window_seconds_override?: integer | null, passive_cooldown_seconds_override?: integer | null, passive_rate_limit_cooldown_seconds_override?: integer | null, active_probe_enabled_override?: boolean | null, active_probe_interval_seconds_override?: integer | null, active_probe_success_threshold_override?: integer | null, active_probe_model_override?: string | null, affinity_enabled_override?: boolean | null, affinity_idle_ttl_seconds_override?: integer | null, affinity_failback_mode_override?: "sticky" | "prefer_higher_priority" | null, affinity_failback_delay_seconds_override?: integer | null }>`
   - `groups?: string[]`
   - `api_type_overrides?: ApiTypeOverride[]`
   - `strip_cross_protocol_nested_extra?: boolean | null`

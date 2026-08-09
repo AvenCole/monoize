@@ -20,6 +20,7 @@ import {
 	FieldLabel
 } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
+import { normalizeMultiplier } from '@/lib/exact-decimal'
 import {
 	hasBillablePricingModelId,
 	type ModelRow
@@ -100,7 +101,8 @@ export function ChannelModelEditor({
 			errors.model = c('当前 Channel 已存在同名模型。', 'This channel already contains that model.')
 		}
 
-		if (!Number.isFinite(Number(multiplier)) || Number(multiplier) <= 0) {
+		const normalizedMultiplier = normalizeMultiplier(multiplier)
+		if (normalizedMultiplier == null) {
 			errors.multiplier = c('倍率必须是大于 0 的数字。', 'Multiplier must be a number greater than zero.')
 		}
 
@@ -112,7 +114,7 @@ export function ChannelModelEditor({
 		const nextModel: ModelRow = {
 			model,
 			redirect: editor.draft.redirect.trim(),
-			multiplier
+			multiplier: normalizedMultiplier ?? multiplier
 		}
 		onChange(
 			editor.index === null ?
@@ -236,9 +238,8 @@ export function ChannelModelEditor({
 									<FieldLabel htmlFor='channel-model-multiplier'>{c('倍率', 'Multiplier')}</FieldLabel>
 									<Input
 										id='channel-model-multiplier'
-										type='number'
-										min='0.0001'
-										step='any'
+										type='text'
+										inputMode='decimal'
 										value={editor.draft.multiplier}
 										onChange={event => updateDraft({ multiplier: event.target.value })}
 										aria-invalid={Boolean(editor.errors.multiplier)}

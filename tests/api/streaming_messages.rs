@@ -580,7 +580,7 @@ async fn messages_streaming_plaintext_reasoning_to_summary_preserves_thinking_de
         "gpt-5-mini".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: None,
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     ctx.state
@@ -1252,7 +1252,7 @@ async fn messages_stream_passthrough_transform_preserves_plaintext_reasoning_chu
         "chunked-msg-transform".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: Some("gpt-5-mini-msg".to_string()),
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     ctx.state

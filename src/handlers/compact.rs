@@ -158,10 +158,26 @@ pub async fn compact_response(
                     let usage = parse_usage_from_responses_object(&value);
                     let charge = match usage.as_ref() {
                         Some(usage) => {
-                            maybe_charge_usage(&state, &auth, &attempt, &logical_model, usage)
-                                .await?
+                            maybe_charge_usage(
+                                &state,
+                                &auth,
+                                &attempt,
+                                &logical_model,
+                                usage,
+                                request_id.as_deref(),
+                            )
+                            .await?
                         }
-                        None => ChargeComputation::default(),
+                        None => {
+                            if let Some(session) = capture.session.as_ref() {
+                                session.persist_with_result(None, true).await;
+                            }
+                            return Err(AppError::new(
+                                StatusCode::BAD_GATEWAY,
+                                "upstream_usage_required",
+                                "upstream response did not include billable usage",
+                            ));
+                        }
                     };
                     spawn_request_log(
                         &state,

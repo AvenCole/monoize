@@ -76,7 +76,7 @@ pub(super) fn map_get_u64(map: &Map<String, Value>, key: &str) -> Option<u64> {
 pub(super) fn calculate_charge_components(
     usage: &urp::Usage,
     pricing: &ModelPricing,
-    provider_multiplier: f64,
+    provider_multiplier: Multiplier,
 ) -> Option<ChargeComponents> {
     let prompt_tokens = i128::from(usage.input_tokens);
     let completion_tokens = i128::from(usage.output_tokens);
@@ -187,7 +187,7 @@ pub(super) fn calculate_charge_components(
 pub(super) fn calculate_charge_nano(
     usage: &urp::Usage,
     pricing: &ModelPricing,
-    provider_multiplier: f64,
+    provider_multiplier: Multiplier,
 ) -> Option<i128> {
     calculate_charge_components(usage, pricing, provider_multiplier).map(|parts| parts.final_charge)
 }
@@ -449,16 +449,14 @@ pub(super) fn billing_rate_matrix_allows_request(
     resolution: &BillingRateResolution,
     server_tool_usage_classes: &[String],
 ) -> Result<bool, String> {
-    let has_input = resolution
-        .rates
-        .iter()
-        .any(|r| r.rate_kind == "token" && r.usage_class == "input_uncached");
-    let has_output = resolution
-        .rates
-        .iter()
-        .any(|r| r.rate_kind == "token" && r.usage_class == "output");
-    if !has_input || !has_output {
-        return Ok(false);
+    for rate in &resolution.rates {
+        let unit_price = rate.unit_price_nano()?;
+        if unit_price < 0 || unit_price.to_string() != rate.unit_price_nano_usd {
+            return Err(format!(
+                "non-canonical or negative unit_price_nano_usd for billing rate {}",
+                rate.id
+            ));
+        }
     }
     let context_tiers: std::collections::BTreeSet<String> = resolution
         .rates
@@ -467,6 +465,31 @@ pub(super) fn billing_rate_matrix_allows_request(
         .filter(|tier| *tier != "default")
         .map(str::to_string)
         .collect();
+    let has_dimensionless_fallback = |usage_class: &str, context_tier: Option<&str>| {
+        resolution.rates.iter().any(|rate| {
+            rate.rate_kind == "token"
+                && rate.usage_class == usage_class
+                && rate.modality.is_none()
+                && rate.cache_ttl.is_none()
+                && rate
+                    .service_tier
+                    .as_deref()
+                    .is_none_or(|tier| tier == "default")
+                && match context_tier {
+                    Some(tier) => rate.context_tier.as_deref() == Some(tier),
+                    None => rate
+                        .context_tier
+                        .as_deref()
+                        .is_none_or(|tier| tier == "default"),
+                }
+        })
+    };
+    if context_tiers.is_empty()
+        && (!has_dimensionless_fallback("input_uncached", None)
+            || !has_dimensionless_fallback("output", None))
+    {
+        return Ok(false);
+    }
     if !context_tiers.is_empty() {
         let has_threshold = resolution
             .rates
@@ -478,11 +501,7 @@ pub(super) fn billing_rate_matrix_allows_request(
         }
         for tier in &context_tiers {
             for usage_class in ["input_uncached", "output"] {
-                let has_tier_rate = resolution.rates.iter().any(|r| {
-                    r.rate_kind == "token"
-                        && r.usage_class == usage_class
-                        && r.context_tier.as_deref() == Some(tier.as_str())
-                });
+                let has_tier_rate = has_dimensionless_fallback(usage_class, Some(tier.as_str()));
                 if !has_tier_rate {
                     return Err(format!(
                         "missing token rate for usage_class={usage_class}, context_tier={tier}"
@@ -492,10 +511,30 @@ pub(super) fn billing_rate_matrix_allows_request(
         }
     }
     for usage_class in server_tool_usage_classes {
-        let has_meter = resolution
-            .rates
-            .iter()
-            .any(|r| r.rate_kind == "meter" && r.usage_class == *usage_class);
+        let meter_matches_tier = |context_tier: Option<&str>| {
+            resolution.rates.iter().any(|rate| {
+                rate.rate_kind == "meter"
+                    && rate.usage_class == *usage_class
+                    && rate.modality.is_none()
+                    && rate.cache_ttl.is_none()
+                    && rate
+                        .service_tier
+                        .as_deref()
+                        .is_none_or(|tier| tier == "default")
+                    && match (rate.context_tier.as_deref(), context_tier) {
+                        (None | Some("default"), _) => true,
+                        (Some(rate_tier), Some(tier)) => rate_tier == tier,
+                        (Some(_), None) => false,
+                    }
+            })
+        };
+        let has_meter = if context_tiers.is_empty() {
+            meter_matches_tier(None)
+        } else {
+            context_tiers
+                .iter()
+                .all(|tier| meter_matches_tier(Some(tier)))
+        };
         if !has_meter {
             return Err(format!(
                 "meter rate required for server-native tool usage class: {usage_class}"
@@ -619,16 +658,25 @@ fn find_rate_for_usage_classes<'a>(
     })
 }
 
-fn has_modality_rates(rates: &[DbBillingRateRecord], usage_class: &str) -> bool {
+fn has_matching_modality_rates(
+    rates: &[DbBillingRateRecord],
+    usage_classes: &[&str],
+    context_tier: Option<&str>,
+    service_tier: Option<&str>,
+    cache_ttl: Option<&str>,
+) -> bool {
     rates.iter().any(|rate| {
-        rate.rate_kind == "token" && rate.usage_class == usage_class && rate.modality.is_some()
+        rate.rate_kind == "token"
+            && usage_classes.contains(&rate.usage_class.as_str())
+            && rate.modality.is_some()
+            && rate_matches_dimension(
+                rate,
+                rate.modality.as_deref(),
+                context_tier,
+                service_tier,
+                cache_ttl,
+            )
     })
-}
-
-fn has_any_modality_rates(rates: &[DbBillingRateRecord], usage_classes: &[&str]) -> bool {
-    usage_classes
-        .iter()
-        .any(|usage_class| has_modality_rates(rates, usage_class))
 }
 
 fn modality_quantity_sum(breakdown: &urp::ModalityBreakdown) -> u64 {
@@ -815,7 +863,7 @@ fn add_modality_token_lines(
     context_tier: Option<&str>,
     service_tier: Option<&str>,
 ) -> Result<i128, String> {
-    if !has_any_modality_rates(rates, usage_classes) {
+    if !has_matching_modality_rates(rates, usage_classes, context_tier, service_tier, None) {
         return add_token_line_for_usage_classes(
             line_items,
             rates,
@@ -832,10 +880,16 @@ fn add_modality_token_lines(
         return Ok(0);
     }
     let Some(breakdown) = breakdown else {
-        return Err(format!(
-            "modality-specific rate for {} requires usage modality breakdown",
-            usage_classes.join("|")
-        ));
+        return add_token_line_for_usage_classes(
+            line_items,
+            rates,
+            usage_classes,
+            fallback_quantity,
+            None,
+            context_tier,
+            service_tier,
+            None,
+        );
     };
     validate_modality_sum(usage_classes[0], breakdown, fallback_quantity)?;
     let mut total = 0i128;
@@ -860,6 +914,105 @@ fn add_modality_token_lines(
             .ok_or_else(|| "token charge overflow".to_string())?;
     }
     Ok(total)
+}
+
+fn add_cache_read_lines(
+    line_items: &mut Vec<Value>,
+    rates: &[DbBillingRateRecord],
+    breakdown: Option<&urp::ModalityBreakdown>,
+    quantity: u64,
+    context_tier: Option<&str>,
+    service_tier: Option<&str>,
+) -> Result<i128, String> {
+    let usage_classes = ["cache_read", "input_cached"];
+    if breakdown.is_some()
+        && has_matching_modality_rates(rates, &usage_classes, context_tier, service_tier, None)
+    {
+        return add_modality_token_lines(
+            line_items,
+            rates,
+            &usage_classes,
+            breakdown,
+            quantity,
+            context_tier,
+            service_tier,
+        );
+    }
+    if find_rate_for_usage_classes(
+        rates,
+        "token",
+        &usage_classes,
+        None,
+        context_tier,
+        service_tier,
+        None,
+    )
+    .is_some()
+    {
+        return add_token_line_for_usage_classes(
+            line_items,
+            rates,
+            &usage_classes,
+            quantity,
+            None,
+            context_tier,
+            service_tier,
+            None,
+        );
+    }
+    add_token_line(
+        line_items,
+        rates,
+        "input_uncached",
+        quantity,
+        None,
+        context_tier,
+        service_tier,
+        None,
+    )
+}
+
+fn add_cache_write_line(
+    line_items: &mut Vec<Value>,
+    rates: &[DbBillingRateRecord],
+    usage_class: &str,
+    quantity: u64,
+    context_tier: Option<&str>,
+    service_tier: Option<&str>,
+    cache_ttl: &str,
+) -> Result<i128, String> {
+    if find_rate(
+        rates,
+        "token",
+        usage_class,
+        None,
+        context_tier,
+        service_tier,
+        Some(cache_ttl),
+    )
+    .is_some()
+    {
+        return add_token_line(
+            line_items,
+            rates,
+            usage_class,
+            quantity,
+            None,
+            context_tier,
+            service_tier,
+            Some(cache_ttl),
+        );
+    }
+    add_token_line(
+        line_items,
+        rates,
+        "input_uncached",
+        quantity,
+        None,
+        context_tier,
+        service_tier,
+        None,
+    )
 }
 
 fn authoritative_meter_quantity(usage: &urp::Usage, usage_class: &str, unit: &str) -> Option<u64> {
@@ -935,9 +1088,18 @@ fn add_meter_lines(
     usage: &urp::Usage,
     output: Option<&[urp::Node]>,
     requested_usage_classes: &[String],
+    context_tier: Option<&str>,
+    service_tier: Option<&str>,
 ) -> Result<i128, String> {
     let mut total = 0i128;
-    for rate in rates.iter().filter(|r| r.rate_kind == "meter") {
+    let mut selected_usage_classes = HashSet::new();
+    for rate in rates.iter().filter(|rate| {
+        rate.rate_kind == "meter"
+            && rate_matches_dimension(rate, None, context_tier, service_tier, None)
+    }) {
+        if !selected_usage_classes.insert(rate.usage_class.as_str()) {
+            continue;
+        }
         let authoritative = authoritative_meter_quantity(usage, &rate.usage_class, &rate.unit);
         if requested_usage_classes
             .iter()
@@ -995,6 +1157,8 @@ fn add_meter_lines(
             "quantity": quantity,
             "charge_nano": charge.to_string(),
             "authoritative": authoritative.is_some(),
+            "context_tier": context_tier,
+            "service_tier": service_tier,
         }));
         total = total
             .checked_add(charge)
@@ -1007,7 +1171,7 @@ pub(super) fn calculate_rate_matrix_charge_components(
     usage: &urp::Usage,
     output: Option<&[urp::Node]>,
     resolution: &BillingRateResolution,
-    provider_multiplier: f64,
+    provider_multiplier: Multiplier,
     requested_usage_classes: &[String],
 ) -> Result<MatrixChargeComponents, String> {
     let input_details = usage.input_details.as_ref();
@@ -1051,12 +1215,23 @@ pub(super) fn calculate_rate_matrix_charge_components(
     } else {
         0
     };
-    let uncached_input_modality_breakdown =
-        if has_any_modality_rates(&resolution.rates, &["input_uncached"]) {
-            input_uncached_modality_breakdown(input_details, uncached_tokens)?
-        } else {
-            None
-        };
+    let can_derive_uncached_modality = input_details.is_some_and(|details| {
+        details.modality_breakdown.is_some()
+            && details.cache_creation_tokens == 0
+            && (details.cache_read_tokens == 0 || details.cache_read_modality_breakdown.is_some())
+    });
+    let uncached_input_modality_breakdown = if can_derive_uncached_modality
+        && has_matching_modality_rates(
+            &resolution.rates,
+            &["input_uncached"],
+            context_tier_ref,
+            service_tier_ref,
+            None,
+        ) {
+        input_uncached_modality_breakdown(input_details, uncached_tokens)?
+    } else {
+        None
+    };
 
     let mut token_line_items = Vec::new();
     let mut token_total = 0i128;
@@ -1072,10 +1247,9 @@ pub(super) fn calculate_rate_matrix_charge_components(
         )?)
         .ok_or_else(|| "token charge overflow".to_string())?;
     token_total = token_total
-        .checked_add(add_modality_token_lines(
+        .checked_add(add_cache_read_lines(
             &mut token_line_items,
             &resolution.rates,
-            &["cache_read", "input_cached"],
             input_details.and_then(|d| d.cache_read_modality_breakdown.as_ref()),
             cached_tokens,
             context_tier_ref,
@@ -1133,35 +1307,43 @@ pub(super) fn calculate_rate_matrix_charge_components(
             "cache creation usage requires 5m/1h split for the selected rate matrix".to_string(),
         );
     }
-    let aggregate_cache_write_5m = if cache_creation_5m == 0 && cache_creation_1h == 0 {
-        cache_creation_tokens
+    if cache_creation_5m == 0 && cache_creation_1h == 0 {
+        token_total = token_total
+            .checked_add(add_token_line(
+                &mut token_line_items,
+                &resolution.rates,
+                "input_uncached",
+                cache_creation_tokens,
+                None,
+                context_tier_ref,
+                service_tier_ref,
+                None,
+            )?)
+            .ok_or_else(|| "token charge overflow".to_string())?;
     } else {
-        cache_creation_5m
-    };
-    token_total = token_total
-        .checked_add(add_token_line(
-            &mut token_line_items,
-            &resolution.rates,
-            "cache_write_5m",
-            aggregate_cache_write_5m,
-            None,
-            context_tier_ref,
-            service_tier_ref,
-            Some("5m"),
-        )?)
-        .ok_or_else(|| "token charge overflow".to_string())?;
-    token_total = token_total
-        .checked_add(add_token_line(
-            &mut token_line_items,
-            &resolution.rates,
-            "cache_write_1h",
-            cache_creation_1h,
-            None,
-            context_tier_ref,
-            service_tier_ref,
-            Some("1h"),
-        )?)
-        .ok_or_else(|| "token charge overflow".to_string())?;
+        token_total = token_total
+            .checked_add(add_cache_write_line(
+                &mut token_line_items,
+                &resolution.rates,
+                "cache_write_5m",
+                cache_creation_5m,
+                context_tier_ref,
+                service_tier_ref,
+                "5m",
+            )?)
+            .ok_or_else(|| "token charge overflow".to_string())?;
+        token_total = token_total
+            .checked_add(add_cache_write_line(
+                &mut token_line_items,
+                &resolution.rates,
+                "cache_write_1h",
+                cache_creation_1h,
+                context_tier_ref,
+                service_tier_ref,
+                "1h",
+            )?)
+            .ok_or_else(|| "token charge overflow".to_string())?;
+    }
     token_total = token_total
         .checked_add(add_modality_token_lines(
             &mut token_line_items,
@@ -1193,6 +1375,8 @@ pub(super) fn calculate_rate_matrix_charge_components(
         usage,
         output,
         requested_usage_classes,
+        context_tier_ref,
+        service_tier_ref,
     )?;
     let base_charge = token_total
         .checked_add(meter_total)
@@ -1238,28 +1422,9 @@ fn build_matrix_billing_breakdown(
 
 pub(super) fn scale_charge_with_multiplier(
     base_nano: i128,
-    provider_multiplier: f64,
+    provider_multiplier: Multiplier,
 ) -> Option<i128> {
-    if !provider_multiplier.is_finite() || provider_multiplier < 0.0 {
-        return None;
-    }
-
-    pub(super) const SCALE: i128 = 1_000_000_000;
-    let multiplier_repr = format!("{provider_multiplier:.18}");
-    let mut parts = multiplier_repr.split('.');
-    let whole = parts.next().unwrap_or("0").parse::<i128>().ok()?;
-    let frac_raw = parts.next().unwrap_or("0");
-    let mut frac_nano = String::with_capacity(9);
-    for ch in frac_raw.chars().take(9) {
-        frac_nano.push(ch);
-    }
-    while frac_nano.len() < 9 {
-        frac_nano.push('0');
-    }
-    let frac = frac_nano.parse::<i128>().ok()?;
-
-    let multiplier_nano = whole.checked_mul(SCALE)?.checked_add(frac)?;
-    base_nano.checked_mul(multiplier_nano)?.checked_div(SCALE)
+    provider_multiplier.checked_scale_i128(base_nano)
 }
 
 pub(super) async fn maybe_charge_usage(
@@ -1268,8 +1433,10 @@ pub(super) async fn maybe_charge_usage(
     attempt: &MonoizeAttempt,
     logical_model: &str,
     usage: &urp::Usage,
+    request_id: Option<&str>,
 ) -> AppResult<ChargeComputation> {
-    maybe_charge_usage_with_output(state, auth, attempt, logical_model, usage, None).await
+    maybe_charge_usage_with_output(state, auth, attempt, logical_model, usage, None, request_id)
+        .await
 }
 
 async fn maybe_charge_usage_with_output(
@@ -1279,6 +1446,7 @@ async fn maybe_charge_usage_with_output(
     logical_model: &str,
     usage: &urp::Usage,
     output: Option<&[urp::Node]>,
+    request_id: Option<&str>,
 ) -> AppResult<ChargeComputation> {
     let resolution = match resolve_billing_rate_matrix(
         state,
@@ -1335,20 +1503,6 @@ async fn maybe_charge_usage_with_output(
             ));
         }
     };
-    if !attempt.model_multiplier.is_finite() || attempt.model_multiplier < 0.0 {
-        tracing::error!(
-            "billing error: charge overflow for model={}",
-            attempt.upstream_model
-        );
-        return Err(AppError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "billing_overflow",
-            format!(
-                "charge calculation overflow for model={}",
-                attempt.upstream_model
-            ),
-        ));
-    }
     let billing_breakdown =
         build_matrix_billing_breakdown(logical_model, attempt, &resolution, &components);
     let charge_nano = components.final_charge;
@@ -1373,6 +1527,7 @@ async fn maybe_charge_usage_with_output(
         "reasoning_tokens": usage.reasoning_tokens(),
         "charge_nano_usd": charge_nano.to_string(),
         "api_key_id": auth.api_key_id,
+        "request_id": request_id,
     });
 
     if auth.sub_account_enabled {
@@ -1443,15 +1598,41 @@ async fn maybe_charge_usage_with_output(
     }
 }
 
+pub(super) async fn maybe_charge_stream_usage(
+    state: &AppState,
+    auth: &crate::auth::AuthResult,
+    attempt: &MonoizeAttempt,
+    logical_model: &str,
+    usage: &urp::Usage,
+    output: &[urp::Node],
+    request_id: Option<&str>,
+) -> AppResult<ChargeComputation> {
+    maybe_charge_usage_with_output(
+        state,
+        auth,
+        attempt,
+        logical_model,
+        usage,
+        Some(output),
+        request_id,
+    )
+    .await
+}
+
 pub(super) async fn maybe_charge_response(
     state: &AppState,
     auth: &crate::auth::AuthResult,
     attempt: &MonoizeAttempt,
     logical_model: &str,
     response: &urp::UrpResponse,
+    request_id: Option<&str>,
 ) -> AppResult<ChargeComputation> {
     let Some(usage) = response.usage.as_ref() else {
-        return Ok(ChargeComputation::default());
+        return Err(AppError::new(
+            StatusCode::BAD_GATEWAY,
+            "upstream_usage_required",
+            "upstream response did not include billable usage",
+        ));
     };
     maybe_charge_usage_with_output(
         state,
@@ -1460,6 +1641,7 @@ pub(super) async fn maybe_charge_response(
         logical_model,
         usage,
         Some(response.output.as_slice()),
+        request_id,
     )
     .await
 }

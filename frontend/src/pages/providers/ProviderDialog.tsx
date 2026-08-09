@@ -68,6 +68,7 @@ import {
 	updateProviderOptimistic
 } from '@/lib/swr'
 import { cn } from '@/lib/utils'
+import { normalizeMultiplier } from '@/lib/exact-decimal'
 import { ChannelModelEditor } from './ChannelModelEditor'
 import { ModelPickerDialog } from './ModelPickerDialog'
 import {
@@ -107,7 +108,7 @@ function modelMap(rows: ModelRow[]) {
 			row.model.trim(),
 			{
 				redirect: row.redirect.trim() || null,
-				multiplier: Number(row.multiplier)
+				multiplier: normalizeMultiplier(row.multiplier) ?? row.multiplier.trim()
 			}
 		])
 	)
@@ -257,7 +258,7 @@ export function ProviderDialog({
 			if (names.some(name => !name) || new Set(names).size !== names.length) {
 				return c(`Channel ${index + 1} 存在空白或重复模型`, `Channel ${index + 1} has blank or duplicate models`)
 			}
-			if (channel.models.some(model => !Number.isFinite(Number(model.multiplier)) || Number(model.multiplier) <= 0)) {
+			if (channel.models.some(model => normalizeMultiplier(model.multiplier) == null)) {
 				return c(`Channel ${index + 1} 的倍率必须大于 0`, `Channel ${index + 1} multipliers must be greater than zero`)
 			}
 		}

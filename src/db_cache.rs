@@ -80,8 +80,37 @@ impl LastUsedBatcher {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
+struct BufferedRequestLog {
+    id: String,
+    log: InsertRequestLog,
+}
+
+fn request_log_u64_value(
+    field: &'static str,
+    value: Option<u64>,
+    request_id: Option<&str>,
+) -> sea_orm::Value {
+    match value {
+        Some(value) => match i64::try_from(value) {
+            Ok(value) => sea_orm::Value::BigInt(Some(value)),
+            Err(_) => {
+                tracing::warn!(
+                    field,
+                    value,
+                    request_id = request_id.unwrap_or("<missing>"),
+                    "request log scalar exceeds i64 and will be stored as null"
+                );
+                sea_orm::Value::BigInt(None)
+            }
+        },
+        None => sea_orm::Value::BigInt(None),
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RequestLogBatcher {
-    buffer: Arc<Mutex<Vec<InsertRequestLog>>>,
+    buffer: Arc<Mutex<Vec<BufferedRequestLog>>>,
+    flush_lock: Arc<Mutex<()>>,
     capacity_hint: usize,
     broadcast: tokio::sync::broadcast::Sender<Vec<InsertRequestLog>>,
     pending_snapshots: Arc<DashMap<String, InsertRequestLog>>,
@@ -95,6 +124,7 @@ impl RequestLogBatcher {
     ) -> Self {
         Self {
             buffer: Arc::new(Mutex::new(Vec::with_capacity(capacity_hint))),
+            flush_lock: Arc::new(Mutex::new(())),
             capacity_hint,
             broadcast,
             pending_snapshots,
@@ -109,12 +139,22 @@ impl RequestLogBatcher {
         }
         let _ = self.broadcast.send(vec![log.clone()]);
         let mut buf = self.buffer.lock().await;
-        buf.push(log);
+        buf.push(BufferedRequestLog {
+            id: uuid::Uuid::new_v4().to_string(),
+            log,
+        });
+    }
+
+    async fn requeue_front(&self, mut entries: Vec<BufferedRequestLog>) {
+        let mut buf = self.buffer.lock().await;
+        entries.append(&mut *buf);
+        *buf = entries;
     }
 
     /// Drain buffer and batch-insert into DB.
     pub async fn flush(&self, db: &DbPool) {
-        let entries: Vec<InsertRequestLog> = {
+        let _flush_guard = self.flush_lock.lock().await;
+        let entries: Vec<BufferedRequestLog> = {
             let mut buf = self.buffer.lock().await;
             if buf.is_empty() {
                 return;
@@ -133,18 +173,19 @@ impl RequestLogBatcher {
             Ok(tx) => tx,
             Err(e) => {
                 tracing::warn!("request_log_batcher flush begin tx error: {e}");
+                self.requeue_front(entries).await;
                 return;
             }
         };
 
         let mut insert_failed = false;
 
-        for log in &entries {
-            let id = uuid::Uuid::new_v4().to_string();
+        for entry in &entries {
+            let log = &entry.log;
             let created_at = log.created_at.to_rfc3339();
             let created_at_unix_ms = log.created_at.timestamp_millis();
             let values = vec![
-                id.into(),
+                entry.id.clone().into(),
                 log.request_id.clone().into(),
                 log.user_id.clone().into(),
                 log.api_key_id.clone().into(),
@@ -153,33 +194,46 @@ impl RequestLogBatcher {
                 log.upstream_model.clone().into(),
                 log.channel_id.clone().into(),
                 SeaValue::Int(Some(if log.is_stream { 1 } else { 0 })),
-                log.input_tokens
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
-                log.output_tokens
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
-                log.cache_read_tokens
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
-                log.cache_creation_tokens
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
-                log.tool_prompt_tokens
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
-                log.reasoning_tokens
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
-                log.accepted_prediction_tokens
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
-                log.rejected_prediction_tokens
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
+                request_log_u64_value("input_tokens", log.input_tokens, log.request_id.as_deref()),
+                request_log_u64_value(
+                    "output_tokens",
+                    log.output_tokens,
+                    log.request_id.as_deref(),
+                ),
+                request_log_u64_value(
+                    "cache_read_tokens",
+                    log.cache_read_tokens,
+                    log.request_id.as_deref(),
+                ),
+                request_log_u64_value(
+                    "cache_creation_tokens",
+                    log.cache_creation_tokens,
+                    log.request_id.as_deref(),
+                ),
+                request_log_u64_value(
+                    "tool_prompt_tokens",
+                    log.tool_prompt_tokens,
+                    log.request_id.as_deref(),
+                ),
+                request_log_u64_value(
+                    "reasoning_tokens",
+                    log.reasoning_tokens,
+                    log.request_id.as_deref(),
+                ),
+                request_log_u64_value(
+                    "accepted_prediction_tokens",
+                    log.accepted_prediction_tokens,
+                    log.request_id.as_deref(),
+                ),
+                request_log_u64_value(
+                    "rejected_prediction_tokens",
+                    log.rejected_prediction_tokens,
+                    log.request_id.as_deref(),
+                ),
                 log.provider_multiplier
-                    .map(|v| SeaValue::Double(Some(v)))
-                    .unwrap_or(SeaValue::Double(None)),
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .into(),
                 log.charge_nano_usd.map(|v| v.to_string()).into(),
                 log.status.clone().into(),
                 log.usage_breakdown_json
@@ -195,24 +249,28 @@ impl RequestLogBatcher {
                 log.error_http_status
                     .map(|v| SeaValue::BigInt(Some(i64::from(v))))
                     .unwrap_or(SeaValue::BigInt(None)),
-                log.duration_ms
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
-                log.ttfb_ms
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
-                log.first_visible_output_ms
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
-                log.last_visible_output_ms
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
-                log.visible_generation_ms
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
-                log.visible_output_tokens
-                    .map(|v| SeaValue::BigInt(Some(v as i64)))
-                    .unwrap_or(SeaValue::BigInt(None)),
+                request_log_u64_value("duration_ms", log.duration_ms, log.request_id.as_deref()),
+                request_log_u64_value("ttfb_ms", log.ttfb_ms, log.request_id.as_deref()),
+                request_log_u64_value(
+                    "first_visible_output_ms",
+                    log.first_visible_output_ms,
+                    log.request_id.as_deref(),
+                ),
+                request_log_u64_value(
+                    "last_visible_output_ms",
+                    log.last_visible_output_ms,
+                    log.request_id.as_deref(),
+                ),
+                request_log_u64_value(
+                    "visible_generation_ms",
+                    log.visible_generation_ms,
+                    log.request_id.as_deref(),
+                ),
+                request_log_u64_value(
+                    "visible_output_tokens",
+                    log.visible_output_tokens,
+                    log.request_id.as_deref(),
+                ),
                 log.tps_mode.clone().into(),
                 log.request_ip.clone().into(),
                 log.reasoning_effort.clone().into(),
@@ -242,7 +300,8 @@ impl RequestLogBatcher {
                     request_ip, reasoning_effort, tried_providers_json, request_kind,
                     effective_provider_type, affinity_hit, affinity_key_hash, affinity_target,
                     created_at, created_at_unix_ms)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42)"#;
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42)
+                   ON CONFLICT(id) DO NOTHING"#;
 
             if let Err(e) = tx.execute(db.stmt(sql, values)).await {
                 tracing::warn!("request_log_batcher flush error: {e}");
@@ -255,11 +314,13 @@ impl RequestLogBatcher {
             if let Err(e) = tx.rollback().await {
                 tracing::warn!("request_log_batcher rollback error: {e}");
             }
+            self.requeue_front(entries).await;
             return;
         }
 
         if let Err(e) = tx.commit().await {
             tracing::warn!("request_log_batcher commit error: {e}");
+            self.requeue_front(entries).await;
         }
     }
 

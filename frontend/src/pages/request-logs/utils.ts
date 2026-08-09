@@ -1,4 +1,5 @@
 import type { RequestLog } from '@/lib/api'
+import { formatNanoUsd, isSignedIntegerString } from '@/lib/exact-decimal'
 
 type TimingValue = number | string | null | undefined
 
@@ -97,7 +98,6 @@ export function readNanoString(obj: JsonObject | null, key: string): string | nu
 	if (!obj) return null
 	const raw = obj[key]
 	if (typeof raw === 'string' && raw.trim() !== '') return raw
-	if (typeof raw === 'number' && Number.isFinite(raw)) return String(raw)
 	return null
 }
 
@@ -172,14 +172,8 @@ export function getTtfbMs(log: RequestLog): number | null {
 
 export function formatCost(nanoUsd: string | null | undefined): string {
 	if (nanoUsd == null) return '-'
-	const cost = Number(nanoUsd) / 1e9
-	if (!Number.isFinite(cost)) return '-'
-	return new Intl.NumberFormat('en-US', {
-		style: 'currency',
-		currency: 'USD',
-		minimumFractionDigits: 6,
-		maximumFractionDigits: 9
-	}).format(cost)
+	if (!isSignedIntegerString(nanoUsd)) return '-'
+	return formatNanoUsd(nanoUsd, 6)
 }
 
 export function formatDuration(ms: number | null | undefined): string | null {

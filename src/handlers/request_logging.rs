@@ -29,7 +29,7 @@ fn broadcast_pending_snapshot(
     provider_id: Option<&str>,
     channel_id: Option<&str>,
     upstream_model: Option<&str>,
-    provider_multiplier: Option<f64>,
+    provider_multiplier: Option<Multiplier>,
     effective_provider_type: Option<&str>,
     affinity_hit: Option<bool>,
     affinity_key_hash: Option<&str>,

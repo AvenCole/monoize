@@ -16,6 +16,38 @@ fn receiver_event_stream(rx: mpsc::Receiver<Event>) -> ForwardEventStream {
         .map(event_ok as fn(Event) -> Result<Event, std::convert::Infallible>)
 }
 
+fn estimated_tokens_from_utf8_bytes(bytes: u64) -> u64 {
+    bytes.div_ceil(4)
+}
+
+fn decoded_visible_output_bytes(output: &[urp::Node]) -> u64 {
+    output.iter().fold(0u64, |total, node| {
+        let bytes = match node {
+            urp::Node::Text { content, .. } | urp::Node::Refusal { content, .. } => {
+                content.len() as u64
+            }
+            _ => 0,
+        };
+        total.saturating_add(bytes)
+    })
+}
+
+async fn retain_decoded_terminal_output(
+    mut rx: mpsc::Receiver<urp::UrpStreamEvent>,
+    tx: mpsc::Sender<urp::UrpStreamEvent>,
+    terminal_output: Arc<Mutex<Vec<urp::Node>>>,
+) -> AppResult<()> {
+    while let Some(event) = rx.recv().await {
+        if let urp::UrpStreamEvent::ResponseDone { output, .. } = &event {
+            *terminal_output.lock().await = output.clone();
+        }
+        if tx.send(event).await.is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn stream_error_code(err: &AppError) -> String {
     err.upstream_code.as_ref().unwrap_or(&err.code).to_string()
 }
@@ -79,7 +111,7 @@ pub(super) async fn forward_stream_typed(
     state: AppState,
     auth: crate::auth::AuthResult,
     mut req: urp::UrpRequest,
-    max_multiplier: Option<f64>,
+    max_multiplier: Option<Multiplier>,
     downstream: DownstreamProtocol,
     request_id: Option<String>,
     request_ip: Option<String>,
@@ -324,6 +356,7 @@ pub(super) async fn forward_stream_typed(
                             &attempt,
                             &logical_model,
                             &resp,
+                            request_id.as_deref(),
                         )
                         .await
                         {
@@ -485,6 +518,9 @@ pub(super) async fn forward_stream_typed(
 
             let upstream_body =
                 encode_request_for_provider(&mut req_attempt, &attempt, downstream)?;
+            let estimated_input_tokens = estimated_tokens_from_utf8_bytes(
+                u64::try_from(upstream_body.to_string().len()).unwrap_or(u64::MAX),
+            );
             let provider = build_channel_provider_config(&attempt);
             let path = upstream_path_for_model(attempt.provider_type, &req_attempt.model, true);
             let call = upstream::call_upstream_raw_with_timeout_and_headers(
@@ -537,6 +573,7 @@ pub(super) async fn forward_stream_typed(
                         last_visible_output_ms: None,
                         visible_output_bytes: 0,
                     }));
+                    let decoded_terminal_output = Arc::new(Mutex::new(Vec::<urp::Node>::new()));
                     let metrics_for_stream = runtime_metrics.clone();
                     let state_for_log = state.clone();
                     let auth_for_log = auth.clone();
@@ -563,8 +600,6 @@ pub(super) async fn forward_stream_typed(
                     let reasoning_effort_for_log =
                         req.reasoning.as_ref().and_then(|r| r.effort.clone());
                     let tried_providers_for_log = tried_providers.clone();
-                    let enable_estimated_billing =
-                        state.monoize_runtime.read().await.enable_estimated_billing;
                     let stream_idle_timeout_ms = state
                         .monoize_runtime
                         .read()
@@ -589,6 +624,8 @@ pub(super) async fn forward_stream_typed(
                         let stream_future = async {
                             let (decoded_tx, decoded_rx) =
                                 mpsc::channel::<crate::urp::UrpStreamEvent>(64);
+                            let (metered_tx, metered_rx) =
+                                mpsc::channel::<crate::urp::UrpStreamEvent>(64);
                             let (transformed_tx, transformed_rx) =
                                 mpsc::channel::<crate::urp::UrpStreamEvent>(64);
 
@@ -609,6 +646,18 @@ pub(super) async fn forward_stream_typed(
                                 })
                             };
 
+                            let retain_output_handle = {
+                                let terminal_output = decoded_terminal_output.clone();
+                                crate::request_capture::spawn_with_sse_capture(async move {
+                                    retain_decoded_terminal_output(
+                                        decoded_rx,
+                                        metered_tx,
+                                        terminal_output,
+                                    )
+                                    .await
+                                })
+                            };
+
                             let transform_handle =
                                 crate::request_capture::spawn_with_sse_capture(async move {
                                     let reasoning_envelope = reasoning_envelope_for_transform
@@ -618,7 +667,7 @@ pub(super) async fn forward_stream_typed(
                                         });
                                     transform_urp_stream(
                                         &state_for_transform,
-                                        decoded_rx,
+                                        metered_rx,
                                         transformed_tx,
                                         &provider_rules_for_transform,
                                         &global_rules_for_transform,
@@ -643,8 +692,17 @@ pub(super) async fn forward_stream_typed(
                                     .await
                                 });
 
-                            let (decode_result, transform_result, encode_result) =
-                                tokio::join!(decode_handle, transform_handle, encode_handle);
+                            let (
+                                decode_result,
+                                retain_output_result,
+                                transform_result,
+                                encode_result,
+                            ) = tokio::join!(
+                                decode_handle,
+                                retain_output_handle,
+                                transform_handle,
+                                encode_handle
+                            );
                             decode_result
                                 .unwrap_or_else(|e| {
                                     Err(AppError::new(
@@ -653,6 +711,13 @@ pub(super) async fn forward_stream_typed(
                                         e.to_string(),
                                     ))
                                 })
+                                .and(retain_output_result.unwrap_or_else(|e| {
+                                    Err(AppError::new(
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        "task_panic",
+                                        e.to_string(),
+                                    ))
+                                }))
                                 .and(transform_result.unwrap_or_else(|e| {
                                     Err(AppError::new(
                                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -673,6 +738,9 @@ pub(super) async fn forward_stream_typed(
                         } else {
                             stream_future.await
                         };
+                        let settled_output = decoded_terminal_output.lock().await.clone();
+                        let terminal_visible_output_bytes =
+                            decoded_visible_output_bytes(&settled_output);
 
                         let (
                             ttfb_ms,
@@ -687,17 +755,21 @@ pub(super) async fn forward_stream_typed(
                             let actual_upstream_usage = guard.usage.clone();
                             let (usage, is_estimated) = match guard.usage.clone() {
                                 Some(u) => (Some(u), false),
-                                None if enable_estimated_billing
-                                    && guard.estimated_output_tokens > 0 =>
-                                {
+                                None => {
+                                    let visible_output_bytes = guard
+                                        .visible_output_bytes
+                                        .max(terminal_visible_output_bytes);
+                                    let estimated_output_tokens =
+                                        estimated_tokens_from_utf8_bytes(visible_output_bytes);
                                     tracing::warn!(
-                                        estimated_output_tokens = guard.estimated_output_tokens,
+                                        estimated_input_tokens,
+                                        estimated_output_tokens,
                                         "upstream stream ended without usage; billing from estimate"
                                     );
                                     (
                                         Some(urp::Usage {
-                                            input_tokens: 0,
-                                            output_tokens: guard.estimated_output_tokens,
+                                            input_tokens: estimated_input_tokens,
+                                            output_tokens: estimated_output_tokens,
                                             input_details: None,
                                             output_details: None,
                                             extra_body: std::collections::HashMap::new(),
@@ -705,7 +777,6 @@ pub(super) async fn forward_stream_typed(
                                         true,
                                     )
                                 }
-                                _ => (None, false),
                             };
                             (
                                 guard.ttfb_ms,
@@ -776,26 +847,52 @@ pub(super) async fn forward_stream_typed(
                             return;
                         }
 
-                        let mut charge = match usage.as_ref() {
-                            Some(usage_row) => match maybe_charge_usage(
-                                &state_for_log,
-                                &auth_for_log,
-                                &attempt_for_log,
-                                &model_for_log,
-                                usage_row,
-                            )
-                            .await
-                            {
-                                Ok(v) => v,
-                                Err(err) => {
-                                    tracing::error!(
-                                        "failed to charge passthrough stream request: {}",
-                                        err.message
-                                    );
-                                    ChargeComputation::default()
+                        let usage_row = usage
+                            .as_ref()
+                            .expect("stream usage or a deterministic estimate must exist");
+                        let mut charge = match maybe_charge_stream_usage(
+                            &state_for_log,
+                            &auth_for_log,
+                            &attempt_for_log,
+                            &model_for_log,
+                            usage_row,
+                            &settled_output,
+                            request_id_for_log.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                tracing::error!(
+                                    code = %err.code,
+                                    "failed to settle passthrough stream billing: {}",
+                                    err.message
+                                );
+                                let terminal_error = StreamTerminalError {
+                                    code: "billing_settlement_failed".to_string(),
+                                    message: format!("{}: {}", err.code, err.message),
+                                    http_status: err.status.as_u16(),
+                                    error_type: Some("billing_error".to_string()),
+                                    param: err.param.clone(),
+                                };
+                                spawn_request_log_stream_terminal_error(
+                                    &state_for_log,
+                                    &auth_for_log,
+                                    &attempt_for_log,
+                                    &model_for_log,
+                                    started_at,
+                                    request_id_for_log,
+                                    request_ip_for_log,
+                                    ttfb_ms,
+                                    terminal_error,
+                                    reasoning_effort_for_log,
+                                    tried_providers_for_log,
+                                );
+                                if let Some(session) = capture_session.as_ref() {
+                                    session.persist_with_result(usage.as_ref(), true).await;
                                 }
-                            },
-                            None => ChargeComputation::default(),
+                                return;
+                            }
                         };
                         if is_estimated {
                             if let Some(ref mut breakdown) = charge.billing_breakdown {
@@ -1071,4 +1168,48 @@ pub(super) async fn forward_stream_typed(
         session.persist_with_result(None, true).await;
     }
     Ok(prestream_error_stream(downstream, final_err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn decoded_terminal_output_is_retained_before_forwarding() {
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (output_tx, mut output_rx) = mpsc::channel(1);
+        let retained = Arc::new(Mutex::new(Vec::new()));
+        let relay = tokio::spawn(retain_decoded_terminal_output(
+            input_rx,
+            output_tx,
+            retained.clone(),
+        ));
+        let nodes = vec![urp::Node::Text {
+            id: None,
+            role: urp::OrdinaryRole::Assistant,
+            content: "拒绝".to_string(),
+            phase: None,
+            extra_body: HashMap::new(),
+        }];
+
+        input_tx
+            .send(urp::UrpStreamEvent::ResponseDone {
+                finish_reason: None,
+                usage: None,
+                output: nodes.clone(),
+                extra_body: HashMap::new(),
+            })
+            .await
+            .expect("relay input should stay open");
+        drop(input_tx);
+
+        assert!(matches!(
+            output_rx.recv().await,
+            Some(urp::UrpStreamEvent::ResponseDone { .. })
+        ));
+        relay.await.expect("relay task should join").expect("relay");
+        assert_eq!(*retained.lock().await, nodes);
+        assert_eq!(decoded_visible_output_bytes(&nodes), 6);
+        assert_eq!(estimated_tokens_from_utf8_bytes(6), 2);
+    }
 }

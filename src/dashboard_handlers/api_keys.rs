@@ -1,6 +1,7 @@
 use crate::app::AppState;
 use crate::dashboard_handlers::session_helpers::get_current_user;
 use crate::error::{AppError, AppResult};
+use crate::exact_decimal::Multiplier;
 use crate::transforms::TransformRuleConfig;
 use crate::users::{
     CreateApiKeyInput, ModelRedirectRule, RequestCaptureMode, UpdateApiKeyInput,
@@ -13,9 +14,9 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-pub(super) fn nano_balance_fields(nano_str: &str) -> (String, String) {
-    let nano = parse_nano_usd(nano_str).unwrap_or(0);
-    (nano_str.to_string(), format_nano_to_usd(nano))
+pub(super) fn nano_balance_fields(nano_str: &str) -> Result<(String, String), String> {
+    let nano = parse_nano_usd(nano_str)?;
+    Ok((nano_str.to_string(), format_nano_to_usd(nano)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -25,6 +26,8 @@ pub struct CreateApiKeyRequest {
     #[serde(default)]
     pub sub_account_enabled: bool,
     #[serde(default)]
+    pub sub_account_balance_nano_usd: Option<String>,
+    #[serde(default)]
     pub model_limits_enabled: bool,
     #[serde(default)]
     pub model_limits: Vec<String>,
@@ -33,7 +36,7 @@ pub struct CreateApiKeyRequest {
     #[serde(default)]
     pub allowed_groups: Vec<String>,
     #[serde(default)]
-    pub max_multiplier: Option<f64>,
+    pub max_multiplier: Option<Multiplier>,
     #[serde(default)]
     pub transforms: Vec<TransformRuleConfig>,
     #[serde(default)]
@@ -69,7 +72,7 @@ pub struct ApiKeyResponse {
     pub model_limits: Vec<String>,
     pub ip_whitelist: Vec<String>,
     pub allowed_groups: Vec<String>,
-    pub max_multiplier: Option<f64>,
+    pub max_multiplier: Option<Multiplier>,
     pub transforms: Vec<TransformRuleConfig>,
     pub model_redirects: Vec<ModelRedirectRule>,
     pub reasoning_envelope_enabled: bool,
@@ -91,7 +94,7 @@ pub struct ApiKeyCreatedResponse {
     pub model_limits: Vec<String>,
     pub ip_whitelist: Vec<String>,
     pub allowed_groups: Vec<String>,
-    pub max_multiplier: Option<f64>,
+    pub max_multiplier: Option<Multiplier>,
     pub transforms: Vec<TransformRuleConfig>,
     pub model_redirects: Vec<ModelRedirectRule>,
     pub reasoning_envelope_enabled: bool,
@@ -103,11 +106,12 @@ pub struct UpdateApiKeyRequest {
     pub name: Option<String>,
     pub enabled: Option<bool>,
     pub sub_account_enabled: Option<bool>,
+    pub sub_account_balance_nano_usd: Option<String>,
     pub model_limits_enabled: Option<bool>,
     pub model_limits: Option<Vec<String>>,
     pub ip_whitelist: Option<Vec<String>>,
     pub allowed_groups: Option<Vec<String>>,
-    pub max_multiplier: Option<f64>,
+    pub max_multiplier: Option<Multiplier>,
     pub transforms: Option<Vec<TransformRuleConfig>>,
     pub model_redirects: Option<Vec<ModelRedirectRule>>,
     pub reasoning_envelope_enabled: Option<bool>,
@@ -133,11 +137,11 @@ pub async fn list_my_api_keys(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
-    let responses: Vec<ApiKeyResponse> = keys
+    let responses = keys
         .into_iter()
         .map(|k| {
-            let (nano, usd) = nano_balance_fields(&k.sub_account_balance_nano);
-            ApiKeyResponse {
+            let (nano, usd) = nano_balance_fields(&k.sub_account_balance_nano)?;
+            Ok(ApiKeyResponse {
                 id: k.id,
                 name: k.name,
                 key_prefix: k.key_prefix,
@@ -158,9 +162,10 @@ pub async fn list_my_api_keys(
                 model_redirects: k.model_redirects,
                 reasoning_envelope_enabled: k.reasoning_envelope_enabled,
                 request_capture_mode: k.request_capture_mode,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
     Ok(Json(responses))
 }
@@ -202,6 +207,7 @@ pub async fn create_api_key(
         name: body.name,
         expires_in_days: body.expires_in_days,
         sub_account_enabled: body.sub_account_enabled,
+        sub_account_balance_nano_usd: body.sub_account_balance_nano_usd,
         model_limits_enabled: body.model_limits_enabled,
         model_limits: body.model_limits,
         ip_whitelist: body.ip_whitelist,
@@ -224,7 +230,8 @@ pub async fn create_api_key(
         .name_caches
         .api_keys
         .insert(api_key.id.clone(), api_key.name.clone());
-    let (nano, usd) = nano_balance_fields(&api_key.sub_account_balance_nano);
+    let (nano, usd) = nano_balance_fields(&api_key.sub_account_balance_nano)
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
     Ok((
         StatusCode::CREATED,
         Json(ApiKeyCreatedResponse {
@@ -307,7 +314,8 @@ pub async fn get_api_key(
     }
 
     Ok(Json({
-        let (nano, usd) = nano_balance_fields(&api_key.sub_account_balance_nano);
+        let (nano, usd) = nano_balance_fields(&api_key.sub_account_balance_nano)
+            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
         ApiKeyResponse {
             id: api_key.id,
             name: api_key.name,
@@ -364,6 +372,7 @@ pub async fn update_api_key(
         name: body.name,
         enabled: body.enabled,
         sub_account_enabled: body.sub_account_enabled,
+        sub_account_balance_nano_usd: body.sub_account_balance_nano_usd,
         model_limits_enabled: body.model_limits_enabled,
         model_limits: body.model_limits,
         ip_whitelist: body.ip_whitelist,
@@ -387,7 +396,8 @@ pub async fn update_api_key(
         .name_caches
         .api_keys
         .insert(updated_key.id.clone(), updated_key.name.clone());
-    let (nano, usd) = nano_balance_fields(&updated_key.sub_account_balance_nano);
+    let (nano, usd) = nano_balance_fields(&updated_key.sub_account_balance_nano)
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
     Ok(Json(ApiKeyResponse {
         id: updated_key.id,
         name: updated_key.name,

@@ -52,9 +52,37 @@ import { TransformChainEditor } from "@/components/transforms/transform-chain-ed
 import { findFirstInvalidTransformRule } from "@/components/transforms/transform-schema";
 import { toast } from "sonner";
 import { useAuth } from "@/hooks/use-auth";
+import { normalizeMultiplier } from "@/lib/exact-decimal";
 
 function groupKey(value: string): string {
   return value.trim().toLowerCase();
+}
+
+function parseOptionalMultiplier(value: string): string | undefined {
+  if (!value.trim()) return undefined;
+  const normalized = normalizeMultiplier(value);
+  if (normalized == null) {
+    throw new Error("Multiplier must be a positive decimal with at most 9 fractional digits");
+  }
+  return normalized;
+}
+
+function parseOptionalNanoBalance(value: string, allowNegative = true): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (!/^-?(?:0|[1-9]\d*)$/.test(trimmed)) {
+    throw new Error("Balance must be a signed integer nano-USD string");
+  }
+  const parsed = BigInt(trimmed);
+  const minimum = -(1n << 127n);
+  const maximum = (1n << 127n) - 1n;
+  if (parsed < minimum || parsed > maximum) {
+    throw new Error("Balance exceeds the supported signed 128-bit range");
+  }
+  if (!allowNegative && parsed < 0n) {
+    throw new Error("Initial balance must be non-negative");
+  }
+  return parsed.toString();
 }
 
 function dedupeAllowedGroups(values: string[]): string[] {
@@ -445,6 +473,7 @@ export function ApiKeysPage() {
   const [newKeyName, setNewKeyName] = useState("");
   const [newKeyExpires, setNewKeyExpires] = useState("");
   const [newKeySubAccountEnabled, setNewKeySubAccountEnabled] = useState(false);
+  const [newKeySubAccountBalanceNanoUsd, setNewKeySubAccountBalanceNanoUsd] = useState("0");
   const [transferDialogKey, setTransferDialogKey] = useState<ApiKey | null>(null);
   const [transferAmount, setTransferAmount] = useState("");
   const [transferring, setTransferring] = useState(false);
@@ -463,11 +492,13 @@ export function ApiKeysPage() {
   const [updating, setUpdating] = useState(false);
   const [createdKey, setCreatedKey] = useState<ApiKeyCreated | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const canManageSystem = currentUser?.role === "admin" || currentUser?.role === "super_admin";
 
   const resetCreateForm = () => {
     setNewKeyName("");
     setNewKeyExpires("");
     setNewKeySubAccountEnabled(false);
+    setNewKeySubAccountBalanceNanoUsd("0");
     setNewKeyModelLimitsEnabled(false);
     setNewKeyModelLimits("");
     setNewKeyIpWhitelist("");
@@ -493,15 +524,28 @@ export function ApiKeysPage() {
     }
     setCreating(true);
     try {
+      const initialSubAccountBalance = canManageSystem
+        ? parseOptionalNanoBalance(newKeySubAccountBalanceNanoUsd, false)
+        : undefined;
+      if (
+        !newKeySubAccountEnabled
+        && initialSubAccountBalance != null
+        && BigInt(initialSubAccountBalance) !== 0n
+      ) {
+        throw new Error("A non-zero initial balance requires sub-account billing to be enabled");
+      }
       const input: CreateApiKeyInput = {
         name: newKeyName.trim(),
         expires_in_days: newKeyExpires ? parseInt(newKeyExpires) : undefined,
         sub_account_enabled: newKeySubAccountEnabled,
+        ...(canManageSystem
+          ? { sub_account_balance_nano_usd: initialSubAccountBalance }
+          : {}),
         model_limits_enabled: newKeyModelLimitsEnabled,
         model_limits: newKeyModelLimits ? newKeyModelLimits.split(",").map(s => s.trim()).filter(s => s) : [],
         ip_whitelist: newKeyIpWhitelist ? newKeyIpWhitelist.split(",").map(s => s.trim()).filter(s => s) : [],
         allowed_groups: dedupeAllowedGroups(newKeyAllowedGroups),
-        max_multiplier: newKeyMaxMultiplier ? parseFloat(newKeyMaxMultiplier) : undefined,
+        max_multiplier: parseOptionalMultiplier(newKeyMaxMultiplier),
         transforms: newKeyTransforms,
         model_redirects: newKeyModelRedirects.filter((r) => r.pattern.trim() && r.replace.trim()),
         reasoning_envelope_enabled: newKeyReasoningEnvelopeEnabled,
@@ -537,11 +581,14 @@ export function ApiKeysPage() {
       const input: UpdateApiKeyInput = {
         name: newKeyName.trim() || undefined,
         sub_account_enabled: newKeySubAccountEnabled,
+        ...(canManageSystem && newKeySubAccountEnabled
+          ? { sub_account_balance_nano_usd: parseOptionalNanoBalance(newKeySubAccountBalanceNanoUsd) }
+          : {}),
         model_limits_enabled: newKeyModelLimitsEnabled,
         model_limits: newKeyModelLimits ? newKeyModelLimits.split(",").map(s => s.trim()).filter(s => s) : [],
         ip_whitelist: newKeyIpWhitelist ? newKeyIpWhitelist.split(",").map(s => s.trim()).filter(s => s) : [],
         allowed_groups: dedupeAllowedGroups(newKeyAllowedGroups),
-        max_multiplier: newKeyMaxMultiplier ? parseFloat(newKeyMaxMultiplier) : undefined,
+        max_multiplier: parseOptionalMultiplier(newKeyMaxMultiplier),
         transforms: newKeyTransforms,
         model_redirects: newKeyModelRedirects.filter((r) => r.pattern.trim() && r.replace.trim()),
         reasoning_envelope_enabled: newKeyReasoningEnvelopeEnabled,
@@ -621,6 +668,7 @@ export function ApiKeysPage() {
     setEditKey(key);
     setNewKeyName(key.name);
     setNewKeySubAccountEnabled(key.sub_account_enabled);
+    setNewKeySubAccountBalanceNanoUsd(key.sub_account_balance_nano_usd);
     setNewKeyModelLimitsEnabled(key.model_limits_enabled);
     setNewKeyModelLimits(key.model_limits.join(", "));
     setNewKeyIpWhitelist(key.ip_whitelist.join(", "));
@@ -731,6 +779,20 @@ export function ApiKeysPage() {
                   />
                   <Label htmlFor="subAccountEnabled">{t("apiKeys.subAccountEnabled")}</Label>
                 </div>
+                {canManageSystem && (
+                  <div className="space-y-2">
+                    <Label htmlFor="subAccountBalanceNanoUsd">
+                      {t("apiKeys.balance")} (nano-USD)
+                    </Label>
+                    <Input
+                      id="subAccountBalanceNanoUsd"
+                      type="text"
+                      inputMode="numeric"
+                      value={newKeySubAccountBalanceNanoUsd}
+                      onChange={(event) => setNewKeySubAccountBalanceNanoUsd(event.target.value)}
+                    />
+                  </div>
+                )}
                 <div className="space-y-1">
                   <div className="flex items-center space-x-2">
                     <Switch
@@ -792,9 +854,8 @@ export function ApiKeysPage() {
                   <Label htmlFor="maxMultiplier">{t("apiKeys.maxMultiplier")}</Label>
                   <Input
                     id="maxMultiplier"
-                    type="number"
-                    min="0"
-                    step="0.1"
+                    type="text"
+                    inputMode="decimal"
                     value={newKeyMaxMultiplier}
                     onChange={(e) => setNewKeyMaxMultiplier(e.target.value)}
                     placeholder="e.g. 1.5"
@@ -1089,6 +1150,20 @@ export function ApiKeysPage() {
               />
               <Label htmlFor="editSubAccountEnabled">{t("apiKeys.subAccountEnabled")}</Label>
             </div>
+            {canManageSystem && (
+              <div className="space-y-2">
+                <Label htmlFor="editSubAccountBalanceNanoUsd">
+                  {t("apiKeys.balance")} (nano-USD)
+                </Label>
+                <Input
+                  id="editSubAccountBalanceNanoUsd"
+                  type="text"
+                  inputMode="numeric"
+                  value={newKeySubAccountBalanceNanoUsd}
+                  onChange={(event) => setNewKeySubAccountBalanceNanoUsd(event.target.value)}
+                />
+              </div>
+            )}
             <div className="space-y-1">
               <div className="flex items-center space-x-2">
                 <Switch
@@ -1146,9 +1221,8 @@ export function ApiKeysPage() {
               <Label htmlFor="editMaxMultiplier">{t("apiKeys.maxMultiplier")}</Label>
               <Input
                 id="editMaxMultiplier"
-                type="number"
-                min="0"
-                step="0.1"
+                type="text"
+                inputMode="decimal"
                 value={newKeyMaxMultiplier}
                 onChange={(e) => setNewKeyMaxMultiplier(e.target.value)}
                 placeholder="e.g. 1.5"

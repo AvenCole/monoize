@@ -25,13 +25,17 @@ MD3. `source` column distinguishes record origin:
 
 MD4. All pricing fields are nano-dollar integer strings (same precision as billing spec).
 
-MD5. `raw_json` stores all provider variants from models.dev as `{ "providers": { "openai": {...}, "azure": {...}, ... } }`. This enables the edit UI to let the user switch pricing source.
+MD5. `raw_json` stores all provider variants from models.dev as `{ "providers": { "openai": {...}, "azure": {...}, ... } }`. Every value inside a variant's `cost` object MUST be stored and returned as its exact decimal string rather than a JSON number. This enables the edit UI to switch pricing source without JavaScript binary-floating-point conversion.
 
 MD6. `models_dev_provider` indicates which models.dev provider's pricing is currently applied.
 
 MD7. Billing computation MUST NOT read model pricing directly from `model_metadata_records`. Billing computation MUST read `billing_rate_records`.
 
 MD8. When a model metadata row is created, updated, or synced with token prices, the server MUST mirror the present token prices into `billing_rate_records` rows whose `source` identifies the metadata origin.
+
+MD9. Every non-null metadata price and every billing-rate `unit_price_nano_usd` MUST be a canonical non-negative integer string. A negative, signed-plus, fractional, exponent, or out-of-range value MUST be rejected with `400 invalid_request`.
+
+MD10. Models.dev decimal USD-per-million prices MUST be parsed directly from their JSON decimal token. The conversion to nano-USD per token is `trunc(price_usd_per_million * 1000)`. This conversion MUST NOT pass through `f32` or `f64`. For example, `1.001` MUST become `"1001"`.
 
 ## 2. Sync Priority & Merge
 
@@ -94,8 +98,9 @@ SP8. Admin MAY explicitly reset a manual record back to sync-managed by updating
 }
 ```
 
-- If row exists: update provided fields, set `source = 'manual'`, set `updated_at = now()`.
+- If row exists: update only fields present in the JSON object, set `source = 'manual'`, set `updated_at = now()`. An omitted field preserves its stored value. An explicitly null nullable field clears its stored value.
 - If row does not exist: insert with provided fields, `source = 'manual'`, `raw_json = '{}'`, `updated_at = now()`.
+- The metadata write and deletion/replacement of its generated `billing_rate_records` mirror rows MUST execute in one database transaction. Any mirror failure MUST roll back the metadata write.
 - Response: `200 OK` with the full updated `ModelMetadataRecord`.
 - Errors: `400 invalid_request` if `model_id` path param is empty.
 
@@ -105,6 +110,7 @@ SP8. Admin MAY explicitly reset a manual record back to sync-managed by updating
 - Auth: admin required.
 - Response: `200 OK` with `{ "success": true }`.
 - Errors: `404 not_found` if record does not exist.
+- The metadata delete and deletion of all generated billing-rate rows whose id starts with `model_metadata:{model_id}:` MUST execute in one database transaction.
 
 ### 3.5 Billing-rate CRUD
 
@@ -116,7 +122,7 @@ SP8. Admin MAY explicitly reset a manual record back to sync-managed by updating
 - Auth: admin required.
 - Body: any mutable fields from `billing_rate_records` except `id` and `updated_at`.
 - Response: full updated `BillingRateRecord`.
-- Errors: `400 invalid_request` if required fields are absent for a new row or `unit_price_nano_usd` is not an integer string.
+- Errors: `400 invalid_request` if required fields are absent for a new row or `unit_price_nano_usd` is not a non-negative integer string.
 
 - Method/Path: `DELETE /api/dashboard/billing-rates/{id}`
 - Auth: admin required.
@@ -182,6 +188,10 @@ UI5.1. In the Model column badge, GLM-series icon compatibility MUST follow `das
 UI6. Each row MUST be clickable to open an edit dialog.
 
 UI7. Price display: `nano_per_token / 1000` = dollars per 1M tokens. Display up to 4 decimal places.
+
+UI7a. Model Database and Billing Profiles MUST keep nano-USD prices and USD-per-million form values as decimal strings. Conversion, provider switching, form editing, validation, and API serialization MUST NOT pass a price through JavaScript `Number`, `parseFloat`, `toFixed`, or binary floating-point arithmetic.
+
+UI7b. Converting a USD-per-million input to nano-USD per token MUST compute `trunc(input * 1000)` with decimal-string arithmetic. A negative or syntactically invalid input MUST be blocked before the mutation request. For example, `1.001` MUST serialize as `"1001"` and round-trip back to `1.001`.
 
 ### 4.4 Search and filter
 

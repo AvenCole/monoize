@@ -612,11 +612,11 @@ pub(crate) fn parse_usage_from_responses_object(obj: &Value) -> Option<urp::Usag
 
 pub(crate) fn parse_usage_from_gemini_object(obj: &Value) -> Option<urp::Usage> {
     let usage = obj.get("usageMetadata")?.as_object()?;
-    let input_tokens = usage
+    let prompt_tokens = usage
         .get("promptTokenCount")
         .or_else(|| usage.get("prompt_token_count"))
         .and_then(|v| v.as_u64())?;
-    let output_tokens = usage
+    let candidate_tokens = usage
         .get("candidatesTokenCount")
         .or_else(|| usage.get("candidates_token_count"))
         .and_then(|v| v.as_u64())?;
@@ -630,14 +630,18 @@ pub(crate) fn parse_usage_from_gemini_object(obj: &Value) -> Option<urp::Usage> 
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let cache_creation_tokens = usage
-        .get("cacheCreationInputTokens")
+        .get("cacheCreationTokenCount")
+        .or_else(|| usage.get("cache_creation_token_count"))
+        .or_else(|| usage.get("cacheCreationInputTokens"))
         .or_else(|| usage.get("cache_creation_input_tokens"))
         .or_else(|| usage.get("cache_creation_tokens"))
         .or_else(|| usage.get("cache_write_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let tool_prompt_tokens = usage
-        .get("toolPromptTokenCount")
+        .get("toolUsePromptTokenCount")
+        .or_else(|| usage.get("tool_use_prompt_token_count"))
+        .or_else(|| usage.get("toolPromptTokenCount"))
         .or_else(|| usage.get("tool_prompt_token_count"))
         .or_else(|| usage.get("tool_prompt_tokens"))
         .and_then(|v| v.as_u64())
@@ -649,17 +653,23 @@ pub(crate) fn parse_usage_from_gemini_object(obj: &Value) -> Option<urp::Usage> 
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let accepted_prediction_tokens = usage
-        .get("acceptedPredictionTokenCount")
+        .get("acceptedPredictionOutputTokenCount")
+        .or_else(|| usage.get("accepted_prediction_output_token_count"))
+        .or_else(|| usage.get("acceptedPredictionTokenCount"))
         .or_else(|| usage.get("accepted_prediction_token_count"))
         .or_else(|| usage.get("accepted_prediction_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let rejected_prediction_tokens = usage
-        .get("rejectedPredictionTokenCount")
+        .get("rejectedPredictionOutputTokenCount")
+        .or_else(|| usage.get("rejected_prediction_output_token_count"))
+        .or_else(|| usage.get("rejectedPredictionTokenCount"))
         .or_else(|| usage.get("rejected_prediction_token_count"))
         .or_else(|| usage.get("rejected_prediction_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let input_tokens = prompt_tokens.checked_add(tool_prompt_tokens)?;
+    let output_tokens = candidate_tokens.checked_add(reasoning_tokens)?;
     let extra_body = split_usage_extra(
         usage,
         &[
@@ -667,6 +677,18 @@ pub(crate) fn parse_usage_from_gemini_object(obj: &Value) -> Option<urp::Usage> 
             "prompt_token_count",
             "candidatesTokenCount",
             "candidates_token_count",
+            "cachedContentTokenCount",
+            "cached_content_token_count",
+            "cacheCreationTokenCount",
+            "cache_creation_token_count",
+            "toolUsePromptTokenCount",
+            "tool_use_prompt_token_count",
+            "thoughtsTokenCount",
+            "thoughts_token_count",
+            "acceptedPredictionOutputTokenCount",
+            "accepted_prediction_output_token_count",
+            "rejectedPredictionOutputTokenCount",
+            "rejected_prediction_output_token_count",
         ],
     );
     Some(urp::Usage {
@@ -782,5 +804,44 @@ mod tests {
             .expect("visible text/refusal basis");
         assert_eq!(basis.visible_output_tokens, 3);
         assert_eq!(basis.tps_mode, "estimated");
+    }
+
+    #[test]
+    fn gemini_stream_usage_builds_inclusive_totals() {
+        let usage = parse_usage_from_gemini_object(&json!({
+            "usageMetadata": {
+                "promptTokenCount": 27,
+                "toolUsePromptTokenCount": 10_309,
+                "candidatesTokenCount": 45,
+                "thoughtsTokenCount": 31
+            }
+        }))
+        .expect("usage should decode");
+
+        assert_eq!(usage.input_tokens, 10_336);
+        assert_eq!(usage.output_tokens, 76);
+        assert_eq!(
+            usage
+                .input_details
+                .as_ref()
+                .expect("input details")
+                .tool_prompt_tokens,
+            10_309
+        );
+        assert_eq!(usage.reasoning_tokens(), Some(31));
+    }
+
+    #[test]
+    fn gemini_stream_usage_rejects_inclusive_total_overflow() {
+        assert!(
+            parse_usage_from_gemini_object(&json!({
+                "usageMetadata": {
+                    "promptTokenCount": u64::MAX,
+                    "toolUsePromptTokenCount": 1,
+                    "candidatesTokenCount": 0
+                }
+            }))
+            .is_none()
+        );
     }
 }

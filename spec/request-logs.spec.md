@@ -28,7 +28,7 @@ A request log row has:
 - `tool_prompt_tokens: integer?`
 - `accepted_prediction_tokens: integer?`
 - `rejected_prediction_tokens: integer?`
-- `provider_multiplier: float?`
+- `provider_multiplier: string?` (canonical positive base-10 decimal string)
 - `charge_nano_usd: string?` (nano-dollar integer string)
 - `status: string` (`"pending"`, `"success"`, or `"error"`)
 - `usage_breakdown_json: object?` (normalized per-request usage detail snapshot; persisted as JSON text in DB)
@@ -80,13 +80,21 @@ RL1b. The lifecycle row MUST transition from `"pending"` to exactly one terminal
 - `"success"` when the downstream client received a normal API response payload (including truncated/cutoff completion cases such as `finish_reason = "length"`, and including cases where the downstream client disconnected mid-stream after partial delivery),
 - `"error"` only when the request ends with an API error response.
 
-RL1c. Terminal logging MUST enqueue exactly one new row with all fields populated (including terminal status, usage, billing, and provider metadata) into the request-log write batcher. There is no preceding pending row to update. If the write batcher has not yet flushed when the process terminates, unflushed rows are lost (acceptable trade-off for write throughput).
+RL1b-1. The only exception to RL1b for an already-delivered normal streaming response is a post-response billing settlement failure. That lifecycle row MUST use `status = "error"` with `error_code = "billing_settlement_failed"`. No additional terminal status value is introduced.
+
+RL1c. Terminal logging MUST enqueue exactly one new row with all fields populated (including terminal status, usage, billing, and provider metadata) into the request-log write batcher. There is no preceding pending row to update. An entry MAY remain in process memory until a successful flush; an abrupt process termination can lose such memory-only entries.
+
+RL1c-2. The write batcher MUST assign a stable database row ID when an entry is enqueued. If transaction begin, any insert, or commit reports failure, the complete drained batch MUST be returned to the front of the buffer for retry. Retrying the same stable row ID MUST be idempotent so an ambiguous commit outcome cannot create duplicate rows.
+
+RL1c-3. Requeuing a failed batch MUST preserve its original order ahead of entries enqueued while the flush was in progress. A failed flush MUST NOT silently discard any entry.
 
 RL1c-0. Enqueuing a terminal row into the request-log write batcher MUST immediately broadcast that terminal row to the request-log SSE stream. SSE visibility of terminal lifecycle transitions MUST NOT wait for the later batch-flush tick, database transaction begin, database commit, or any other write-behind persistence step.
 
 RL1c-1. The `created_at` value persisted for a terminal row MUST equal the wall-clock time at which request processing began, not the later terminal-finalization time and not the later write-batcher flush time.
 
 RL1d. Creating or updating `pending` status MUST NOT trigger any extra billing call. Request billing execution count MUST remain identical to pre-pending behavior (at most once per billable request outcome).
+
+RL1d-1. For a billed request, the terminal request-log row and the corresponding `request_charge` or `api_key_charge` ledger row MUST carry the same non-empty `request_id`. These writes are not required to share one transaction; `request_id` is the reconciliation key when either asynchronous write is absent after an abrupt process failure.
 
 RL1e. When all provider attempts are exhausted (including the case where zero attempts exist), the pending row MUST still transition to `"error"`. The absence of a `last_failed_attempt` MUST NOT prevent finalization.
 
@@ -188,6 +196,12 @@ RL17. When a request triggers waterfall fail-forward (one or more provider/chann
 
 RL18. Successful active probe connectivity tests that can incur upstream token cost MUST be persisted as request logs with `request_kind = "active_probe_connectivity"`. Failed active probe connectivity tests MUST NOT be persisted as request logs.
 
+RL18a. When a successful active probe returns both prompt and completion token counts, its charge calculation MUST read `billing_rate_records`; it MUST NOT read token prices from `model_metadata_records`. Pricing-model normalization, ordered `pricing_profile_model_patterns` selection, optional `models_dev_provider` profile fallback, and redirected-upstream-model then logical-model fallback MUST follow `user-billing-and-model-metadata.spec.md` C1.2 and `metered-billing.spec.md` MB-P1 through MB-P6.
+
+RL18b. Within each candidate profile, active-probe pricing MUST use the first eligible `rate_kind = "token"`, `unit = "token"` row in `priority DESC, id ASC` order for each of `usage_class = "input_uncached"` and `usage_class = "output"`. Each selected row MUST be dimensionless: `context_tier` and `service_tier` are null or `"default"`, and `modality` and `cache_ttl` are null. Both prices MUST be canonical non-negative integer strings. Token multiplication, addition, and exact provider-multiplier scaling MUST use checked integer/decimal arithmetic.
+
+RL18c. A successful active probe with missing usage, no complete RL18b pair, an invalid selected price, or arithmetic overflow MUST still persist its connectivity log with `charge_nano_usd = null` and `billing_breakdown_json = null`. It MUST NOT substitute zero for a missing or failed calculation. A successful calculated probe snapshot MUST use metered-billing version `2`, include the selected `pricing_profile` and `pricing_model`, and satisfy RL16a through RL16c.
+
 RL19. For active probe logs, `api_key_id` MUST be null and UI token column label MUST be rendered as a localized "Connectivity Test" string.
 
 ## 3. Dashboard endpoint
@@ -257,9 +271,9 @@ RL-S2d. Request-log writes MUST populate both canonical time representations fro
 - `created_at` stores RFC3339 text,
 - `created_at_unix_ms` stores the same instant as Unix epoch milliseconds.
 
-RL-S2e. Request-log charge aggregation MUST continue to use backend-native compatibility expressions over the canonical `charge_nano_usd` text column:
-- SQLite charge aggregation MUST cast `charge_nano_usd` text to `BIGINT`.
-- PostgreSQL charge aggregation MUST cast syntactically valid integer `charge_nano_usd` text to `NUMERIC(39,0)` at query time.
+RL-S2e. Request-log charge aggregation MUST preserve the full signed `i128` nano-dollar domain on both backends. The implementation MUST parse syntactically valid canonical `charge_nano_usd` text and fold values with checked `i128` addition. It MUST NOT cast canonical charge text through SQLite `INTEGER`/`BIGINT`, PostgreSQL `BIGINT`, Rust `i64`, `REAL`, `DOUBLE PRECISION`, or `f64`. Aggregate overflow MUST return an explicit internal storage error.
+
+RL-S2f. Request-log scalar token and timing columns decoded into Rust `i64` MUST use SQLite `INTEGER` and PostgreSQL `BIGINT`. Conversion from an in-memory `u64` MUST be checked. A value above `i64::MAX` MUST NOT wrap to a negative number. When the full unsigned value is also present in canonical usage JSON, the unrepresentable scalar field MUST be stored as null and the batcher MUST emit a warning without dropping the terminal row.
 
 RL-S3. The `user_id` foreign key MUST cascade on delete.
 
@@ -372,7 +386,7 @@ FL23. The admin `channel` column MUST use a narrow width with aggressive truncat
 
 FL24. On desktop dashboard layouts, the logs table SHOULD fit within the page content width without horizontal scrolling; the `request_ip` column MUST use narrow width with truncated text display.
 
-FL25. The `charge_nano_usd` (Cost) column displayed value MUST use regular USD currency formatting with exactly 6 fractional digits (for example: `$0.000123`), and MUST NOT use threshold shorthand (for example: `<$0.0001`).
+FL25. The `charge_nano_usd` (Cost) column displayed value MUST use regular USD currency formatting with exactly 6 fractional digits (for example: `$0.000123`), and MUST NOT use threshold shorthand (for example: `<$0.0001`). Formatting MUST operate on the integer string with `BigInt`; it MUST round to the nearest micro-dollar with ties away from zero and MUST NOT pass through JavaScript `Number`, `parseFloat`, or `Intl.NumberFormat`.
 
 FL25a. The Cost column MUST NOT truncate visible cell text. The table layout MUST allow this column to expand with content when needed (while preserving horizontal overflow/scroll behavior for narrow viewports).
 

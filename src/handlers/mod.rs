@@ -17,6 +17,7 @@ mod tests;
 use crate::app::AppState;
 use crate::config::{ProviderAuthConfig, ProviderAuthType, ProviderConfig, ProviderType};
 use crate::error::{AppError, AppResult};
+use crate::exact_decimal::Multiplier;
 use crate::request_capture::RequestCaptureSession;
 use crate::settings::normalize_pricing_model_key;
 use crate::transforms::{self, Phase, TransformRuleConfig};
@@ -609,10 +610,23 @@ pub async fn create_embeddings(
                     let usage = parse_usage_from_embeddings_object(&value);
                     let charge = match usage.as_ref() {
                         Some(usage_row) => {
-                            maybe_charge_usage(&state, &auth, &attempt, &logical_model, usage_row)
-                                .await?
+                            maybe_charge_usage(
+                                &state,
+                                &auth,
+                                &attempt,
+                                &logical_model,
+                                usage_row,
+                                request_id.as_deref(),
+                            )
+                            .await?
                         }
-                        None => ChargeComputation::default(),
+                        None => {
+                            return Err(AppError::new(
+                                StatusCode::BAD_GATEWAY,
+                                "upstream_usage_required",
+                                "upstream response did not include billable usage",
+                            ));
+                        }
                     };
 
                     if let Some(obj) = value.as_object_mut() {
@@ -773,7 +787,7 @@ const URP_KNOWN_MESSAGES_FIELDS: [&str; 8] = [
 #[derive(Clone, Debug)]
 pub(crate) struct UrpRequest {
     pub(crate) model: String,
-    pub(crate) max_multiplier: Option<f64>,
+    pub(crate) max_multiplier: Option<Multiplier>,
     pub(crate) server_tool_usage_classes: Vec<String>,
     pub(crate) affinity_explicit: Option<String>,
     pub(crate) affinity_prefix_hash: String,
@@ -788,7 +802,7 @@ struct MonoizeAttempt {
     api_key: String,
     logical_model: String,
     upstream_model: String,
-    model_multiplier: f64,
+    model_multiplier: Multiplier,
     server_tool_usage_classes: Vec<String>,
     provider_transforms: Vec<TransformRuleConfig>,
     passive_failure_count_threshold: u32,
@@ -1126,12 +1140,11 @@ fn split_body(value: Value, known_keys: &[&str]) -> AppResult<(Value, Map<String
     Ok((Value::Object(known_obj), extra))
 }
 
-fn parse_max_multiplier_header(headers: &HeaderMap) -> Option<f64> {
+fn parse_max_multiplier_header(headers: &HeaderMap) -> Option<Multiplier> {
     headers
         .get("x-max-multiplier")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
+        .and_then(|s| s.parse().ok())
 }
 
 #[allow(clippy::result_large_err)]
@@ -1151,14 +1164,8 @@ fn parse_urp_request(known: &Value, extra: Map<String, Value>) -> AppResult<UrpR
         .to_string();
     let max_multiplier = obj
         .get("max_multiplier")
-        .and_then(|v| {
-            v.as_f64().or_else(|| {
-                v.as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .filter(|n| n.is_finite())
-            })
-        })
-        .filter(|n| *n > 0.0);
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok());
 
     Ok(UrpRequest {
         affinity_explicit: None,

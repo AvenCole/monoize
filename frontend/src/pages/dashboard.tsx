@@ -18,6 +18,11 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { PageHeader } from "@/components/ui/page-header";
 import { CardsPageSkeleton } from "@/components/ui/page-skeleton";
 import { toast } from "sonner";
+import {
+  formatNanoUsd,
+  formatUsdDecimal,
+  nanoUsdToChartNumber,
+} from "@/lib/exact-decimal";
 
 type AnalysisTabId = "spendDistribution" | "callDistribution" | "callRank";
 
@@ -41,7 +46,7 @@ interface StackedBucketRow {
 interface AnalysisData {
   rows: StackedBucketRow[];
   models: string[];
-  total: number;
+  total: bigint;
   valueType: "money" | "count";
   metricTitle: string;
 }
@@ -56,17 +61,8 @@ function formatNumber(value: number): string {
   return value.toLocaleString("en-US");
 }
 
-function formatMoney(value: string | number | undefined): string {
-  const parsed = Number(value ?? 0);
-  if (!Number.isFinite(parsed)) return "$0.00";
-  return `$${parsed.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
-function nanoUsdToUsd(nanoUsd: number | string | undefined): number {
-  if (nanoUsd == null) return 0;
-  const parsed = Number(nanoUsd);
-  if (!Number.isFinite(parsed)) return 0;
-  return parsed / 1e9;
+function formatChartMoney(value: number): string {
+  return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 const CHART_COLORS = Array.from(
@@ -242,7 +238,7 @@ export function DashboardPage() {
           {
             key: "balance",
             label: tt("dashboard.cards.currentBalance", "Current Balance"),
-            value: formatMoney(user?.balance_usd),
+            value: formatUsdDecimal(user?.balance_usd, 2),
           },
           {
             key: "myKeys",
@@ -274,12 +270,12 @@ export function DashboardPage() {
           {
             key: "totalSpend",
             label: tt("dashboard.cards.totalSpend", "30d Spend"),
-            value: formatMoney(nanoUsdToUsd(summaryAnalytics?.total_cost_nano_usd)),
+            value: formatNanoUsd(summaryAnalytics?.total_cost_nano_usd, 2),
           },
           {
             key: "todaySpend",
             label: tt("dashboard.cards.todaySpend", "Today's Spend"),
-            value: formatMoney(nanoUsdToUsd(summaryAnalytics?.today_cost_nano_usd)),
+            value: formatNanoUsd(summaryAnalytics?.today_cost_nano_usd, 2),
           },
         ],
       },
@@ -314,7 +310,7 @@ export function DashboardPage() {
     const base: AnalysisData = {
       rows: [],
       models: [],
-      total: 0,
+      total: 0n,
       valueType: (activeTab === "spendDistribution" ? "money" : "count"),
       metricTitle:
         activeTab === "callRank"
@@ -324,44 +320,44 @@ export function DashboardPage() {
 
     if (!analysisAnalytics?.buckets?.length) return base;
 
-    const getBucketMap = (bucket: DashboardAnalyticsBucket): Record<string, number> => {
+    const getBucketMap = (bucket: DashboardAnalyticsBucket): Record<string, string | number> => {
       if (activeTab === "spendDistribution") return bucket.cost_by_model;
       if (activeTab === "callDistribution") return bucket.calls_by_model;
       return bucket.calls_by_provider;
     };
 
-    const modelTotals = new Map<string, number>();
+    const modelTotals = new Map<string, bigint>();
     for (const bucket of analysisAnalytics.buckets) {
       const map = getBucketMap(bucket);
       for (const [key, val] of Object.entries(map)) {
-        modelTotals.set(key, (modelTotals.get(key) ?? 0) + val);
+        const exact = BigInt(val);
+        modelTotals.set(key, (modelTotals.get(key) ?? 0n) + exact);
       }
     }
 
     const models = [...modelTotals.entries()]
-      .filter(([, v]) => v > 0)
-      .sort((a, b) => b[1] - a[1])
+      .filter(([, v]) => v > 0n)
+      .sort((a, b) => a[1] === b[1] ? 0 : a[1] > b[1] ? -1 : 1)
       .map(([k]) => k);
 
     const rows: StackedBucketRow[] = analysisAnalytics.buckets.map((bucket) => {
       const row: StackedBucketRow = { label: bucket.label };
       const map = getBucketMap(bucket);
       for (const model of models) {
-        const raw = map[model] ?? 0;
-        row[model] = base.valueType === "money" ? Number((raw / 1e9).toFixed(4)) : raw;
+        const raw = map[model] ?? (base.valueType === "money" ? "0" : 0);
+        row[model] = base.valueType === "money" ? nanoUsdToChartNumber(String(raw)) : Number(raw);
       }
       return row;
     });
 
-    const total = [...modelTotals.values()].reduce((s, v) => s + v, 0);
-    const displayTotal = base.valueType === "money" ? total / 1e9 : total;
-    return { ...base, rows, models, total: displayTotal };
+    const total = [...modelTotals.values()].reduce((sum, value) => sum + value, 0n);
+    return { ...base, rows, models, total };
   }, [activeTab, analysisAnalytics, tt]);
 
   const analysisTotalDisplay =
     analysisData.valueType === "money"
-      ? formatMoney(analysisData.total)
-      : formatNumber(Math.round(analysisData.total));
+      ? formatNanoUsd(analysisData.total, 2)
+      : analysisData.total.toLocaleString("en-US");
 
   const activeTabMeta = ANALYSIS_TABS.find((tab) => tab.id === activeTab) ?? ANALYSIS_TABS[0];
   const analysisHeading = tt(activeTabMeta.i18nKey, activeTabMeta.fallback);
@@ -388,7 +384,7 @@ export function DashboardPage() {
   );
 
   const formatAnalysisValue = (value: number): string =>
-    analysisData.valueType === "money" ? formatMoney(value) : formatNumber(Math.round(value));
+    analysisData.valueType === "money" ? formatChartMoney(value) : formatNumber(Math.round(value));
 
   if (loading) {
     return (

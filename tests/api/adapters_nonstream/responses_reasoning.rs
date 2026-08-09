@@ -297,6 +297,7 @@ async fn responses_reasoning_envelope_can_be_disabled_per_api_key() {
                 name: None,
                 enabled: None,
                 sub_account_enabled: None,
+                sub_account_balance_nano_usd: None,
                 model_limits_enabled: None,
                 model_limits: None,
                 ip_whitelist: None,
@@ -373,7 +374,7 @@ async fn responses_nonstream_collects_completed_snapshot_image_generation_result
         "gpt-image-test".to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: Some("gpt-5-mini".to_string()),
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     ctx.state

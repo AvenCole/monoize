@@ -54,7 +54,7 @@ CG-3. If a stored provider row has `groups` absent, null, empty string, or seria
 A Channel model entry MUST include:
 
 - `redirect: string | null`
-- `multiplier: number` where `multiplier > 0`
+- `multiplier: string` containing a representable base-10 decimal with at most 9 fractional digits where `multiplier > 0`
 
 ### 2.3 Provider
 
@@ -136,10 +136,12 @@ CFG-6. Each provider MAY define a timeout override field:
 The router MUST read:
 
 - `model: string`
-- `max_multiplier: number | null`
+- `max_multiplier: string | null`
 - `effective_groups: string[] | null`
 
 `max_multiplier` MAY be supplied by request body field `max_multiplier` or header `X-Max-Multiplier`.
+
+RRP-0. Channel multipliers and request/API-key multiplier ceilings MUST be parsed and compared as exact decimals. They MUST NOT be converted through `f32` or `f64`. JSON responses and stored routing policy MUST use canonical decimal strings.
 
 RRP-1. `effective_groups` is the request-scoped group filter produced by `api-key-authentication.spec.md` §4.
 
@@ -356,4 +358,4 @@ UI-5. Nullable boolean overrides MUST use a three-value selector (inherit / enab
 
 UI-6. Provider model fetching MUST NOT exist as a provider-level action. Each channel editor MUST expose model fetching using the channel's type, base URL, and API key.
 
-UI-7. A Channel model fetch confirmation MUST add selected models to that Channel `models` object with `redirect = null` and `multiplier = 1`. It MUST preserve existing entries that remain selected and MUST NOT mutate sibling Channels.
+UI-7. A Channel model fetch confirmation MUST add selected models to that Channel `models` object with `redirect = null` and `multiplier = "1"`. It MUST preserve existing entries that remain selected and MUST NOT mutate sibling Channels.

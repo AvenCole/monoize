@@ -58,9 +58,9 @@ SA-CH2. On successful sub-account deduction, server MUST append a ledger row wit
 - `kind = "api_key_charge"`
 - `delta_nano_usd` (negative value)
 - `balance_after_nano_usd` = the API key's balance after deduction
-- `meta_json` MUST include all fields from regular `request_charge` entries plus `api_key_id`.
+- `meta_json` MUST include all fields from regular `request_charge` entries, including `request_id`, plus `api_key_id`.
 
-SA-CH3. If deduction would make `sub_account_balance_nano` negative, server MUST return HTTP `402` with code `insufficient_balance` and MUST NOT write the deduction.
+SA-CH3. A request admitted while `sub_account_balance_nano > 0` MUST settle its complete final charge with checked integer subtraction even when the resulting balance is zero or negative. The charge and ledger row MUST commit in the same transaction. A later request MUST fail the SA-BE1 admission gate while the persisted balance is non-positive.
 
 SA-CH4. When `sub_account_enabled = 0`:
 - Charge deduction MUST use the owning user's balance, identical to current behavior.
@@ -69,7 +69,13 @@ SA-CH4. When `sub_account_enabled = 0`:
 
 SA-CC1. Sub-account balance mutations MUST execute on the write pool (same as user balance mutations per `user-billing-and-model-metadata.spec.md` §6a).
 
-SA-CC2. The charge path MUST use a single atomic transaction: read current balance → verify sufficient → update balance → write ledger → commit.
+SA-CC2. The charge path MUST use a single atomic transaction: lock participating rows → read current balance → checked subtraction → update balance → write ledger → commit.
+
+SA-CC3. On PostgreSQL, every mutation involving both a user and an API key MUST acquire row locks in deterministic order: first `users`, then `api_keys`, each with `SELECT ... FOR UPDATE`. The transaction MUST recompute each new balance from the locked values. It MUST NOT update a balance from a value read before the transaction.
+
+SA-CC4. If an admitted sub-account request settles after another transaction has disabled and consolidated that sub-account, settlement MUST deduct the charge from the locked owning user balance and write `request_charge`. It MUST NOT recreate an ignored negative balance on the disabled key, and it MUST NOT omit the charge.
+
+SA-CC5. If an admitted sub-account request settles after another transaction has deleted and consolidated that API key, settlement MUST deduct the charge from the locked owning user balance and write `request_charge`. Deleting an API key MUST NOT cancel the charge of an already admitted request.
 
 ## 4. Balance transfer
 
@@ -90,11 +96,12 @@ SA-TX3. Request body:
 SA-TX4. If both `amount_nano_usd` and `amount_usd` are provided, server MUST use `amount_nano_usd`.
 
 SA-TX5. Transfer MUST execute atomically in a single transaction:
-1. Verify `sub_account_enabled = 1` on the target key.
-2. Verify owning user has sufficient balance (unless user is `balance_unlimited`).
-3. Deduct `amount` from `users.balance_nano_usd`.
-4. Add `amount` to `api_keys.sub_account_balance_nano`.
-5. Write two ledger entries:
+1. Lock the owning user and target API key in the SA-CC3 order.
+2. Verify `sub_account_enabled = 1` on the locked target key.
+3. Verify the locked owning user has sufficient balance (unless user is `balance_unlimited`).
+4. Deduct `amount` from the locked `users.balance_nano_usd`.
+5. Add `amount` to the locked `api_keys.sub_account_balance_nano`.
+6. Write two ledger entries:
    - `kind = "sub_account_transfer_out"`, negative delta, on user
    - `kind = "sub_account_transfer_in"`, positive delta, on user (with `api_key_id` in meta)
 
@@ -142,7 +149,7 @@ SA-API2. `POST /api/dashboard/tokens` MUST accept optional fields:
 - `sub_account_enabled: boolean` (default `false`)
 - `sub_account_balance_nano_usd: string` (default `"0"`)
 
-SA-API3. When `sub_account_enabled` is set to `true` during creation, the initial balance is `"0"` unless explicitly provided (admin only may provide initial balance).
+SA-API3. When `sub_account_enabled` is set to `true` during creation, the initial balance is `"0"` unless explicitly provided. Only an admin MAY provide an initial balance. The explicit initial balance MUST be a canonical non-negative nano-dollar integer string. A non-zero initial balance with `sub_account_enabled = false` MUST be rejected. A non-zero initial balance MUST append `kind = "admin_sub_account_adjustment"` in the same transaction as key creation.
 
 ### 5.3 Update API key
 
@@ -152,16 +159,29 @@ SA-API4. `PUT /api/dashboard/tokens/{key_id}` MUST accept optional fields:
 
 SA-API5. Non-admin users MUST NOT be able to set `sub_account_balance_nano_usd` directly. They MUST use the transfer endpoint (§4.1).
 
-SA-API6. Disabling sub-account (`sub_account_enabled: false`) on a key with non-zero positive balance MUST auto-refund the remaining balance to the owning user atomically:
-1. Let `refund = sub_account_balance_nano` (current balance).
+SA-API5a. An update MUST reject a body that combines `sub_account_enabled = false` with `sub_account_balance_nano_usd`. Disabling consolidates the locked current balance under SA-API6; it MUST NOT depend on a caller-supplied replacement balance. An update that leaves `sub_account_enabled = false` MUST reject a non-zero replacement balance.
+
+SA-API6. Disabling sub-account (`sub_account_enabled: false`) on a key with a non-zero signed balance MUST consolidate the complete balance into the owning user atomically:
+1. Lock the owning user and API key in the SA-CC3 order and let `settlement = sub_account_balance_nano` from the locked key.
 2. Set `api_keys.sub_account_balance_nano = "0"`.
 3. Set `api_keys.sub_account_enabled = 0`.
-4. Add `refund` to `users.balance_nano_usd`.
-5. Write a ledger entry with `kind = "sub_account_refund"` (positive delta on user, with `api_key_id` in meta).
+4. Add the signed `settlement` to `users.balance_nano_usd` using checked integer arithmetic. A positive value returns credit; a negative value transfers debt.
+5. Write a ledger entry with `kind = "sub_account_refund"` for a positive settlement or `kind = "sub_account_debt_transfer"` for a negative settlement. `delta_nano_usd` MUST equal `settlement`, `balance_after_nano_usd` MUST equal the locked user's resulting balance, and `meta_json` MUST include `api_key_id`.
+6. Commit all steps in one transaction. Failure of any step MUST leave the key enabled with its original balance and MUST leave the user and ledger unchanged.
 
-SA-API6a. If the owning user has `balance_unlimited = true`, the refund credit step (SA-API6 step 4) MUST be skipped, but the sub-account balance MUST still be zeroed and the ledger entry MUST still be written.
+SA-API6a. If the owning user has `balance_unlimited = true`, the finite user balance mutation in SA-API6 step 4 MUST be skipped, but the sub-account balance MUST still be zeroed and the signed settlement ledger entry MUST still be written with `balance_after_nano_usd = null`.
 
 SA-API6b. Disabling sub-account on a key with zero balance MUST succeed without writing a refund ledger entry.
+
+### 5.4 Delete API key
+
+SA-DEL1. Single-key and batch-key deletion MUST run in a transaction. For every selected key, the transaction MUST lock the owning user before the API key as required by SA-CC3.
+
+SA-DEL2. Before deleting a sub-account key, the transaction MUST add its complete signed `sub_account_balance_nano` to the owning finite user's balance with checked integer arithmetic. This rule applies to positive, zero, and negative key balances. The transaction MUST NOT erase sub-account debt by deleting the key.
+
+SA-DEL3. For each deleted sub-account key with a non-zero balance, the transaction MUST append `kind = "sub_account_delete_settlement"` with `delta_nano_usd` equal to the signed key balance, `balance_after_nano_usd` equal to the resulting finite user balance, and `meta_json.api_key_id` equal to the deleted key ID. For an unlimited user, the finite balance update is skipped and `balance_after_nano_usd` is null, but the settlement ledger row MUST still be appended.
+
+SA-DEL4. The balance consolidation, ledger append, and key deletion MUST commit together. Any parse error, overflow, update error, ledger error, or delete error MUST roll back the entire single-key or batch-key operation.
 
 ## 6. Auth context changes
 
@@ -196,7 +216,9 @@ SA-MIG3. Data migration for existing keys:
 | `admin_adjustment`             | either    | Admin adjustment of user balance (existing)              |
 | `sub_account_transfer_out`     | negative  | User balance deducted for transfer to API key            |
 | `sub_account_transfer_in`      | positive  | API key sub-account credited from user transfer          |
-| `sub_account_refund`           | positive  | Remaining sub-account balance returned to user           |
+| `sub_account_refund`           | positive  | Positive sub-account balance returned to user             |
+| `sub_account_debt_transfer`    | negative  | Negative sub-account balance transferred to user          |
+| `sub_account_delete_settlement`| either    | Signed sub-account balance consolidated before key delete |
 | `admin_sub_account_adjustment` | positive  | Admin direct increase of API key sub-account balance     |
 
 ## 9. Error codes
@@ -204,7 +226,6 @@ SA-MIG3. Data migration for existing keys:
 | Condition                                          | HTTP | Code                  | Message                                                   |
 |----------------------------------------------------|------|-----------------------|-----------------------------------------------------------|
 | Sub-account balance ≤ 0 at pre-forward             | 402  | `insufficient_balance`| `"insufficient balance"`                                  |
-| Sub-account balance would go negative at charge    | 402  | `insufficient_balance`| `"insufficient balance"`                                  |
 | Transfer to key with sub_account_enabled = 0       | 400  | `invalid_request`     | `"sub-account not enabled on this key"`                   |
 | Transfer amount ≤ 0                                | 400  | `invalid_request`     | `"transfer amount must be positive"`                      |
 | User insufficient balance for transfer             | 402  | `insufficient_balance`| `"insufficient balance for transfer"`                     |

@@ -133,7 +133,7 @@ PL13. The selected Channel model section MUST include an explicit "Fetch upstrea
 - Dialog model list container MUST have a bounded positive height with internal scrolling so fetched rows are visible immediately after load.
 - Dialog model list items MUST render as compact stacked badges (wrapping rows), not forced single-column rows.
 - Confirming selection MUST set only the current Channel `models` object.
-- Newly selected model IDs MUST receive default `{ redirect: null, multiplier: 1 }` entries.
+- Newly selected model IDs MUST receive default `{ redirect: null, multiplier: "1" }` entries.
 - Existing Channel model entries MUST preserve their redirect and multiplier values when the same logical model remains selected.
 - Removing a selected model MUST remove only that Channel model entry and MUST NOT mutate any sibling Channel.
 

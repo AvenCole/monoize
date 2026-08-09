@@ -48,6 +48,7 @@ ISM3.2. Column type rules MUST be:
 
 - logical TEXT → `.text()`
 - logical INTEGER → `.integer()`
+- logical BIGINT → `.big_integer()`; physical type MUST be SQLite `INTEGER` and PostgreSQL `BIGINT`
 - logical REAL → `.double()`; the physical type MUST be SQLite `REAL` and PostgreSQL `DOUBLE PRECISION` (`FLOAT8`)
 - logical BLOB → `.binary()`
 
@@ -103,7 +104,7 @@ ISM4.3. `api_keys` columns:
 - `model_limits` TEXT NOT NULL DEFAULT '{}'
 - `ip_whitelist` TEXT NOT NULL DEFAULT '[]'
 - `token_group` TEXT NOT NULL DEFAULT 'default'
-- `max_multiplier` REAL NULL
+- `max_multiplier` TEXT NULL
 - `transforms` TEXT NOT NULL DEFAULT '[]'
 - `reasoning_envelope_enabled` INTEGER NOT NULL DEFAULT 1, added by migration `m20260404_000014_api_key_reasoning_envelope_switch`
 
@@ -117,6 +118,8 @@ ISM4.4. `billing_ledger` columns:
 - `meta_json` TEXT NOT NULL
 - `created_at` TEXT NOT NULL
 
+ISM4.4a. `billing_ledger.user_id` is a historical identifier. The table MUST NOT define a foreign key from this column to `users`, because user deletion MUST preserve ledger history.
+
 ISM4.5. `request_logs` columns:
 
 - `id` TEXT PK
@@ -128,24 +131,24 @@ ISM4.5. `request_logs` columns:
 - `upstream_model` TEXT NULL
 - `channel_id` TEXT NULL
 - `is_stream` INTEGER NOT NULL DEFAULT 0
-- `input_tokens` INTEGER NULL
-- `output_tokens` INTEGER NULL
-- `cache_read_tokens` INTEGER NULL
-- `cache_creation_tokens` INTEGER NULL
-- `tool_prompt_tokens` INTEGER NULL
-- `reasoning_tokens` INTEGER NULL
-- `accepted_prediction_tokens` INTEGER NULL
-- `rejected_prediction_tokens` INTEGER NULL
-- `provider_multiplier` REAL NULL
+- `input_tokens` BIGINT NULL
+- `output_tokens` BIGINT NULL
+- `cache_read_tokens` BIGINT NULL
+- `cache_creation_tokens` BIGINT NULL
+- `tool_prompt_tokens` BIGINT NULL
+- `reasoning_tokens` BIGINT NULL
+- `accepted_prediction_tokens` BIGINT NULL
+- `rejected_prediction_tokens` BIGINT NULL
+- `provider_multiplier` TEXT NULL
 - `charge_nano_usd` TEXT NULL
 - `status` TEXT NOT NULL
 - `usage_breakdown_json` TEXT NULL
 - `billing_breakdown_json` TEXT NULL
 - `error_code` TEXT NULL
 - `error_message` TEXT NULL
-- `error_http_status` INTEGER NULL
-- `duration_ms` INTEGER NULL
-- `ttfb_ms` INTEGER NULL
+- `error_http_status` BIGINT NULL
+- `duration_ms` BIGINT NULL
+- `ttfb_ms` BIGINT NULL
 - `request_ip` TEXT NULL
 - `reasoning_effort` TEXT NULL
 - `tried_providers_json` TEXT NULL
@@ -185,9 +188,9 @@ ISM4.8. `model_metadata_records` columns:
 - `cache_read_input_cost_per_token_nano` TEXT NULL
 - `cache_creation_input_cost_per_token_nano` TEXT NULL
 - `output_cost_per_reasoning_token_nano` TEXT NULL
-- `max_input_tokens` INTEGER NULL
-- `max_output_tokens` INTEGER NULL
-- `max_tokens` INTEGER NULL
+- `max_input_tokens` BIGINT NULL
+- `max_output_tokens` BIGINT NULL
+- `max_tokens` BIGINT NULL
 - `raw_json` TEXT NOT NULL
 - `source` TEXT NOT NULL
 - `updated_at` TEXT NOT NULL
@@ -271,11 +274,15 @@ ISM4.12. `monoize_channel_models` columns:
 - `channel_id` TEXT NOT NULL
 - `model_name` TEXT NOT NULL
 - `redirect` TEXT NULL
-- `multiplier` REAL NOT NULL DEFAULT 1.0
+- `multiplier` TEXT NOT NULL DEFAULT `"1"`
 - `created_at` TEXT NOT NULL
 - UNIQUE(`channel_id`, `model_name`)
 
-ISM4.12a. `monoize_channel_models.multiplier` MUST decode as Rust `f64` on both supported database backends. Migration `m20260718_000023_channel_model_multiplier_float8` MUST convert an existing PostgreSQL `REAL`/`FLOAT4` column to `DOUBLE PRECISION`/`FLOAT8` without changing stored numeric values. The migration MUST be a no-op on SQLite.
+ISM4.12a. Migration `m20260809_000026_exact_multiplier_text` MUST replace `monoize_channel_models.multiplier`, `api_keys.max_multiplier`, and `request_logs.provider_multiplier` floating-point columns with TEXT decimal columns on SQLite and PostgreSQL. Existing finite values MUST be copied as decimal text. Runtime reads and writes after this migration MUST NOT use `REAL`, `DOUBLE PRECISION`, `f32`, or `f64` for these fields.
+
+ISM4.12b. Migration `m20260809_000025_storage_ledger_integrity` MUST remove the cascading `billing_ledger.user_id` foreign key while preserving every ledger row. On PostgreSQL it MUST also convert request-log token/timing counters and model-metadata maximum-token counters from `INTEGER` to `BIGINT` without changing their values.
+
+ISM4.12c. On SQLite and PostgreSQL, every backend-specific DDL/data-copy statement in each of migrations `m20260809_000025_storage_ledger_integrity` and `m20260809_000026_exact_multiplier_text` MUST execute inside one database transaction. Any failed statement MUST roll back every earlier statement from that migration.
 
 ISM4.13. Legacy `providers`, `model_mappings`, and `group_members` tables MUST NOT be created.
 
@@ -325,7 +332,6 @@ ISM6.2. If defined, foreign key edges SHOULD follow:
 
 - `sessions.user_id -> users.id`
 - `api_keys.user_id -> users.id`
-- `billing_ledger.user_id -> users.id`
 - `request_logs.user_id -> users.id`
 - `monoize_channels.provider_id -> monoize_providers.id`
 - `monoize_channel_models.channel_id -> monoize_channels.id`

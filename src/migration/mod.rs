@@ -30,6 +30,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260718_000022_move_models_to_channels::Migration),
             Box::new(m20260718_000023_channel_model_multiplier_float8::Migration),
             Box::new(m20260729_000024_channel_affinity_overrides::Migration),
+            Box::new(m20260809_000025_storage_ledger_integrity::Migration),
+            Box::new(m20260809_000026_exact_multiplier_text::Migration),
         ]
     }
 }
@@ -58,3 +60,5 @@ mod m20260620_000021_pricing_profile_pattern_defaults;
 mod m20260718_000022_move_models_to_channels;
 mod m20260718_000023_channel_model_multiplier_float8;
 mod m20260729_000024_channel_affinity_overrides;
+mod m20260809_000025_storage_ledger_integrity;
+mod m20260809_000026_exact_multiplier_text;

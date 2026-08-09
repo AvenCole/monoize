@@ -9,15 +9,11 @@ import { PageHeader } from "@/components/ui/page-header";
 import { TablePageSkeleton } from "@/components/ui/page-skeleton";
 import { DataTableShell, TableToolbarSearch, VirtualTableCell, VirtualTableHeaderCell } from "@/components/ui/data-table-shell";
 import { TableVirtuoso } from "react-virtuoso";
+import { formatNanoPerTokenPerMillion } from "@/lib/exact-decimal";
 
 function nanoToPerMillion(nano?: string | null): string {
-  if (!nano) return "-";
-  const n = Number(nano);
-  if (!Number.isFinite(n)) return "-";
-  const perM = n / 1000;
-  if (perM === 0) return "$0";
-  if (perM < 0.0001) return `$${perM.toFixed(6)}`;
-  return `$${perM.toFixed(4)}`;
+  const formatted = formatNanoPerTokenPerMillion(nano);
+  return formatted === "—" ? "-" : formatted;
 }
 
 function formatTokens(tokens?: number | null): string {

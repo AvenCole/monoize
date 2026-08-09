@@ -7,6 +7,7 @@ import zhTw from '../src/locales/zh-TW.json'
 import {
 	billingValueTranslationKey,
 	computeTps,
+	formatCost,
 	type BillingValueDimension
 } from '../src/pages/request-logs/utils'
 
@@ -85,6 +86,18 @@ describe('computeTps', () => {
 				})
 			)
 		).toEqual({ state: 'unavailable' })
+	})
+})
+
+describe('formatCost', () => {
+	test('formats nano-USD with exactly six digits and exact half-up rounding', () => {
+		expect(formatCost('123000')).toBe('$0.000123')
+		expect(formatCost('123499')).toBe('$0.000123')
+		expect(formatCost('123500')).toBe('$0.000124')
+	})
+
+	test('does not narrow large integer strings through Number', () => {
+		expect(formatCost('9007199254740993000')).toBe('$9,007,199,254.740993')
 	})
 })
 

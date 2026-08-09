@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -183,53 +184,59 @@ pub async fn get_dashboard_analytics(
         bucket_labels.push(label);
     }
 
-    let mut cost_by_model_buckets: Vec<serde_json::Map<String, Value>> =
-        (0..buckets).map(|_| serde_json::Map::new()).collect();
-    let mut calls_by_model_buckets: Vec<serde_json::Map<String, Value>> =
-        (0..buckets).map(|_| serde_json::Map::new()).collect();
-    let mut calls_by_provider_buckets: Vec<serde_json::Map<String, Value>> =
-        (0..buckets).map(|_| serde_json::Map::new()).collect();
+    let mut cost_by_model_buckets: Vec<BTreeMap<String, i128>> =
+        (0..buckets).map(|_| BTreeMap::new()).collect();
+    let mut calls_by_model_buckets: Vec<BTreeMap<String, i64>> =
+        (0..buckets).map(|_| BTreeMap::new()).collect();
+    let mut calls_by_provider_buckets: Vec<BTreeMap<String, i64>> =
+        (0..buckets).map(|_| BTreeMap::new()).collect();
 
     for row in &raw.model_buckets {
         let idx = row.bucket_idx.clamp(0, buckets - 1) as usize;
-        *cost_by_model_buckets[idx]
-            .entry(&row.model)
-            .or_insert(json!(0)) = json!(
-            cost_by_model_buckets[idx]
-                .get(&row.model)
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                + row.cost_nano
-        );
-        *calls_by_model_buckets[idx]
-            .entry(&row.model)
-            .or_insert(json!(0)) = json!(
-            calls_by_model_buckets[idx]
-                .get(&row.model)
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                + row.call_count
-        );
+        let cost = cost_by_model_buckets[idx]
+            .entry(row.model.clone())
+            .or_insert(0);
+        *cost = cost.checked_add(row.cost_nano).ok_or_else(|| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "analytics cost aggregate overflow",
+            )
+        })?;
+        let calls = calls_by_model_buckets[idx]
+            .entry(row.model.clone())
+            .or_insert(0);
+        *calls = calls.checked_add(row.call_count).ok_or_else(|| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "analytics call count overflow",
+            )
+        })?;
     }
 
     for row in &raw.provider_buckets {
         let idx = row.bucket_idx.clamp(0, buckets - 1) as usize;
-        *calls_by_provider_buckets[idx]
-            .entry(&row.provider_label)
-            .or_insert(json!(0)) = json!(
-            calls_by_provider_buckets[idx]
-                .get(&row.provider_label)
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                + row.call_count
-        );
+        let calls = calls_by_provider_buckets[idx]
+            .entry(row.provider_label.clone())
+            .or_insert(0);
+        *calls = calls.checked_add(row.call_count).ok_or_else(|| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "analytics call count overflow",
+            )
+        })?;
     }
 
     let response_buckets: Vec<Value> = (0..buckets as usize)
         .map(|i| {
             json!({
                 "label": bucket_labels[i],
-                "cost_by_model": cost_by_model_buckets[i],
+                "cost_by_model": cost_by_model_buckets[i]
+                    .iter()
+                    .map(|(model, cost)| (model.clone(), Value::String(cost.to_string())))
+                    .collect::<serde_json::Map<String, Value>>(),
                 "calls_by_model": calls_by_model_buckets[i],
                 "calls_by_provider": calls_by_provider_buckets[i],
             })
@@ -240,9 +247,9 @@ pub async fn get_dashboard_analytics(
         "buckets": response_buckets,
         "time_from": time_from,
         "time_to": time_to,
-        "total_cost_nano_usd": raw.total_cost_nano_usd,
+        "total_cost_nano_usd": raw.total_cost_nano_usd.to_string(),
         "total_calls": raw.total_calls,
-        "today_cost_nano_usd": raw.today_cost_nano_usd,
+        "today_cost_nano_usd": raw.today_cost_nano_usd.to_string(),
         "today_calls": raw.today_calls,
     })))
 }

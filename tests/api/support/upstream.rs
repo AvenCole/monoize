@@ -4816,7 +4816,7 @@ async fn create_test_provider(
         logical_model.to_string(),
         monoize::monoize_routing::MonoizeModelEntry {
             redirect: None,
-            multiplier: 1.0,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
         },
     );
     state
@@ -4885,10 +4885,10 @@ async fn seed_test_model_pricing(state: &monoize::app::AppState, model_ids: &[&s
             .upsert_model_metadata(
                 model_id,
                 monoize::model_registry_store::UpsertModelMetadataInput {
-                    models_dev_provider: Some(pricing_profile.to_string()),
-                    mode: Some("chat".to_string()),
-                    input_cost_per_token_nano: Some("1000".to_string()),
-                    output_cost_per_token_nano: Some("1000".to_string()),
+                    models_dev_provider: Some(Some(pricing_profile.to_string())),
+                    mode: Some(Some("chat".to_string())),
+                    input_cost_per_token_nano: Some(Some("1000".to_string())),
+                    output_cost_per_token_nano: Some(Some("1000".to_string())),
                     cache_read_input_cost_per_token_nano: None,
                     cache_creation_input_cost_per_token_nano: None,
                     output_cost_per_reasoning_token_nano: None,

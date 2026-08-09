@@ -1040,7 +1040,7 @@ mod tests {
                     "alpha-model".to_string(),
                     MonoizeModelEntry {
                         redirect: None,
-                        multiplier: 1.0,
+                        multiplier: crate::exact_decimal::Multiplier::ONE,
                     },
                 )]),
                 active_probe_enabled_override: None,

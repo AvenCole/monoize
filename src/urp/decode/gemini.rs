@@ -55,6 +55,8 @@ struct GeminiUsage {
     #[serde(
         default,
         deserialize_with = "deserialize_u64ish_default",
+        alias = "toolUsePromptTokenCount",
+        alias = "tool_use_prompt_token_count",
         alias = "toolPromptInputTokenCount",
         alias = "tool_prompt_input_token_count",
         alias = "tool_prompt_tokens"
@@ -80,9 +82,19 @@ struct GeminiUsage {
     extra: HashMap<String, Value>,
 }
 
-impl From<GeminiUsage> for Usage {
-    fn from(mut value: GeminiUsage) -> Self {
+impl TryFrom<GeminiUsage> for Usage {
+    type Error = String;
+
+    fn try_from(mut value: GeminiUsage) -> Result<Self, Self::Error> {
         retain_wire_extra_fields(&mut value.extra);
+        let input_tokens = value
+            .prompt_token_count
+            .checked_add(value.tool_prompt_tokens)
+            .ok_or_else(|| "Gemini input token total overflow".to_string())?;
+        let output_tokens = value
+            .candidates_token_count
+            .checked_add(value.thoughts_token_count)
+            .ok_or_else(|| "Gemini output token total overflow".to_string())?;
         let input_details = if value.cached_content_token_count > 0
             || value.cache_creation_tokens > 0
             || value.tool_prompt_tokens > 0
@@ -116,13 +128,13 @@ impl From<GeminiUsage> for Usage {
             None
         };
 
-        Usage {
-            input_tokens: value.prompt_token_count,
-            output_tokens: value.candidates_token_count,
+        Ok(Usage {
+            input_tokens,
+            output_tokens,
             input_details,
             output_details,
             extra_body: value.extra,
-        }
+        })
     }
 }
 
@@ -290,10 +302,10 @@ pub fn decode_response(value: &Value) -> Result<UrpResponse, String> {
         .and_then(|v| v.as_str())
         .map(parse_finish_reason);
 
-    let usage = obj
-        .get("usageMetadata")
-        .and_then(|v| v.as_object())
-        .map(parse_usage);
+    let usage = match obj.get("usageMetadata").and_then(|v| v.as_object()) {
+        Some(usage) => Some(parse_usage(usage)?),
+        None => None,
+    };
 
     Ok(UrpResponse {
         id: obj
@@ -673,16 +685,10 @@ fn parse_finish_reason(reason: &str) -> FinishReason {
     }
 }
 
-fn parse_usage(obj: &Map<String, Value>) -> Usage {
+fn parse_usage(obj: &Map<String, Value>) -> Result<Usage, String> {
     serde_json::from_value::<GeminiUsage>(Value::Object(obj.clone()))
-        .map(Usage::from)
-        .unwrap_or_else(|_| Usage {
-            input_tokens: 0,
-            output_tokens: 0,
-            input_details: None,
-            output_details: None,
-            extra_body: split_extra(obj, &[]),
-        })
+        .map_err(|err| format!("invalid Gemini usage metadata: {err}"))?
+        .try_into()
 }
 
 fn collect_content_text(value: &Value) -> String {
@@ -719,9 +725,54 @@ mod tests {
             })
             .as_object()
             .expect("usage object"),
-        );
+        )
+        .expect("usage should decode");
         assert_eq!(usage.extra_body["vendorUsageCounter"], json!(3));
         assert!(!usage.extra_body.contains_key("_monoize_spoofed_usage"));
+    }
+
+    #[test]
+    fn gemini_usage_builds_inclusive_totals_from_disjoint_counters() {
+        let usage = parse_usage(
+            json!({
+                "promptTokenCount": 27,
+                "toolUsePromptTokenCount": 10_309,
+                "candidatesTokenCount": 45,
+                "thoughtsTokenCount": 31,
+                "cachedContentTokenCount": 7
+            })
+            .as_object()
+            .expect("usage object"),
+        )
+        .expect("usage should decode");
+
+        assert_eq!(usage.input_tokens, 10_336);
+        assert_eq!(usage.output_tokens, 76);
+        assert_eq!(
+            usage
+                .input_details
+                .as_ref()
+                .expect("input details")
+                .tool_prompt_tokens,
+            10_309
+        );
+        assert_eq!(usage.reasoning_tokens(), Some(31));
+    }
+
+    #[test]
+    fn gemini_usage_rejects_inclusive_total_overflow() {
+        let error = parse_usage(
+            json!({
+                "promptTokenCount": u64::MAX,
+                "toolUsePromptTokenCount": 1,
+                "candidatesTokenCount": 0
+            })
+            .as_object()
+            .expect("usage object"),
+        )
+        .expect_err("overflow must fail usage decoding");
+
+        assert!(error.contains("input token total overflow"));
     }
 
     #[test]

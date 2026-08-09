@@ -68,12 +68,12 @@ impl Transform for SetFieldTransform {
         match data {
             UrpData::Request(req) => {
                 if let Some(sub_path) = cfg.path.strip_prefix("reasoning.") {
-                    let reasoning = req.reasoning.get_or_insert_with(|| {
-                        crate::urp::ReasoningConfig {
-                            effort: None,
-                            extra_body: std::collections::HashMap::new(),
-                        }
-                    });
+                    let reasoning =
+                        req.reasoning
+                            .get_or_insert_with(|| crate::urp::ReasoningConfig {
+                                effort: None,
+                                extra_body: std::collections::HashMap::new(),
+                            });
                     set_extra_path(&mut reasoning.extra_body, sub_path, cfg.value.clone());
                 } else {
                     set_extra_path(&mut req.extra_body, &cfg.path, cfg.value.clone());

@@ -29,7 +29,7 @@ An API key row has:
 - `ip_whitelist: string[]`
 - `group: string`
 - `allowed_groups: string[]`
-- `max_multiplier: number?`
+- `max_multiplier: string?` (canonical positive base-10 decimal string)
 - `transforms: TransformRuleConfig[]`
 - `request_capture_mode: "off" | "capture-all" | "capture-only-abnormal"`
 
@@ -76,13 +76,13 @@ All endpoints in this spec require an authenticated dashboard session.
   - `name: string`
   - `expires_in_days: integer?`
   - `sub_account_enabled: boolean` (default false)
-  - `sub_account_balance_nano_usd: string` (default `"0"`, admin only for non-zero initial balance)
+  - `sub_account_balance_nano_usd: string` (default `"0"`; an explicit value is admin only)
   - `model_limits_enabled: boolean` (default false)
   - `model_limits: string[]` (default empty)
   - `ip_whitelist: string[]` (default empty)
   - `group: string` (default `"default"`)
   - `allowed_groups: string[]` (default empty, meaning inherit from owning user)
-  - `max_multiplier: number?` (default null)
+  - `max_multiplier: string?` (default null)
   - `transforms: TransformRuleConfig[]` (default empty)
   - `request_capture_mode: "off" | "capture-all" | "capture-only-abnormal"` (default `"off"`)
 - **Response:** The created key object including the full key string.
@@ -196,3 +196,9 @@ TM-BATCH-1. A successful batch delete MUST invalidate in-memory API key cache en
 TM-Q1. Any operation that mutates `sub_account_balance_nano` for an API key MUST invalidate in-memory API key cache entries for that key id in the same process before returning.
 
 TM-Q2. Sub-account billing behavior is defined in `api-key-sub-account-billing.spec.md`.
+
+## 4. Dashboard balance controls
+
+TM-UI1. The create and edit dialogs MUST render `sub_account_balance_nano_usd` only when the authenticated user's role is `admin` or `super_admin`. The create control MUST accept only a non-negative integer; the edit control MUST accept a signed integer. The frontend MUST validate and submit its value as a decimal string using `BigInt`-equivalent integer arithmetic; it MUST NOT pass the value through JavaScript `Number`, `parseInt`, `parseFloat`, or `toFixed`. When an edit disables sub-account billing, the mutation MUST omit `sub_account_balance_nano_usd` so the server can consolidate the locked current balance.
+
+TM-UI2. A non-admin create or update mutation MUST omit `sub_account_balance_nano_usd` from its JSON request body.
