@@ -1,193 +1,270 @@
 <div align="center">
 
+<img src="frontend/public/monoize.svg" width="96" alt="Monoize logo">
+
 # Monoize
 
-**One endpoint. Every model.**
+**AI APIs look alike. Their contracts differ.**
 
-A high-performance AI gateway that unifies OpenAI, Anthropic, Google Gemini, xAI Grok, and DeepSeek behind a single API — with built-in routing, billing, transforms, and a full admin dashboard.
+Monoize is a Rust gateway for OpenAI Responses, Chat Completions, Anthropic Messages, Gemini, embeddings, and image APIs. It converts protocol semantics, routes one logical model across multiple upstream channels, and handles the failure modes that appear between real clients and real gateways.
 
-Written in Rust. Embeds its own frontend. Ships as a single binary.
+[English](README.md) · [简体中文](README.zh-CN.md)
 
 </div>
 
----
+## The problem
 
-## Why Monoize?
+An AI API gateway does more than rename JSON fields.
 
-Most AI proxy solutions are Node/Python wrappers that glue APIs together. Monoize is different:
+Responses, Chat Completions, and Messages use different models for conversation history, reasoning, tools, usage, errors, and streaming. A converter can return HTTP 200 and still corrupt the conversation. It may drop encrypted reasoning, attach a delta to the wrong content block, duplicate a stream event, or turn a tool result into assistant text.
 
-- **Protocol-native translation** — Internally converts every request to a unified representation (URP-Proto), then encodes to each provider's native wire format. No lossy pass-through.
-- **Single binary deployment** — The React dashboard compiles into the Rust binary at build time. No separate frontend server, no static file hosting.
-- **Streaming-first** — SSE streaming works across all provider types with automatic format adaptation, including mid-stream tool calls and reasoning tokens.
-- **Transform pipeline** — Rewrite, inject, strip, or reshape requests and responses at the API-key or provider level — without touching upstream configs.
+Routing adds another state machine. A gateway must retry a failed channel, move to the next provider, and stop retrying once it has committed response bytes to the client. Switching upstreams after that point would splice two different generations into one stream.
 
-## Features
+Clients and upstream gateways also disagree at the edges. Claude Code, OpenRouter-compatible clients, Codex WebSocket clients, DeepSeek tool loops, image providers, and provider-specific SSE implementations each expose different assumptions.
 
-### API Gateway
+Large inline images add a separate cost. Upload time and upstream image preprocessing can dominate time to first token. Passing the same oversized base64 payload through every retry makes the problem worse.
 
-- **Multi-format ingress** — Accept requests via OpenAI Chat Completions (`/v1/chat/completions`), OpenAI Responses (`/v1/responses`), Anthropic Messages (`/v1/messages`), or Embeddings (`/v1/embeddings`)
-- **Provider-native egress** — Route to `responses`, `chat_completion`, `messages`, or `gemini` upstream types with full format conversion
-- **Waterfall routing** — Ordered provider evaluation with weighted channel selection, automatic fail-forward, and configurable retry policies
-- **Health checks** — Passive failure tracking with cooldown + active probing to recover unhealthy channels
-- **Unknown field preservation** — Forward provider-specific parameters (e.g. `logprobs`, `top_k`) without explicit support
-- **Reasoning normalization** — Translate reasoning effort hints (`none`/`minimum`/`low`/`medium`/`high`/`xhigh`) across OpenAI, Anthropic, and native formats
+## Where common converters fail
 
-### Transform System
+Format support is not protocol correctness. These public examples were checked on 2026-08-10:
 
-A pluggable, ordered pipeline that runs on every request:
+- OpenAI defines `encrypted_content` as the state needed to preserve reasoning in stateless multi-turn flows. At New API commit [`823e263`](https://github.com/QuantumNous/new-api/commit/823e26304a396854ace30b52b98ec497c2dd9c36), its Responses output DTO [cannot represent that field](https://github.com/QuantumNous/new-api/blob/823e26304a396854ace30b52b98ec497c2dd9c36/relaykit/dto/openai_response.go#L327-L339), and its Responses-to-Chat converter [reads only reasoning text](https://github.com/QuantumNous/new-api/blob/823e26304a396854ace30b52b98ec497c2dd9c36/relaykit/relayconvert/internal/oai_responses/to_oai_chat_resp.go#L212-L229). Format conversion therefore still drops encrypted reasoning. See the [OpenAI reasoning guide](https://developers.openai.com/api/docs/guides/reasoning#preserve-reasoning-without-stored-responses) for why that state must be replayed.
+- LiteLLM issue [#32357](https://github.com/BerriAI/litellm/issues/32357) reports an Anthropic adapter that emits `message_start` twice and sends `thinking_delta` inside a text block. Anthropic SDKs discard that reasoning because the event violates the block lifecycle.
+- New API issue [#5480](https://github.com/QuantumNous/new-api/issues/5480) documents streaming relay paths that retain the complete generated text only to estimate tokens. Memory then grows with output length and concurrency.
 
-| Transform | Description |
-|-----------|-------------|
-| `inject_system_prompt` | Prepend or append system instructions |
-| `reasoning_to_think_xml` | Convert structured reasoning to `<think>` XML |
-| `think_xml_to_reasoning` | Parse `<think>` XML back to structured reasoning |
-| `reasoning_effort_to_budget` | Map effort levels to token budgets |
-| `strip_reasoning` | Remove reasoning from responses |
-| `system_to_developer_role` | Rewrite `system` role to `developer` |
-| `merge_consecutive_roles` | Collapse adjacent same-role messages |
-| `override_max_tokens` | Force a max output token limit |
-| `set_field` / `remove_field` | Arbitrary JSON field manipulation |
-| `force_stream` | Force streaming mode on all requests |
+These are design failures, not missing aliases. Monoize addresses them in the protocol model, stream state machines, routing rules, and resource bounds.
 
-Transforms can be scoped per API key or per provider, filtered by model glob, and applied to request or response phase.
+## What Monoize does
 
-### Dashboard
+### It converts semantics, not field names
 
-A full admin console served from the same binary:
+Monoize decodes each supported protocol into URP v2, a flat and typed canonical representation. It keeps text, reasoning summary, raw reasoning, encrypted reasoning, tool calls, tool results, images, files, refusals, usage, and control boundaries as distinct nodes.
 
-- **Home** — Real-time overview with usage charts (consumption distribution, trends, call rankings)
-- **Providers** — Visual provider/channel management with drag-to-reorder priority, per-model redirect & multiplier config, and live health indicators
-- **API Keys** — Per-user token management with expiry, quotas, model restrictions, IP whitelists, max multiplier ceilings, and per-key transform rules
-- **Request Logs** — Virtualized, filterable log viewer with timing metrics (duration, TTFB), token counts, cost tracking, and IP display
-- **Model Metadata** — Browse and sync pricing data from [Models.dev](https://models.dev)
-- **Playground** — Interactive chat completions tester with streaming output
-- **Users** — User management with role-based access and prepaid nano-dollar balance system
-- **Settings** — System configuration (API base URL, etc.)
-- **i18n** — Multi-language UI
+The selected upstream adapter then encodes those nodes into the target protocol. The response follows the same path in reverse.
 
-### Billing
+This design provides concrete guarantees:
 
-- Nano-dollar precision (1 USD = 1,000,000,000 nano-USD) — no floating-point drift
-- Per-request charge calculation using model metadata pricing with multiplier support
-- Cached token and reasoning token aware billing
-- Balance guard on every forwarded request
-- Append-only ledger for full audit trail
+- The full Responses, Chat Completions, and Messages request/response grid is tested in streaming and non-streaming modes.
+- Encrypted reasoning remains separate from visible reasoning. Optional `mz2` envelopes preserve opaque reasoning across otherwise incompatible replay formats.
+- Tool-call IDs, parallel calls, multipart tool results, and assistant history keep their roles.
+- Responses output-item lifecycles and Messages content-block lifecycles remain ordered and balanced.
+- Unknown same-family fields can survive. Unsafe nested fields are stripped at cross-family boundaries instead of leaking into an invalid request.
 
-## Quick Start
+The normative cases and their tests live in the [protocol test matrix](spec/urp-v2-flat-protocol-test-matrix.spec.md).
 
-### Prerequisites
+### It retries before it commits a stream
 
-- [Rust](https://rustup.rs/) (2024 edition)
-- [Bun](https://bun.sh/) (for frontend builds)
+A logical model can match several ordered Providers. Each Provider can contain several weighted Channels.
 
-### Development
+Monoize tries them as a bounded waterfall:
 
-```bash
-# Start the frontend dev server (with API proxy to backend)
-cd frontend && bun install && bun dev
+1. Select the first matching Provider.
+2. Select an eligible Channel by weight and affinity.
+3. Retry retryable failures within the configured budgets.
+4. Move forward to the next eligible route when the current route is exhausted.
+5. Stop fallback after the first downstream response byte.
 
-# In another terminal, start the backend
-cargo run
+Network failures, timeouts, `429`, and selected `5xx` responses can move forward. Client errors such as `400`, `401`, `403`, and `422` stop the waterfall. Circuit breakers, passive health state, active probes, cooldowns, and model affinity keep known-bad channels out of the hot path.
+
+Monoize never switches providers in the middle of a visible stream. The exact transition rules are defined in the [routing specification](spec/monoize-upstream-routing.spec.md).
+
+### It handles client and gateway quirks at the boundary
+
+The core adapters cover normal protocol conversion. Ordered transforms handle behavior that belongs to one client, provider, model, or API key.
+
+Examples include:
+
+- OpenRouter-compatible structured reasoning and final usage chunks.
+- DeepSeek reasoning replay during tool loops.
+- Anthropic thinking blocks and signatures.
+- Codex Responses WebSocket sessions and `/v1/responses/compact`.
+- data-URL images converted to provider-native image sources.
+- SSE frame splitting for clients with small line buffers.
+- orphaned tool-call cleanup and consecutive-role repair.
+- system/developer role mapping.
+- prompt-cache breakpoints for system prompts, tool use, and OpenAI tools.
+- provider-specific header removal, model suffixes, and token-budget mapping.
+
+Transforms can run at Provider, global, or API-key scope. Model globs select where each rule applies. See the [transform specification](spec/urp-transform-system.spec.md).
+
+### It reduces large-image overhead before the upstream call
+
+`compress_user_message_images` is an opt-in request transform. It can resize and recompress inline user images before routing them upstream. Supported output modes include JPEG, PNG, WebP, and JPEG XL.
+
+The transform preserves the image node and its provider-specific detail hints. It skips unsupported or remote URL sources. Input bytes, decoded pixels, concurrent encodes, cache entries, and cache bytes have explicit limits.
+
+This reduces request size and the avoidable part of image-heavy TTFT. Cached results also avoid repeating the same encode work across retries or repeated requests.
+
+### It runs with significantly less forwarding overhead
+
+Monoize is significantly more efficient on the forwarding hot path than common API forwarding gateways.
+
+- Rust and Tokio handle concurrent I/O without a language runtime or per-request interpreter work.
+- The normal stream path decodes and re-encodes incrementally through bounded channels.
+- Usage estimation updates counters as deltas arrive. It does not retain the complete generated text merely to count it.
+- Rate-limit keys, routing health, affinity, API-key caches, request capture, WebSocket history, discovery bodies, and image transforms all have explicit bounds.
+- A release build embeds the React dashboard and serves the API, dashboard, and metrics from one process.
+
+Some response transforms intentionally select buffered synthetic streaming. Replicate also uses that path. The default protocol bridge remains incremental.
+
+This comparison concerns proxy-side CPU, memory, and latency. It does not claim to make an upstream model generate tokens faster. See [stream usage accounting](src/handlers/usage.rs) and the [runtime resource bounds](spec/runtime-resource-bounds.spec.md).
+
+## Supported surface
+
+### Downstream endpoints
+
+| Method | Endpoint | Contract |
+| --- | --- | --- |
+| `GET` | `/v1/models` | OpenAI-compatible model list |
+| `POST` | `/v1/responses` | OpenAI Responses, streaming or non-streaming |
+| `GET` | `/v1/responses` | OpenAI Responses WebSocket transport |
+| `POST` | `/v1/responses/compact` | Responses compaction |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/messages` | Anthropic Messages |
+| `POST` | `/v1/embeddings` | Embeddings |
+| `POST` | `/v1/images/generations` | Image generation |
+| `POST` | `/v1/images/edits` | Multipart image edits |
+
+Every forwarding endpoint also has an `/api/v1/...` alias.
+
+### Upstream channel types
+
+| Type | Native upstream contract |
+| --- | --- |
+| `responses` | OpenAI Responses-compatible |
+| `chat_completion` | OpenAI Chat Completions-compatible |
+| `messages` | Anthropic Messages-compatible |
+| `gemini` | Google Gemini native |
+| `openai_image` | OpenAI-compatible image API |
+| `replicate` | Replicate predictions |
+
+Providers define routing order, retry budgets, and health policy. Channels hold the actual upstream type, base URL, credential, model mapping, weight, and timeout.
+
+## Request path
+
+```text
+Client protocol
+    │
+    ▼
+Decode to typed URP v2
+    │
+    ▼
+Provider waterfall ──► weighted Channel ──► circuit breaker / affinity
+    │                                           │
+    │                                retry or fail forward
+    │                                before the first byte
+    ▼
+Provider, global, and API-key transforms
+    │
+    ▼
+Upstream protocol encoding
+    │
+    ▼
+Upstream stream ──► URP v2 events ──► downstream protocol events
 ```
 
-The dashboard will be available at `http://localhost:5173` (Vite dev server), proxying API calls to the Rust backend on port `8080`.
+## Quick start
 
-### Production
+Install a stable Rust toolchain and [Bun](https://bun.sh/). A release build compiles the frontend and embeds it in the executable.
 
 ```bash
-# Release build embeds the frontend into the binary
 cargo build --release
-
-# Run — that's it, no nginx/caddy needed
 ./target/release/monoize
 ```
 
-The single binary serves both the API and the dashboard on `0.0.0.0:8080`.
+Open `http://localhost:8080`. The first registered account becomes `super_admin` even if public registration has been disabled. Then:
+
+1. Create a Provider.
+2. Add at least one Channel with its upstream URL and credential.
+3. Map a logical model to the Channel.
+4. Create an API key.
+
+Call the logical model through any supported downstream protocol:
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H 'Authorization: Bearer sk-your-monoize-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "your-logical-model",
+    "input": "Explain why stream fallback must stop after the first byte.",
+    "stream": true
+  }'
+```
 
 ## Configuration
 
-Monoize is configured via environment variables — no config files.
+Runtime bootstrap uses environment variables. Providers, Channels, models, routing policy, transforms, users, and API keys are stored in the database and managed through the dashboard.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MONOIZE_LISTEN` | `0.0.0.0:8080` | Server listen address |
-| `MONOIZE_DATABASE_DSN` | `sqlite://./data/monoize.db` | Database connection string |
-| `DATABASE_URL` | *(fallback for above)* | Alternative DSN variable |
-| `MONOIZE_METRICS_PATH` | `/metrics` | Prometheus metrics endpoint |
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MONOIZE_LISTEN` | `0.0.0.0:8080` | HTTP listen address |
+| `MONOIZE_DATABASE_DSN` | `sqlite://./data/monoize.db` | SQLite or PostgreSQL DSN |
+| `DATABASE_URL` | unset | Fallback DSN when `MONOIZE_DATABASE_DSN` is unset |
+| `MONOIZE_METRICS_PATH` | `/metrics` | Prometheus metrics path |
+| `MONOIZE_HTTP_BODY_MAX_BYTES` | `52428800` | Forwarding request-body limit |
+| `MONOIZE_TRUSTED_PROXY_CIDRS` | empty | Trusted reverse-proxy networks |
 
-## API Endpoints
+Monoize supports SQLite and PostgreSQL. One Monoize application process is the supported writer for its business tables.
 
-### Forwarding (proxy)
+## Operations
 
-All forwarding endpoints require `Authorization: Bearer sk-...` using a dashboard-managed API key.
+The embedded dashboard manages:
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/responses` | OpenAI Responses API |
-| `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
-| `POST` | `/v1/messages` | Anthropic Messages |
-| `POST` | `/v1/embeddings` | Embeddings (pass-through) |
+- Providers, Channels, health, priority, model mapping, and pricing multipliers.
+- API keys, quotas, model restrictions, IP allowlists, transforms, and sub-accounts.
+- users, balances, nano-dollar billing, and an append-only ledger.
+- request logs with TTFB, duration, token usage, cost, errors, and tried routes.
+- model metadata and pricing imported from [Models.dev](https://models.dev).
+- Prometheus metrics and live operational views.
 
-All endpoints are also available under `/api/v1/...`.
+Request capture is opt-in and bounded. Credentials and prompt bodies are not part of normal observability logs.
 
-### Dashboard
+## Limits and non-goals
 
-The dashboard API lives under `/api/dashboard/*` and uses session-based authentication.
+- Monoize forwards tool definitions and tool calls. It does not execute tools locally.
+- Monoize does not provide OpenAI Files, vector stores, or local retrieval.
+- Responses object storage and later object retrieval are not implemented.
+- Fallback ends after downstream bytes begin. Mid-stream provider switching is intentionally forbidden.
+- Cross-family conversion preserves representable semantics. Provider-specific nested fields that have no safe target representation are intentionally removed.
+- Image compression is opt-in. It does not fetch arbitrary remote image URLs unless the separate URL-resolution transform is configured.
 
-## Architecture
+## Release artifacts
 
-```
-                         ┌─────────────────────────────────┐
-                         │           Downstream            │
-                         │  (your app / SDK / curl / etc)  │
-                         └──────────────┬──────────────────┘
-                                        │
-                    ┌───────────────────────────────────────────┐
-                    │  /v1/responses  │  /v1/chat/completions  │
-                    │  /v1/messages   │  /v1/embeddings        │
-                    └───────────────────┬───────────────────────┘
-                                        │
-                    ┌───────────────────────────────────────────┐
-                    │             Auth + Balance Guard          │
-                    ├───────────────────────────────────────────┤
-                    │          Decode to URP-Proto              │
-                    ├───────────────────────────────────────────┤
-                    │      API-Key Request Transforms           │
-                    ├───────────────────────────────────────────┤
-                    │     Waterfall Router (fail-forward)       │
-                    │   ┌─────────┐ ┌─────────┐ ┌─────────┐   │
-                    │   │Provider1│→│Provider2│→│Provider3│   │
-                    │   └─────────┘ └─────────┘ └─────────┘   │
-                    ├───────────────────────────────────────────┤
-                    │     Provider Request Transforms           │
-                    ├───────────────────────────────────────────┤
-                    │       Encode to Provider Format           │
-                    └───────────────────┬───────────────────────┘
-                                        │
-              ┌─────────────┬───────────┼───────────┬──────────────┐
-              │             │           │           │              │
-         ┌────┴────┐  ┌────┴────┐ ┌────┴────┐ ┌────┴────┐  ┌─────┴────┐
-         │ OpenAI  │  │Anthropic│ │ Gemini  │ │  Grok   │  │DeepSeek  │
-         │responses│  │messages │ │ native  │ │ native  │  │  chat    │
-         └─────────┘  └─────────┘ └─────────┘ └─────────┘  └──────────┘
+Publishing a GitHub Release whose tag equals `v` plus the Cargo package version runs the [release workflow](.github/workflows/release.yml). It builds native x86-64 and ARM64 binaries for Linux, macOS, and Windows.
+
+Linux and macOS assets use `tar.gz`. Windows assets use `zip`. Every archive includes both READMEs and the license, and has a separate SHA-256 file. The workflow uploads nothing until all six builds and all checksum checks succeed.
+
+A manual workflow run executes the same six-platform preflight without changing a GitHub Release. The exact asset contract is defined in the [release artifact specification](spec/release-artifacts.spec.md).
+
+## Development and verification
+
+Backend tests:
+
+```bash
+cargo test
 ```
 
-## Tech Stack
+Frontend checks:
 
-| Layer | Technology |
-|-------|-----------|
-| Runtime | Rust, Tokio, Axum |
-| Database | SQLite (via SQLx) |
-| Auth | JWT + Argon2 |
-| Metrics | Prometheus (`metrics` crate) |
-| Frontend | React 19, TypeScript, Vite |
-| Styling | Tailwind CSS, shadcn/ui |
-| Animation | Framer Motion |
-| Data Fetching | SWR |
-| Charts | Recharts |
-| Virtualization | react-virtuoso |
-| i18n | i18next |
+```bash
+cd frontend
+bun install
+bun run lint
+bun run build
+```
+
+Run the live three-protocol suite against a configured instance:
+
+```bash
+cd sdk-tests
+bun run live-protocol-suite.ts <baseURL> <apiKey> <model>
+```
+
+The suite checks non-streaming text, streaming text, tool loops, and streaming tool loops through Chat Completions, Responses, and Messages.
+
+Observable behavior is specified under [`spec/`](spec/). Code and specifications change together.
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+Monoize is licensed under the [MIT License](LICENSE).
