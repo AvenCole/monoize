@@ -149,6 +149,11 @@ ISM4.5. `request_logs` columns:
 - `error_http_status` BIGINT NULL
 - `duration_ms` BIGINT NULL
 - `ttfb_ms` BIGINT NULL
+- `first_visible_output_ms` BIGINT NULL
+- `last_visible_output_ms` BIGINT NULL
+- `visible_generation_ms` BIGINT NULL
+- `visible_output_tokens` BIGINT NULL
+- `tps_mode` TEXT NULL
 - `request_ip` TEXT NULL
 - `reasoning_effort` TEXT NULL
 - `tried_providers_json` TEXT NULL
@@ -158,6 +163,9 @@ ISM4.5. `request_logs` columns:
 - `affinity_key_hash` TEXT NULL
 - `affinity_target` TEXT NULL
 - `created_at` TEXT NOT NULL
+- `created_at_unix_ms` BIGINT NULL
+
+ISM4.5a. `request_logs` MUST contain exactly the 42 columns listed by ISM4.5. `request_logs.user_id` is a historical identifier and MUST NOT have a foreign key to `users`. Deleting a user MUST preserve all request-log rows for that user.
 
 ISM4.6. `system_settings` columns:
 
@@ -286,6 +294,8 @@ ISM4.12c. On SQLite and PostgreSQL, every backend-specific DDL/data-copy stateme
 
 ISM4.12d. Migration `m20260809_000029_sessions_expires_at_index` MUST create `idx_sessions_expires_at` on `sessions(expires_at)` on SQLite and PostgreSQL. Its down migration MUST remove that index.
 
+ISM4.12e. Migration `m20260809_000031_request_logs_without_user_fk` requires source columns `id`, `user_id`, `model`, `is_stream`, `status`, and `created_at`. It MUST fail and roll back when any required source column is absent. Every other nullable ISM4.5 column MAY be absent and MUST be added with null values. For `input_tokens`, `output_tokens`, and `cache_read_tokens`, an existing canonical non-null value MUST win; a null or absent canonical value MUST fall back respectively to legacy `prompt_tokens`, `completion_tokens`, or `cached_tokens`; both absent MUST produce null. The output on SQLite and PostgreSQL MUST contain exactly the 42 ISM4.5 columns. Every other column and every ordinary request-log index outside the ISM5.2 set MUST be removed. PostgreSQL MUST preserve indexes owned by table constraints and MUST drop both `request_logs_user_id_fkey` and `fk_request_logs_user_id` with `IF EXISTS`. The migration MUST perform inspection, data changes, and DDL in one transaction, MUST be idempotent, and MUST preserve every row. The migration down operation MUST be a no-op.
+
 ISM4.13. Legacy `providers`, `model_mappings`, and `group_members` tables MUST NOT be created.
 
 ISM4.15. `state_records` columns:
@@ -321,9 +331,10 @@ ISM5.2. Required indexes:
 - `idx_api_keys_user_id` on `api_keys(user_id)`
 - `idx_api_keys_key_hash` on `api_keys(key_hash)`
 - `idx_billing_ledger_user_id` on `billing_ledger(user_id)`
-- `idx_request_logs_user_id` on `request_logs(user_id)`
-- `idx_request_logs_created_at` on `request_logs(created_at)`
+- `idx_request_logs_user_created_at` on `request_logs(user_id, created_at_unix_ms DESC)`
+- `idx_request_logs_created_at` on `request_logs(created_at_unix_ms DESC)`
 - `idx_request_logs_model` on `request_logs(model)`
+- `idx_request_logs_legacy_created_at` on `request_logs(created_at)` where `created_at_unix_ms IS NULL`
 - `idx_mc_provider_id` on `monoize_channels(provider_id)`
 - `idx_mcm_channel_id` on `monoize_channel_models(channel_id)`
 
@@ -335,6 +346,7 @@ ISM6.2. If defined, foreign key edges SHOULD follow:
 
 - `sessions.user_id -> users.id`
 - `api_keys.user_id -> users.id`
-- `request_logs.user_id -> users.id`
 - `monoize_channels.provider_id -> monoize_providers.id`
 - `monoize_channel_models.channel_id -> monoize_channels.id`
+
+ISM6.3. `request_logs.user_id -> users.id` MUST NOT be defined. `request_logs.user_id` MUST accept an identifier that has no current `users` row.

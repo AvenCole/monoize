@@ -188,7 +188,7 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(RequestLogs::ReasoningTokens).big_integer())
                     .col(ColumnDef::new(RequestLogs::AcceptedPredictionTokens).big_integer())
                     .col(ColumnDef::new(RequestLogs::RejectedPredictionTokens).big_integer())
-                    .col(ColumnDef::new(RequestLogs::ProviderMultiplier).double())
+                    .col(ColumnDef::new(RequestLogs::ProviderMultiplier).text())
                     .col(ColumnDef::new(RequestLogs::ChargeNanoUsd).text())
                     .col(ColumnDef::new(RequestLogs::Status).text().not_null())
                     .col(ColumnDef::new(RequestLogs::UsageBreakdownJson).text())
@@ -213,13 +213,6 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(RequestLogs::AffinityTarget).text())
                     .col(ColumnDef::new(RequestLogs::CreatedAt).text().not_null())
                     .col(ColumnDef::new(RequestLogs::CreatedAtUnixMs).big_integer())
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_request_logs_user_id")
-                            .from(RequestLogs::Table, RequestLogs::UserId)
-                            .to(Users::Table, Users::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
                     .to_owned(),
             )
             .await?;
@@ -1132,4 +1125,74 @@ enum FileBytes {
     TenantId,
     FileId,
     Bytes,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+
+    #[tokio::test]
+    async fn initial_request_logs_preserve_rows_after_user_deletion() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options).await.expect("SQLite connects");
+        db.execute_unprepared("PRAGMA foreign_keys = ON")
+            .await
+            .expect("foreign keys enable");
+        Migration
+            .up(&SchemaManager::new(&db))
+            .await
+            .expect("initial migration succeeds");
+
+        let foreign_keys = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_key_list(request_logs)".to_string(),
+            ))
+            .await
+            .expect("request-log foreign keys query");
+        assert!(foreign_keys.is_empty());
+        let schema = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS column_count, MAX(CASE WHEN name = 'provider_multiplier' THEN type END) AS provider_multiplier_type FROM pragma_table_info('request_logs')".to_string(),
+            ))
+            .await
+            .expect("request-log schema queries")
+            .expect("request-log schema exists");
+        assert_eq!(schema.try_get::<i64>("", "column_count").unwrap(), 42);
+        assert_eq!(
+            schema
+                .try_get::<String>("", "provider_multiplier_type")
+                .unwrap(),
+            "TEXT"
+        );
+
+        db.execute_unprepared(
+            "INSERT INTO users (id, username, password_hash, role, created_at, updated_at) VALUES ('user-1', 'history-user', 'hash', 'user', '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z')",
+        )
+        .await
+        .expect("user inserts");
+        db.execute_unprepared(
+            "INSERT INTO request_logs (id, user_id, model, status, created_at) VALUES ('log-1', 'user-1', 'model-1', 'success', '2026-08-09T00:00:00Z')",
+        )
+        .await
+        .expect("request log inserts");
+        db.execute_unprepared("DELETE FROM users WHERE id = 'user-1'")
+            .await
+            .expect("user deletes");
+
+        let count: i64 = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM request_logs WHERE id = 'log-1'".to_string(),
+            ))
+            .await
+            .expect("request-log count queries")
+            .expect("request-log count exists")
+            .try_get("", "count")
+            .expect("request-log count decodes");
+        assert_eq!(count, 1);
+    }
 }

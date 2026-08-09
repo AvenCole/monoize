@@ -1281,6 +1281,29 @@ async fn sqlite_migration_creates_request_log_retention_indexes() {
         name == "idx_request_logs_created_at" && sql.contains("(created_at_unix_ms DESC)")
     }));
 
+    let request_log_columns: i64 = db
+        .read()
+        .query_one(db.stmt(
+            "SELECT COUNT(*) AS column_count FROM pragma_table_info('request_logs')",
+            vec![],
+        ))
+        .await
+        .expect("count request-log columns")
+        .expect("request-log column count exists")
+        .try_get("", "column_count")
+        .expect("request-log column count decodes");
+    assert_eq!(request_log_columns, 42);
+
+    let request_log_foreign_keys = db
+        .read()
+        .query_all(db.stmt(
+            "SELECT id FROM pragma_foreign_key_list('request_logs')",
+            vec![],
+        ))
+        .await
+        .expect("list request-log foreign keys");
+    assert!(request_log_foreign_keys.is_empty());
+
     let channel_columns = db
         .read()
         .query_all(db.stmt(

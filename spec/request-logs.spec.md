@@ -13,7 +13,7 @@ A request log row has:
 
 - `id: string` (UUID)
 - `request_id: string` (the `x-request-id` header assigned by tower-http `SetRequestIdLayer`)
-- `user_id: string`
+- `user_id: string` (the historical authenticated user identifier captured when the request was admitted)
 - `api_key_id: string?`
 - `model: string` (logical model requested by the client)
 - `provider_id: string?`
@@ -22,10 +22,10 @@ A request log row has:
 - `is_stream: boolean`
 - `input_tokens: integer?`
 - `output_tokens: integer?`
-- `cached_tokens: integer?`
-- `reasoning_tokens: integer?`
+- `cache_read_tokens: integer?`
 - `cache_creation_tokens: integer?`
 - `tool_prompt_tokens: integer?`
+- `reasoning_tokens: integer?`
 - `accepted_prediction_tokens: integer?`
 - `rejected_prediction_tokens: integer?`
 - `provider_multiplier: string?` (canonical positive base-10 decimal string)
@@ -44,6 +44,7 @@ A request log row has:
 - `visible_output_tokens: integer?` (token count used as the TPS numerator; null when no visible streaming output basis exists)
 - `tps_mode: string?` (`"exact"`, `"estimated"`, or `"approx"`; null for rows without new TPS basis)
 - `request_ip: string?` (the server-generated canonical client IP for the request)
+- `reasoning_effort: string?` (the selected reasoning-effort label when present)
 - `tried_providers_json: object[]?` (array of `{ provider_id, channel_id, error }` objects recording providers/channels that were attempted and failed before the final result; persisted as JSON text in DB; null when no fallback occurred)
 - `request_kind: string?` (classification of log source; null for normal client requests. `"active_probe_connectivity"` for active health-probe connectivity tests)
 - `effective_provider_type: string?` (effective upstream type used for the selected attempt; null when no attempt was selected)
@@ -51,12 +52,13 @@ A request log row has:
 - `affinity_key_hash: string?` (short hash of the affinity cache key; raw affinity key material MUST NOT be stored)
 - `affinity_target: string?` (`provider_id/channel_id` for the affinity target when present)
 - `created_at: RFC3339 string`
+- `created_at_unix_ms: integer?` (the same creation instant as Unix epoch milliseconds; nullable only for legacy rows whose text timestamp could not be backfilled)
 
 ### 1.2 Enriched fields (computed at query time, not stored)
 
 When returning request log rows via the dashboard API, the following fields are JOINed from related tables:
 
-- `username: string?` (from `users.username` via `user_id`)
+- `username: string?` (from `users.username` via `user_id`; null after that user is deleted)
 - `api_key_name: string?` (from `api_keys.name` via `api_key_id`)
 - `channel_name: string?` (from `monoize_channels.name` via `channel_id`)
 - `provider_name: string?` (from `monoize_providers.name` via `provider_id`)
@@ -320,13 +322,36 @@ RL-S2f. Request-log scalar token and timing columns decoded into Rust `i64` MUST
 
 RL-S2g. A request-log row read MUST decode every selected database column explicitly. A database type mismatch, malformed persisted JSON, or malformed persisted multiplier MUST return an internal storage error for the read. The decoder MUST NOT replace a failed decode with null, zero, an empty string, or an empty object.
 
-RL-S3. The `user_id` foreign key MUST cascade on delete.
+RL-S3. `request_logs.user_id` MUST store the exact authenticated user identifier captured when the request was admitted. `request_logs.user_id` MUST NOT have a foreign key to `users`. Deleting a `users` row MUST NOT delete or modify any request-log row.
 
-RL-S4. New columns (`request_id`, `channel_id`, `ttfb_ms`, `first_visible_output_ms`, `last_visible_output_ms`, `visible_generation_ms`, `visible_output_tokens`, `tps_mode`, `request_ip`, `usage_breakdown_json`, `billing_breakdown_json`, `error_code`, `error_message`, `error_http_status`, `tried_providers_json`) MUST be added via `ALTER TABLE ADD COLUMN` statements in the migration logic. All new columns are nullable to preserve backward compatibility with existing rows.
+RL-S3a. A terminal row from the durable request-log spool MUST remain insertable when its `user_id` no longer exists in `users`, including when the user was deleted after request admission and when a later process recovers an older spool file. A missing current user MUST NOT make request-log batch flush retry permanently.
 
-RL-S6. The migration from `prompt_tokens`/`completion_tokens` to `input_tokens`/`output_tokens` MUST be performed via `ALTER TABLE RENAME COLUMN` when the database supports it, otherwise via column addition + data copy. New usage detail columns (`cache_creation_tokens`, `tool_prompt_tokens`, `accepted_prediction_tokens`, `rejected_prediction_tokens`) MUST be added via `ALTER TABLE ADD COLUMN` with nullable defaults.
+RL-S3b. Migration `m20260809_000031_request_logs_without_user_fk` requires its input `request_logs` table to contain `id`, `user_id`, `model`, `is_stream`, `status`, and `created_at`. Every other canonical column in section 1.1 MAY be absent. The input MAY also contain non-canonical legacy columns. The output table on SQLite and PostgreSQL MUST contain exactly the 42 canonical columns in section 1.1 and MUST contain no foreign key from `user_id` to `users`.
 
-RL-S5. `request_kind` MUST be added as a nullable `TEXT` column via migration logic, with null as backward-compatible default for existing rows.
+RL-S3b-1. For each canonical source column that exists, migration `m20260809_000031_request_logs_without_user_fk` MUST copy its value without conversion except for the three token fallback rules in RL-S3b-2. For each absent nullable canonical source column, the migration MUST create that column with the backend type defined by RL-S2f and store null for every existing row.
+
+RL-S3b-2. The migration MUST derive the three canonical token columns per row as follows:
+
+- `input_tokens = COALESCE(input_tokens, prompt_tokens)` when both columns exist; it equals the existing column when only one exists; it is null when neither exists.
+- `output_tokens = COALESCE(output_tokens, completion_tokens)` under the same existence rule.
+- `cache_read_tokens = COALESCE(cache_read_tokens, cached_tokens)` under the same existence rule.
+
+RL-S3b-3. PostgreSQL migration MUST drop both possible user foreign-key constraint names, `request_logs_user_id_fkey` and `fk_request_logs_user_id`, with `IF EXISTS`. On both backends, the migration MUST replace every ordinary request-log index with exactly these four indexes while preserving any index owned by a table constraint:
+
+- `idx_request_logs_user_created_at` on `(user_id, created_at_unix_ms DESC)`
+- `idx_request_logs_created_at` on `(created_at_unix_ms DESC)`
+- `idx_request_logs_model` on `(model)`
+- `idx_request_logs_legacy_created_at` on `(created_at)` where `created_at_unix_ms IS NULL`
+
+RL-S3c. On SQLite and PostgreSQL, every column outside the 42-column data model in section 1.1, including legacy `prompt_tokens`, `completion_tokens`, and `cached_tokens`, MUST be absent after migration `m20260809_000031_request_logs_without_user_fk`. These columns are not canonical storage and MUST NOT be retained as compatibility aliases. When a canonical token value and its legacy counterpart are both non-null and differ, the canonical value MUST win under RL-S3b-2.
+
+RL-S3d. Every schema inspection, data update, table rebuild, constraint change, column change, and index change performed by migration `m20260809_000031_request_logs_without_user_fk` MUST execute in one database transaction per backend. If a required RL-S3b source column is absent or any statement fails, the original table, rows, constraints, and indexes MUST remain unchanged. Running the up migration twice against a successful output MUST leave the same rows, 42-column schema, four ordinary indexes, and no user foreign key. The down migration MUST be a no-op because an intervening request-log row may contain a deleted `user_id` that cannot satisfy a restored foreign key.
+
+RL-S4. Outside the SQLite rebuild defined by RL-S3b, new columns (`request_id`, `channel_id`, `ttfb_ms`, `first_visible_output_ms`, `last_visible_output_ms`, `visible_generation_ms`, `visible_output_tokens`, `tps_mode`, `request_ip`, `usage_breakdown_json`, `billing_breakdown_json`, `error_code`, `error_message`, `error_http_status`, `tried_providers_json`) MUST be added via `ALTER TABLE ADD COLUMN` statements in migration logic. The RL-S3b SQLite rebuild MAY define an absent nullable canonical column directly on its replacement table. All such columns are nullable for existing rows.
+
+RL-S6. Migration `m20260809_000031_request_logs_without_user_fk` MUST converge legacy `prompt_tokens`/`completion_tokens`/`cached_tokens` and canonical `input_tokens`/`output_tokens`/`cache_read_tokens` according to RL-S3b-2, then remove the three legacy columns. New usage detail columns (`cache_creation_tokens`, `tool_prompt_tokens`, `accepted_prediction_tokens`, `rejected_prediction_tokens`) MUST be nullable for migrated rows whose source schema did not contain those columns.
+
+RL-S5. Outside the SQLite rebuild defined by RL-S3b, `request_kind` MUST be added as a nullable `TEXT` column via `ALTER TABLE ADD COLUMN`. The RL-S3b SQLite rebuild MAY define an absent `request_kind` column directly on its replacement table. Its value MUST be null for a source row that had no `request_kind` column.
 
 RL-S7. If a PostgreSQL database still contains legacy shadow columns (`created_at_ts`, `is_stream_bool`, `charge_nano_usd_decimal`) from an older Monoize version, startup migration MUST drop those columns and their associated indexes without touching the canonical columns (`created_at`, `is_stream`, `charge_nano_usd`).
 

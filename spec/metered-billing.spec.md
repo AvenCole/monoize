@@ -40,6 +40,8 @@ MB-D3a. `unit_price_nano_usd` MUST be non-negative and representable as `i128`. 
 
 MB-D4. `match_json` and `raw_json` MUST be JSON object strings. Decoding a persisted value that is malformed JSON or is not a JSON object MUST return a storage error that identifies the billing-rate row and column. A get, list, or matching-rate query MUST propagate that error; it MUST NOT replace the value with `{}`, omit the row, or treat the row as an unconditional rate. Create, update, and catalog-sync paths MUST reject an explicit non-object value before persistence. An omitted value MAY default to `{}` before persistence.
 
+MB-D4a. Migration `m20260809_000030_normalize_billing_json_nulls` MUST evaluate `billing_rate_records.match_json` and `billing_rate_records.raw_json` independently. For each column, it MUST replace the stored value with `{}` if and only if removing leading and trailing JSON whitespace (`U+0009`, `U+000A`, `U+000D`, and `U+0020`) yields the exact string `null`. It MUST leave every other value unchanged, including malformed JSON, arrays, objects, strings, booleans, numbers, and values containing non-JSON whitespace. SQLite and PostgreSQL MUST apply these predicates identically. The down migration MUST be a no-op because the original whitespace cannot be reconstructed. Runtime decoding MUST continue to satisfy MB-D4 after this migration.
+
 MB-D5. `model_metadata_records` MUST continue to store model capabilities, limits, Models.dev raw data, and legacy token prices. Billing computation MUST read `billing_rate_records`. Metadata writes and Models.dev sync MAY mirror token prices into `billing_rate_records`.
 
 ## 2. Pricing Profiles
