@@ -32,17 +32,21 @@ AKP1. Monoize MUST attempt database API key validation first **only** if:
 
 AKP2. If AKP1 holds, Monoize MUST:
 
-1. Look up an API key row by complete-token equality against the stored full key.
-2. Use the complete token as the in-memory authentication-cache identity. The first 12 characters MUST NOT identify a cache entry.
-3. If no row exists, treat the token as invalid.
-4. If a row exists, Monoize MUST validate the token as follows:
+1. Reject a token longer than 512 bytes as invalid before hashing or querying it.
+2. Compute the deterministic complete-token lookup hash and look up candidate API-key rows through the indexed `api_keys.key_hash` column.
+   Existing rows whose `key_hash` is null or empty MUST be backfilled from the full token before indexed authentication. Startup backfill MUST use ascending-ID keyset batches of at most 300 rows. Each non-empty batch MUST select, hash, update through one CASE statement, and commit before the next batch begins. Memory use and one transaction's row count MUST therefore remain bounded by 300. The backfill MUST NOT issue one UPDATE statement per API key.
+3. Read the candidate API-key row and its owning user in the same database query.
+4. Compare the complete supplied token with the stored full token before accepting a hash candidate. A hash match alone MUST NOT authenticate a request.
+5. Use the complete token as the in-memory authentication-cache identity. The first 12 characters MUST NOT identify a cache entry.
+6. If no row exists, treat the token as invalid.
+7. If a row exists, Monoize MUST validate the token as follows:
    - `enabled` MUST be true.
    - `expires_at` MUST be null or a future timestamp.
    - the stored full key value MUST equal the full token.
    - the referenced user MUST exist and have `enabled` true.
    - if an in-memory cache entry for the same complete token exists but fails cache-side validation, Monoize MUST invalidate that cache entry and continue with the database validation path in the same request.
    - if cache invalidation occurs after the database read but before cache publication, Monoize MUST discard that result and repeat database validation.
-5. If validation succeeds:
+8. If validation succeeds:
    - Monoize MUST update `last_used_at` to the current time.
    - Monoize MUST authenticate the request with `tenant_id = user.id`.
    - Monoize MUST attach API key routing policy and runtime guards (`max_multiplier`, `effective_groups`, ordered `transforms`, `reasoning_envelope_enabled`) to the authenticated context.
@@ -59,7 +63,11 @@ AKG1. The owning user row MUST be read as if it contains `allowed_groups: string
 
 AKG2. For backward compatibility, if `users.allowed_groups` is absent, null, empty string, or serialized empty array, authentication MUST treat it as `[]`.
 
+AKG2a. A non-empty `users.allowed_groups` storage value MUST decode as a JSON array of strings. A malformed JSON value, a non-array JSON value, a non-string array element, or a storage value with an incompatible database type MUST fail authentication with an internal storage error. It MUST NOT be converted to `[]`.
+
 AKG3. The authenticated API key row MUST be read as if it contains `allowed_groups: string[]`. `[]` means inherit from the owning user at request-authentication time.
+
+AKG3a. The compatibility values in AKG2 also apply to `api_keys.allowed_groups`. Every other non-empty value MUST decode as a JSON array of strings. A malformed JSON value, a non-array JSON value, a non-string array element, or a storage value with an incompatible database type MUST fail authentication with an internal storage error. It MUST NOT be converted to `[]`.
 
 AKG4. The authenticated context MUST represent request-scoped group access as `effective_groups: string[] | null`. `null` means the request is unrestricted by group filtering. A non-null array means the request is restricted to the named groups in that array.
 
@@ -77,6 +85,19 @@ AKG7. Authentication MUST succeed even when `effective_groups = []`. The downstr
 ## 5. Error response uniformity
 
 AKE1. Authentication failures MUST NOT reveal whether a token partially matched (e.g. prefix exists but hash mismatch).
+
+AKE2. The number of database rows decoded for one invalid token MUST be bounded independently of the total API-key count.
+
+AKE3. Authentication MUST decode the selected API-key row and owning user before publishing an authentication-cache entry. The following persisted API-key fields are required authorization-policy values:
+
+- `model_limits`, `ip_whitelist`, `transforms`, and `model_redirects` MUST decode from JSON arrays of their declared element types;
+- `enabled`, `sub_account_enabled`, `model_limits_enabled`, and `reasoning_envelope_enabled` MUST decode from integer `0` or integer `1` only;
+- the owning user's `enabled` value MUST decode from integer `0` or integer `1` only;
+- `request_capture_mode` MUST be absent, null, or one of `"off"`, `"capture-all"`, and `"capture-only-abnormal"`; absent or null means `"off"` as defined by `request-capture-dumps.spec.md`;
+- every decoded non-empty `ip_whitelist` entry MUST be a valid IP address or CIDR network;
+- every decoded `model_redirects` entry MUST satisfy the stored-rule invariants applied by API-key create and update operations.
+
+AKE4. If any required value in AKE3 has malformed JSON, an incompatible database type, an out-of-domain integer value, an unsupported enum value, or invalid element semantics, API-key validation MUST return an internal storage error. It MUST NOT authenticate the request, publish or retain an authentication-cache entry from that database read, or record the key as used. Empty/default policy values MUST NOT be substituted for the invalid value.
 
 ## 6. Max multiplier enforcement
 

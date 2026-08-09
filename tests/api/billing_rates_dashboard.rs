@@ -17,6 +17,7 @@ async fn setup() -> TestContext {
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     })
     .await
     .expect("state loads");

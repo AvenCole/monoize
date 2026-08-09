@@ -287,11 +287,6 @@ impl ModelRegistryStore {
         id: &str,
         input: UpdateModelInput,
     ) -> Result<DbModelRecord, String> {
-        let _existing = self
-            .get_model(id)
-            .await?
-            .ok_or_else(|| "model not found".to_string())?;
-
         let now = Utc::now();
         let mut set_clauses = Vec::new();
         let mut values: Vec<sea_orm::Value> = Vec::new();
@@ -345,7 +340,8 @@ impl ModelRegistryStore {
                 set_clauses.join(", ")
             );
 
-            self.db
+            let result = self
+                .db
                 .write().await
                 .execute(self.db.stmt(&sql, values))
                 .await
@@ -360,6 +356,9 @@ impl ModelRegistryStore {
                         msg
                     }
                 })?;
+            if result.rows_affected() == 0 {
+                return Err("model not found".to_string());
+            }
         }
 
         self.get_model(id)
@@ -398,6 +397,36 @@ impl ModelRegistryStore {
                         max_tokens, raw_json, source, updated_at
                  FROM model_metadata_records
                  ORDER BY model_id ASC",
+                vec![],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+
+        rows.iter().map(row_to_model_metadata).collect()
+    }
+
+    pub async fn list_marketplace_model_metadata(
+        &self,
+    ) -> Result<Vec<DbModelMetadataRecord>, String> {
+        let rows = self
+            .db
+            .read()
+            .query_all(self.db.stmt(
+                "SELECT DISTINCT
+                        m.model_id, m.models_dev_provider, m.mode,
+                        m.input_cost_per_token_nano, m.output_cost_per_token_nano,
+                        m.cache_read_input_cost_per_token_nano,
+                        m.cache_creation_input_cost_per_token_nano,
+                        m.output_cost_per_reasoning_token_nano, m.max_input_tokens,
+                        m.max_output_tokens, m.max_tokens, m.raw_json, m.source, m.updated_at
+                 FROM model_metadata_records AS m
+                 INNER JOIN monoize_channel_models AS cm ON cm.model_name = m.model_id
+                 INNER JOIN monoize_channels AS c ON c.id = cm.channel_id
+                 INNER JOIN monoize_providers AS p ON p.id = c.provider_id
+                 WHERE p.enabled = 1
+                   AND c.enabled = 1
+                   AND c.weight > 0
+                 ORDER BY m.model_id ASC",
                 vec![],
             ))
             .await
@@ -449,6 +478,54 @@ impl ModelRegistryStore {
             Some(r) => Ok(Some(row_to_model_metadata(&r)?)),
             None => Ok(None),
         }
+    }
+
+    pub async fn list_model_metadata_pricing_profiles(
+        &self,
+        model_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        if model_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let model_ids = model_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut profiles = std::collections::HashMap::new();
+        const LOOKUP_CHUNK_SIZE: usize = 400;
+        for chunk in model_ids.chunks(LOOKUP_CHUNK_SIZE) {
+            let placeholders = (0..chunk.len())
+                .map(|index| format!("${}", index + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rows = self
+                .db
+                .read()
+                .query_all(self.db.stmt(
+                    &format!(
+                        "SELECT model_id, models_dev_provider
+                         FROM model_metadata_records
+                         WHERE model_id IN ({placeholders})
+                           AND models_dev_provider IS NOT NULL"
+                    ),
+                    chunk.iter().cloned().map(Into::into).collect(),
+                ))
+                .await
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let model_id: String = row.try_get("", "model_id").map_err(|e| e.to_string())?;
+                let profile: String = row
+                    .try_get("", "models_dev_provider")
+                    .map_err(|e| e.to_string())?;
+                let profile = profile.trim();
+                if !profile.is_empty() {
+                    profiles.insert(model_id, profile.to_string());
+                }
+            }
+        }
+        Ok(profiles)
     }
 
     pub async fn get_model_pricing(&self, model_id: &str) -> Result<Option<ModelPricing>, String> {
@@ -522,6 +599,11 @@ impl ModelRegistryStore {
         let now = Utc::now().to_rfc3339();
         let write_guard = self.db.write().await;
         let txn = write_guard.begin().await.map_err(|e| e.to_string())?;
+        if self.db.is_postgres() {
+            txn.execute_unprepared("LOCK TABLE model_metadata_records IN SHARE ROW EXCLUSIVE MODE")
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         let existing = get_model_metadata_with(&self.db, &txn, model_id).await?;
 
         let models_dev_provider = merge_nullable(
@@ -657,11 +739,11 @@ impl ModelRegistryStore {
         if !status.is_success() {
             return Err(format!("fetch_failed: status={status}"));
         }
-        let text = resp
-            .text()
+        let body = crate::bounded_response::read_upstream_discovery_body(resp)
             .await
             .map_err(|e| format!("fetch_failed: {e}"))?;
-        let root: Value = serde_json::from_str(&text).map_err(|e| format!("parse_failed: {e}"))?;
+        let root: Value =
+            serde_json::from_slice(&body).map_err(|e| format!("parse_failed: {e}"))?;
         let providers = root
             .as_object()
             .ok_or_else(|| "parse_failed: root must be object".to_string())?;
@@ -742,26 +824,31 @@ impl ModelRegistryStore {
         .await
         .map_err(|e| e.to_string())?;
 
-        let mut upserted = 0usize;
-        let mut skipped = 0usize;
+        let manual_rows = txn
+            .query_all(self.db.stmt(
+                "SELECT model_id FROM model_metadata_records WHERE source = 'manual'",
+                vec![],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        let manual_ids = manual_rows
+            .into_iter()
+            .map(|row| {
+                row.try_get::<String>("", "model_id")
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
 
-        for (model_name, variants) in &grouped {
+        let mut metadata_writes = Vec::new();
+        let mut rate_writes = Vec::new();
+        let mut skipped = 0usize;
+        let mut grouped_models = grouped.iter().collect::<Vec<_>>();
+        grouped_models.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (model_name, variants) in grouped_models {
             if !has_positive_input_variant(variants) {
                 continue;
             }
-
-            let existing_row = txn
-                .query_one(self.db.stmt(
-                    "SELECT source FROM model_metadata_records WHERE model_id = $1",
-                    vec![model_name.clone().into()],
-                ))
-                .await
-                .map_err(|e| e.to_string())?;
-
-            let existing_source: Option<String> =
-                existing_row.and_then(|r| r.try_get::<String>("", "source").ok());
-
-            if existing_source.as_deref() == Some("manual") {
+            if manual_ids.contains(model_name) {
                 skipped += 1;
                 continue;
             }
@@ -780,52 +867,164 @@ impl ModelRegistryStore {
             for v in variants {
                 providers_map.insert(v.provider_id.clone(), v.raw.clone());
             }
-            let raw_json = serde_json::json!({ "providers": providers_map });
+            metadata_writes.push(ModelsDevMetadataWrite {
+                model_name: model_name.clone(),
+                provider_id: winner.provider_id.clone(),
+                mode,
+                input_cost_nano: winner.input_cost_nano.clone(),
+                output_cost_nano: winner.output_cost_nano.clone(),
+                cache_read_nano: winner.cache_read_nano.clone(),
+                cache_write_nano: winner.cache_write_nano.clone(),
+                reasoning_nano: winner.reasoning_nano.clone(),
+                max_input_tokens: winner.max_input_tokens,
+                max_output_tokens: winner.max_output_tokens,
+                max_tokens: winner.max_tokens,
+                raw_json: serde_json::json!({ "providers": providers_map }).to_string(),
+            });
+            for (usage_class, price) in [
+                ("input_uncached", winner.input_cost_nano.as_ref()),
+                ("output", winner.output_cost_nano.as_ref()),
+                ("cache_read", winner.cache_read_nano.as_ref()),
+                ("cache_write_5m", winner.cache_write_nano.as_ref()),
+                ("reasoning_output", winner.reasoning_nano.as_ref()),
+            ] {
+                let Some(price) = price else {
+                    continue;
+                };
+                rate_writes.push(ModelsDevRateWrite {
+                    id: format!(
+                        "models_dev:{}:{}:{usage_class}",
+                        winner.provider_id, model_name
+                    ),
+                    pricing_profile: winner.provider_id.clone(),
+                    model_name: model_name.clone(),
+                    usage_class,
+                    price: price.clone(),
+                    raw_json: serde_json::json!({
+                        "source": "models.dev",
+                        "models_dev_provider": winner.provider_id
+                    })
+                    .to_string(),
+                });
+            }
+        }
 
-            txn.execute(self.db.stmt(
-                "INSERT INTO model_metadata_records
-                 (model_id, models_dev_provider, mode, input_cost_per_token_nano, output_cost_per_token_nano,
-                  cache_read_input_cost_per_token_nano, cache_creation_input_cost_per_token_nano, output_cost_per_reasoning_token_nano,
-                  max_input_tokens, max_output_tokens, max_tokens, raw_json, source, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'models_dev', $13)
-                 ON CONFLICT(model_id) DO UPDATE SET
-                   models_dev_provider=excluded.models_dev_provider,
-                   mode=excluded.mode,
-                   input_cost_per_token_nano=excluded.input_cost_per_token_nano,
-                   output_cost_per_token_nano=excluded.output_cost_per_token_nano,
-                   cache_read_input_cost_per_token_nano=excluded.cache_read_input_cost_per_token_nano,
-                   cache_creation_input_cost_per_token_nano=excluded.cache_creation_input_cost_per_token_nano,
-                   output_cost_per_reasoning_token_nano=excluded.output_cost_per_reasoning_token_nano,
-                   max_input_tokens=excluded.max_input_tokens,
-                   max_output_tokens=excluded.max_output_tokens,
-                   max_tokens=excluded.max_tokens,
-                   raw_json=excluded.raw_json,
-                   source=excluded.source,
-                   updated_at=excluded.updated_at",
-                vec![
-                    model_name.clone().into(),
-                    winner.provider_id.clone().into(),
-                    mode.into(),
-                    winner.input_cost_nano.clone().into(),
-                    winner.output_cost_nano.clone().into(),
-                    winner.cache_read_nano.clone().into(),
-                    winner.cache_write_nano.clone().into(),
-                    winner.reasoning_nano.clone().into(),
-                    winner.max_input_tokens.into(),
-                    winner.max_output_tokens.into(),
-                    winner.max_tokens.into(),
-                    raw_json.to_string().into(),
+        const METADATA_SYNC_CHUNK_SIZE: usize = 30;
+        for chunk in metadata_writes.chunks(METADATA_SYNC_CHUNK_SIZE) {
+            let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 13);
+            let mut rows = Vec::with_capacity(chunk.len());
+            for row in chunk {
+                let start = values.len() + 1;
+                values.extend([
+                    row.model_name.clone().into(),
+                    row.provider_id.clone().into(),
+                    row.mode.into(),
+                    row.input_cost_nano.clone().into(),
+                    row.output_cost_nano.clone().into(),
+                    row.cache_read_nano.clone().into(),
+                    row.cache_write_nano.clone().into(),
+                    row.reasoning_nano.clone().into(),
+                    row.max_input_tokens.into(),
+                    row.max_output_tokens.into(),
+                    row.max_tokens.into(),
+                    row.raw_json.clone().into(),
                     fetched_at.clone().into(),
-                ],
+                ]);
+                let mut placeholders = (start..start + 12)
+                    .map(|index| format!("${index}"))
+                    .collect::<Vec<_>>();
+                placeholders.push("'models_dev'".to_string());
+                placeholders.push(format!("${}", start + 12));
+                rows.push(format!("({})", placeholders.join(", ")));
+            }
+            txn.execute(self.db.stmt(
+                &format!(
+                    "INSERT INTO model_metadata_records
+                     (model_id, models_dev_provider, mode, input_cost_per_token_nano,
+                      output_cost_per_token_nano, cache_read_input_cost_per_token_nano,
+                      cache_creation_input_cost_per_token_nano,
+                      output_cost_per_reasoning_token_nano, max_input_tokens,
+                      max_output_tokens, max_tokens, raw_json, source, updated_at)
+                     VALUES {}
+                     ON CONFLICT(model_id) DO UPDATE SET
+                       models_dev_provider=excluded.models_dev_provider,
+                       mode=excluded.mode,
+                       input_cost_per_token_nano=excluded.input_cost_per_token_nano,
+                       output_cost_per_token_nano=excluded.output_cost_per_token_nano,
+                       cache_read_input_cost_per_token_nano=excluded.cache_read_input_cost_per_token_nano,
+                       cache_creation_input_cost_per_token_nano=excluded.cache_creation_input_cost_per_token_nano,
+                       output_cost_per_reasoning_token_nano=excluded.output_cost_per_reasoning_token_nano,
+                       max_input_tokens=excluded.max_input_tokens,
+                       max_output_tokens=excluded.max_output_tokens,
+                       max_tokens=excluded.max_tokens,
+                       raw_json=excluded.raw_json,
+                       source=excluded.source,
+                       updated_at=excluded.updated_at",
+                    rows.join(", ")
+                ),
+                values,
             ))
             .await
             .map_err(|e| e.to_string())?;
-            upsert_models_dev_billing_rates(&self.db, &txn, model_name, winner, &fetched_at)
-                .await?;
-            upserted += 1;
+        }
+
+        const RATE_SYNC_CHUNK_SIZE: usize = 57;
+        for chunk in rate_writes.chunks(RATE_SYNC_CHUNK_SIZE) {
+            let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 7);
+            let mut rows = Vec::with_capacity(chunk.len());
+            for row in chunk {
+                let start = values.len() + 1;
+                values.extend([
+                    row.id.clone().into(),
+                    row.pricing_profile.clone().into(),
+                    row.model_name.clone().into(),
+                    row.usage_class.into(),
+                    row.price.clone().into(),
+                    row.raw_json.clone().into(),
+                    fetched_at.clone().into(),
+                ]);
+                rows.push(format!(
+                    "(${}, 'models_dev', ${}, ${}, NULL, 'token', ${}, 'token', ${}, '{{}}', 0, 1, ${}, ${})",
+                    start,
+                    start + 1,
+                    start + 2,
+                    start + 3,
+                    start + 4,
+                    start + 5,
+                    start + 6
+                ));
+            }
+            txn.execute(self.db.stmt(
+                &format!(
+                    "INSERT INTO billing_rate_records
+                     (id, source, pricing_profile, model_pattern, provider_type, rate_kind,
+                      usage_class, unit, unit_price_nano_usd, match_json, priority, enabled,
+                      raw_json, updated_at)
+                     VALUES {}
+                     ON CONFLICT(id) DO UPDATE SET
+                       source=excluded.source,
+                       pricing_profile=excluded.pricing_profile,
+                       model_pattern=excluded.model_pattern,
+                       provider_type=excluded.provider_type,
+                       rate_kind=excluded.rate_kind,
+                       usage_class=excluded.usage_class,
+                       unit=excluded.unit,
+                       unit_price_nano_usd=excluded.unit_price_nano_usd,
+                       match_json=excluded.match_json,
+                       priority=excluded.priority,
+                       enabled=excluded.enabled,
+                       raw_json=excluded.raw_json,
+                       updated_at=excluded.updated_at",
+                    rows.join(", ")
+                ),
+                values,
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
         }
 
         txn.commit().await.map_err(|e| e.to_string())?;
+        let upserted = metadata_writes.len();
         Ok(ModelMetadataSyncResult {
             success: true,
             upserted,
@@ -882,28 +1081,34 @@ fn row_to_model_metadata(row: &sea_orm::QueryResult) -> Result<DbModelMetadataRe
 
     Ok(DbModelMetadataRecord {
         model_id: row.try_get("", "model_id").map_err(|e| e.to_string())?,
-        models_dev_provider: row.try_get("", "models_dev_provider").unwrap_or(None),
-        mode: row.try_get("", "mode").unwrap_or(None),
-        input_cost_per_token_nano: row.try_get("", "input_cost_per_token_nano").unwrap_or(None),
+        models_dev_provider: row
+            .try_get("", "models_dev_provider")
+            .map_err(|e| e.to_string())?,
+        mode: row.try_get("", "mode").map_err(|e| e.to_string())?,
+        input_cost_per_token_nano: row
+            .try_get("", "input_cost_per_token_nano")
+            .map_err(|e| e.to_string())?,
         output_cost_per_token_nano: row
             .try_get("", "output_cost_per_token_nano")
-            .unwrap_or(None),
+            .map_err(|e| e.to_string())?,
         cache_read_input_cost_per_token_nano: row
             .try_get("", "cache_read_input_cost_per_token_nano")
-            .unwrap_or(None),
+            .map_err(|e| e.to_string())?,
         cache_creation_input_cost_per_token_nano: row
             .try_get("", "cache_creation_input_cost_per_token_nano")
-            .unwrap_or(None),
+            .map_err(|e| e.to_string())?,
         output_cost_per_reasoning_token_nano: row
             .try_get("", "output_cost_per_reasoning_token_nano")
-            .unwrap_or(None),
-        max_input_tokens: row.try_get("", "max_input_tokens").unwrap_or(None),
-        max_output_tokens: row.try_get("", "max_output_tokens").unwrap_or(None),
-        max_tokens: row.try_get("", "max_tokens").unwrap_or(None),
+            .map_err(|e| e.to_string())?,
+        max_input_tokens: row
+            .try_get("", "max_input_tokens")
+            .map_err(|e| e.to_string())?,
+        max_output_tokens: row
+            .try_get("", "max_output_tokens")
+            .map_err(|e| e.to_string())?,
+        max_tokens: row.try_get("", "max_tokens").map_err(|e| e.to_string())?,
         raw_json,
-        source: row
-            .try_get("", "source")
-            .unwrap_or_else(|_| "models_dev".to_string()),
+        source: row.try_get("", "source").map_err(|e| e.to_string())?,
         updated_at,
     })
 }
@@ -913,15 +1118,18 @@ async fn get_model_metadata_with<C: ConnectionTrait>(
     conn: &C,
     model_id: &str,
 ) -> Result<Option<DbModelMetadataRecord>, String> {
+    let lock_suffix = if db.is_postgres() { " FOR UPDATE" } else { "" };
     let row = conn
         .query_one(db.stmt(
-            "SELECT model_id, models_dev_provider, mode, input_cost_per_token_nano,
+            &format!(
+                "SELECT model_id, models_dev_provider, mode, input_cost_per_token_nano,
                     output_cost_per_token_nano, cache_read_input_cost_per_token_nano,
                     cache_creation_input_cost_per_token_nano,
                     output_cost_per_reasoning_token_nano, max_input_tokens, max_output_tokens,
                     max_tokens, raw_json, source, updated_at
              FROM model_metadata_records
-             WHERE model_id = $1",
+             WHERE model_id = $1{lock_suffix}"
+            ),
             vec![model_id.into()],
         ))
         .await
@@ -963,64 +1171,28 @@ struct SyncProviderVariant {
     raw: Value,
 }
 
-async fn upsert_models_dev_billing_rates(
-    db: &DbPool,
-    txn: &DatabaseTransaction,
-    model_name: &str,
-    variant: &SyncProviderVariant,
-    updated_at: &str,
-) -> Result<(), String> {
-    for (usage_class, price) in [
-        ("input_uncached", variant.input_cost_nano.as_ref()),
-        ("output", variant.output_cost_nano.as_ref()),
-        ("cache_read", variant.cache_read_nano.as_ref()),
-        ("cache_write_5m", variant.cache_write_nano.as_ref()),
-        ("reasoning_output", variant.reasoning_nano.as_ref()),
-    ] {
-        let Some(price) = price else {
-            continue;
-        };
-        let id = format!(
-            "models_dev:{}:{}:{usage_class}",
-            variant.provider_id, model_name
-        );
-        txn.execute(db.stmt(
-            "INSERT INTO billing_rate_records
-             (id, source, pricing_profile, model_pattern, provider_type, rate_kind, usage_class,
-              unit, unit_price_nano_usd, match_json, priority, enabled, raw_json, updated_at)
-             VALUES ($1, 'models_dev', $2, $3, NULL, 'token', $4, 'token', $5, '{}', 0, 1, $6, $7)
-             ON CONFLICT(id) DO UPDATE SET
-               source = excluded.source,
-               pricing_profile = excluded.pricing_profile,
-               model_pattern = excluded.model_pattern,
-               rate_kind = excluded.rate_kind,
-               usage_class = excluded.usage_class,
-               unit = excluded.unit,
-               unit_price_nano_usd = excluded.unit_price_nano_usd,
-               match_json = excluded.match_json,
-               priority = excluded.priority,
-               enabled = excluded.enabled,
-               raw_json = excluded.raw_json,
-               updated_at = excluded.updated_at",
-            vec![
-                id.into(),
-                variant.provider_id.clone().into(),
-                model_name.to_string().into(),
-                usage_class.into(),
-                price.clone().into(),
-                serde_json::json!({
-                    "source": "models.dev",
-                    "models_dev_provider": variant.provider_id
-                })
-                .to_string()
-                .into(),
-                updated_at.to_string().into(),
-            ],
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+struct ModelsDevMetadataWrite {
+    model_name: String,
+    provider_id: String,
+    mode: &'static str,
+    input_cost_nano: Option<String>,
+    output_cost_nano: Option<String>,
+    cache_read_nano: Option<String>,
+    cache_write_nano: Option<String>,
+    reasoning_nano: Option<String>,
+    max_input_tokens: Option<i64>,
+    max_output_tokens: Option<i64>,
+    max_tokens: Option<i64>,
+    raw_json: String,
+}
+
+struct ModelsDevRateWrite {
+    id: String,
+    pricing_profile: String,
+    model_name: String,
+    usage_class: &'static str,
+    price: String,
+    raw_json: String,
 }
 
 async fn upsert_model_metadata_billing_rates(
@@ -1316,8 +1488,13 @@ pub fn normalize_model_id(raw: &str, provider_hint: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        cost_per_1m_to_nano_string, deserialize_nullable_field, models_dev_variant_for_dashboard,
+        ModelRegistryStore, UpsertModelMetadataInput, cost_per_1m_to_nano_string,
+        deserialize_nullable_field, models_dev_variant_for_dashboard,
     };
+    use crate::db::DbPool;
+    use crate::migration::Migrator;
+    use crate::monoize_routing::{CreateMonoizeProviderInput, MonoizeRoutingStore};
+    use sea_orm_migration::MigratorTrait;
     use serde::Deserialize;
     use serde_json::json;
 
@@ -1359,5 +1536,121 @@ mod tests {
         assert_eq!(omitted.value, None);
         assert_eq!(cleared.value, Some(None));
         assert_eq!(assigned.value, Some(Some("1001".to_string())));
+    }
+
+    #[tokio::test]
+    async fn marketplace_metadata_join_is_distinct_sorted_and_filters_routing_state() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let metadata_store = ModelRegistryStore::new(db.clone())
+            .await
+            .expect("metadata store creates");
+        let routing_store = MonoizeRoutingStore::new(db)
+            .await
+            .expect("routing store creates");
+
+        for model_id in [
+            "eligible-a",
+            "eligible-z",
+            "shared",
+            "disabled-channel",
+            "zero-weight",
+            "disabled-provider",
+            "metadata-only",
+        ] {
+            let input: UpsertModelMetadataInput =
+                serde_json::from_value(json!({})).expect("metadata input parses");
+            metadata_store
+                .upsert_model_metadata(model_id, input)
+                .await
+                .expect("metadata upserts");
+        }
+
+        let enabled: CreateMonoizeProviderInput = serde_json::from_value(json!({
+            "name": "enabled",
+            "channels": [
+                {
+                    "name": "active-a",
+                    "provider_type": "responses",
+                    "base_url": "https://example.com",
+                    "api_key": "secret-a",
+                    "models": {
+                        "eligible-z": { "redirect": null, "multiplier": "1" },
+                        "shared": { "redirect": null, "multiplier": "1" }
+                    }
+                },
+                {
+                    "name": "active-b",
+                    "provider_type": "responses",
+                    "base_url": "https://example.com",
+                    "api_key": "secret-b",
+                    "models": {
+                        "eligible-a": { "redirect": null, "multiplier": "1" },
+                        "shared": { "redirect": null, "multiplier": "1" }
+                    }
+                },
+                {
+                    "name": "disabled",
+                    "provider_type": "responses",
+                    "base_url": "https://example.com",
+                    "api_key": "secret-disabled",
+                    "enabled": false,
+                    "models": {
+                        "disabled-channel": { "redirect": null, "multiplier": "1" }
+                    }
+                },
+                {
+                    "name": "zero-weight",
+                    "provider_type": "responses",
+                    "base_url": "https://example.com",
+                    "api_key": "secret-zero",
+                    "weight": 0,
+                    "models": {
+                        "zero-weight": { "redirect": null, "multiplier": "1" }
+                    }
+                }
+            ]
+        }))
+        .expect("enabled provider input parses");
+        routing_store
+            .create_provider(enabled)
+            .await
+            .expect("enabled provider creates");
+
+        let disabled: CreateMonoizeProviderInput = serde_json::from_value(json!({
+            "name": "disabled provider",
+            "enabled": false,
+            "channels": [{
+                "name": "active channel",
+                "provider_type": "responses",
+                "base_url": "https://example.com",
+                "api_key": "secret-provider-disabled",
+                "models": {
+                    "disabled-provider": { "redirect": null, "multiplier": "1" }
+                }
+            }]
+        }))
+        .expect("disabled provider input parses");
+        routing_store
+            .create_provider(disabled)
+            .await
+            .expect("disabled provider creates");
+
+        let listed = metadata_store
+            .list_marketplace_model_metadata()
+            .await
+            .expect("marketplace metadata lists");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|record| record.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eligible-a", "eligible-z", "shared"]
+        );
     }
 }

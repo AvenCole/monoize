@@ -17,7 +17,10 @@ The Model Marketplace page presents all registered model metadata to logged-in d
 
 - Uses a dedicated `GET /api/dashboard/marketplace/models` endpoint (via the `useMarketplaceModels()` SWR hook).
 - This endpoint requires login (any role) but NOT admin.
-- Server-side: collects all model IDs from enabled monoize providers (same set as `/v1/models`), then returns `model_metadata_records` filtered to only those model IDs.
+- Server-side: returns metadata whose model ID is offered by at least one enabled Provider through an enabled Channel whose weight is greater than zero.
+- The endpoint MUST obtain the result through one set-based query that joins `model_metadata_records`, `monoize_channel_models`, `monoize_channels`, and `monoize_providers`.
+- The query MUST select only metadata columns, MUST use `DISTINCT`, and MUST order results by `model_id ASC`.
+- The endpoint MUST NOT hydrate Provider or Channel objects and MUST NOT return a Provider or Channel secret.
 - The page renders the filtered `ModelMetadataRecord[]` array.
 
 ## 4. UI Structure
@@ -86,7 +89,7 @@ When `filtered.length === 0`:
 
 1. The page MUST NOT expose any mutation controls (no create, edit, delete, sync buttons).
 2. The page MUST use `useMarketplaceModels()` from `@/lib/swr` — which calls `GET /api/dashboard/marketplace/models`.
-3. The backend endpoint MUST only return metadata for models present in at least one enabled provider.
+3. The backend endpoint MUST only return metadata for models present in at least one enabled Provider and at least one enabled Channel whose weight is greater than zero.
 4. The page MUST use `TableVirtuoso` with the same component override pattern as `model-metadata.tsx`.
 5. All user-visible strings MUST go through `t()` (i18next). Keys live under `modelMarketplace.*`.
 6. Navigation entry MUST appear in the common `navItems` array (visible to all roles).

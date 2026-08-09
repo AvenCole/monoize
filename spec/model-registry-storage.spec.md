@@ -85,12 +85,11 @@ CREATE INDEX IF NOT EXISTS idx_model_registry_enabled ON model_registry_records(
 
 ```rust
 pub struct ModelRegistryStore {
-    read_pool: Pool<Sqlite>,
-    write_pool: Pool<Sqlite>,
+    db: DbPool,
 }
 
 impl ModelRegistryStore {
-    pub async fn new(read_pool: Pool<Sqlite>, write_pool: Pool<Sqlite>) -> Result<Self, String>;
+    pub async fn new(db: DbPool) -> Result<Self, String>;
     pub async fn list_models(&self) -> Result<Vec<DbModelRecord>, String>;
     pub async fn get_model(&self, id: &str) -> Result<Option<DbModelRecord>, String>;
     pub async fn get_model_by_logical_and_provider(&self, logical_model: &str, provider_id: &str) -> Result<Option<DbModelRecord>, String>;
@@ -101,11 +100,16 @@ impl ModelRegistryStore {
 }
 ```
 
-Pool routing constraints:
+Connection routing constraints:
 
-1. Read-only methods (`list_models`, `list_enabled_models`, `get_model`, `get_model_by_logical_and_provider`, `find_by_logical_model`, `list_model_metadata`, `list_priced_model_ids`, `get_model_metadata`, `get_model_pricing`) MUST use `read_pool`.
-2. Mutating methods (`create_model`, `update_model`, `delete_model`, `upsert_model_metadata`, `delete_model_metadata`, `sync_from_models_dev`) MUST use `write_pool`.
-3. Schema creation and migration in `new(...)` MUST execute on `write_pool`.
+1. Read-only methods (`list_models`, `list_enabled_models`, `get_model`, `get_model_by_logical_and_provider`, `find_by_logical_model`, `list_model_metadata`, `list_priced_model_ids`, `get_model_metadata`, `get_model_pricing`) MUST use `DbPool::read()`.
+2. Mutating methods (`create_model`, `update_model`, `delete_model`, `upsert_model_metadata`, `delete_model_metadata`, `sync_from_models_dev`) MUST use `DbPool::write()` or `DbPool::begin_write()`.
+3. Schema creation and migration in `new(...)` MUST execute on the write connection.
+4. A partial model or model-metadata update MUST preserve fields omitted from that update at the database write boundary. Concurrent partial updates to distinct fields MUST NOT restore omitted fields from a stale pre-update snapshot on SQLite or PostgreSQL.
+5. `sync_from_models_dev` MUST read the set of protected manual model ids once per transaction. It MUST NOT issue a metadata lookup per synchronized model.
+6. `sync_from_models_dev` MUST write model metadata and generated billing-rate rows with set-based statements split into fixed-size chunks. The number of database round trips MAY grow by chunk count but MUST NOT grow by one round trip per model or per rate row.
+7. Every dynamic statement MUST remain below the portable SQLite bound-parameter limit. A PostgreSQL deployment MUST use the same chunking semantics.
+8. Model and model-metadata row decoding MUST propagate every database type error. Nullable fields MAY decode to null only when the stored value is SQL null; a type mismatch MUST NOT be replaced with null or a default source value.
 
 ### CreateModelInput
 
@@ -134,17 +138,9 @@ pub struct UpdateModelInput {
 }
 ```
 
-## Integration with ModelRegistry
+## Mutation read behavior
 
-The `ModelRegistry` struct maintains an in-memory cache of model records. It is initialized from enabled records in `model_registry_records` only.
-
-### Refresh Behavior
-
-When `ModelRegistry` is refreshed after startup or model mutations:
-
-1. Load all enabled records from `model_registry_records`.
-2. Replace the in-memory cache with exactly the loaded set.
-3. Serialize each model-record mutation through completion of steps 1 and 2. A snapshot loaded by an earlier mutation MUST NOT replace the snapshot published by a later mutation.
+After a create, update, or delete mutation, the dashboard handler MUST NOT load all enabled model records. The mutation response MAY read only the affected record.
 
 ## Dashboard API Endpoints
 
@@ -249,15 +245,14 @@ Delete a model registry record.
 **Errors:**
 - `404 Not Found`: Model does not exist
 
-## Side Effects
+## Runtime reads
 
-After any mutating operation (create, update, delete), the `ModelRegistry` in-memory cache should be refreshed to reflect the changes. This ensures that subsequent API requests use the updated model definitions.
+The database is the source of truth for model registry reads. The runtime MUST NOT maintain a cross-request full-table `ModelRegistry` mirror. A mutation response MAY perform a point read for the affected row; it MUST NOT refresh or rebuild all enabled model records.
 
 ## Invariants
 
 1. The combination of (logical_model, provider_id) must be unique across all records.
 2. All timestamps are stored in RFC3339 format.
 3. capabilities_json must be valid JSON parseable into ModelCapabilities.
-4. Active in-memory model registry content is exactly the set of enabled rows in `model_registry_records`.
-5. Disabled models (enabled=0) are excluded from the active model registry but remain in the database.
-6. When a mutating dashboard response returns, the active in-memory registry reflects that mutation and every model mutation that completed before it.
+4. Disabled models (`enabled = 0`) remain in the database and are excluded by methods whose contract is to list enabled models.
+5. A completed mutation is visible to every later database read on the same process.

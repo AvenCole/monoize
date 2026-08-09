@@ -1,12 +1,16 @@
 use crate::db::DbPool;
 use crate::exact_decimal::Multiplier;
+use crate::settings::{
+    PricingProfilePattern, default_pricing_profile_model_patterns, default_reasoning_suffix_map,
+};
 use crate::transforms::{TransformRuleConfig, canonicalize_transform_rules};
-use crate::users::{canonicalize_groups, parse_groups_json};
+use crate::users::canonicalize_groups;
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, QueryResult, Value as SeaValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +292,9 @@ pub struct MonoizeRuntimeConfig {
     pub active_probe_model: Option<String>,
     pub global_transforms: Vec<TransformRuleConfig>,
     pub global_model_redirects: Vec<crate::users::ModelRedirectRule>,
+    pub reasoning_suffix_map: HashMap<String, String>,
+    pub codex_model_ids: Vec<String>,
+    pub pricing_profile_model_patterns: Vec<PricingProfilePattern>,
     pub extra_fields_whitelist: HashMap<String, Vec<String>>,
     pub strip_cross_protocol_nested_extra: bool,
     pub request_capture_enabled: bool,
@@ -315,6 +322,9 @@ impl Default for MonoizeRuntimeConfig {
             active_probe_model: None,
             global_transforms: Vec::new(),
             global_model_redirects: Vec::new(),
+            reasoning_suffix_map: default_reasoning_suffix_map(),
+            codex_model_ids: Vec::new(),
+            pricing_profile_model_patterns: default_pricing_profile_model_patterns(),
             extra_fields_whitelist: HashMap::new(),
             strip_cross_protocol_nested_extra: true,
             request_capture_enabled: false,
@@ -327,12 +337,6 @@ impl Default for MonoizeRuntimeConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PassiveHealthSample {
-    pub at_ts: i64,
-    pub failed: bool,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ChannelHealthState {
     pub healthy: bool,
@@ -340,7 +344,7 @@ pub struct ChannelHealthState {
     pub cooldown_until: Option<i64>,
     pub probe_success_count: u32,
     pub last_probe_at: Option<i64>,
-    pub passive_samples: VecDeque<PassiveHealthSample>,
+    pub passive_failure_timestamps: VecDeque<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -348,10 +352,157 @@ pub struct ChannelAffinityBinding {
     pub provider_id: String,
     pub channel_id: String,
     pub bound_at: i64,
-    pub updated_at: i64,
+    pub last_used_at: i64,
+    pub expires_at: i64,
 }
 
-pub const CHANNEL_AFFINITY_MAX_ENTRIES: usize = 4096;
+pub const DEFAULT_CHANNEL_AFFINITY_MAX_ENTRIES: usize = 4096;
+pub const DEFAULT_CHANNEL_AFFINITY_CLEANUP_INTERVAL_SECONDS: u64 = 60;
+pub const DEFAULT_CHANNEL_HEALTH_MAX_ENTRIES: usize = 10_000;
+pub const DEFAULT_CHANNEL_PASSIVE_FAILURE_SAMPLE_MAX_ENTRIES: usize = 1024;
+pub const DEFAULT_DASHBOARD_GROUP_SCAN_BATCH_ROWS: usize = 400;
+pub const DEFAULT_PROVIDER_REORDER_MAX_IDS: usize = 199;
+const TRANSFORM_MIGRATION_BATCH_SIZE: usize = 199;
+const TRANSFORM_MIGRATION_MARKER: &str = "migration.provider_transform_rule_ids.v1";
+
+fn parse_positive_entry_limit(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_provider_reorder_limit(raw: Option<&str>) -> usize {
+    parse_positive_entry_limit(raw, DEFAULT_PROVIDER_REORDER_MAX_IDS)
+        .min(DEFAULT_PROVIDER_REORDER_MAX_IDS)
+}
+
+fn provider_reorder_max_ids() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_provider_reorder_limit(
+            std::env::var("MONOIZE_PROVIDER_REORDER_MAX_IDS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+pub fn channel_affinity_max_entries() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_positive_entry_limit(
+            std::env::var("MONOIZE_CHANNEL_AFFINITY_MAX_ENTRIES")
+                .ok()
+                .as_deref(),
+            DEFAULT_CHANNEL_AFFINITY_MAX_ENTRIES,
+        )
+    })
+}
+
+pub fn channel_affinity_cleanup_interval() -> Duration {
+    static INTERVAL: OnceLock<Duration> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        parse_channel_affinity_cleanup_interval(
+            std::env::var("MONOIZE_CHANNEL_AFFINITY_CLEANUP_INTERVAL_SECONDS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_channel_affinity_cleanup_interval(raw: Option<&str>) -> Duration {
+    let seconds = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CHANNEL_AFFINITY_CLEANUP_INTERVAL_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+pub fn cleanup_channel_affinity(
+    cache: &mut HashMap<String, ChannelAffinityBinding>,
+    now_ts: i64,
+) -> usize {
+    let previous_len = cache.len();
+    cache.retain(|_, binding| now_ts < binding.expires_at);
+    previous_len - cache.len()
+}
+
+pub fn channel_health_max_entries() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_positive_entry_limit(
+            std::env::var("MONOIZE_CHANNEL_HEALTH_MAX_ENTRIES")
+                .ok()
+                .as_deref(),
+            DEFAULT_CHANNEL_HEALTH_MAX_ENTRIES,
+        )
+    })
+}
+
+fn dashboard_group_scan_batch_rows() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_positive_entry_limit(
+            std::env::var("MONOIZE_DASHBOARD_GROUP_SCAN_BATCH_ROWS")
+                .ok()
+                .as_deref(),
+            DEFAULT_DASHBOARD_GROUP_SCAN_BATCH_ROWS,
+        )
+    })
+}
+
+pub fn channel_passive_failure_sample_max_entries() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_positive_entry_limit(
+            std::env::var("MONOIZE_CHANNEL_PASSIVE_FAILURE_SAMPLE_MAX_ENTRIES")
+                .ok()
+                .as_deref(),
+            DEFAULT_CHANNEL_PASSIVE_FAILURE_SAMPLE_MAX_ENTRIES,
+        )
+    })
+}
+
+pub fn effective_passive_failure_threshold(resolved_threshold: u32) -> usize {
+    effective_passive_failure_threshold_with_limit(
+        resolved_threshold,
+        channel_passive_failure_sample_max_entries(),
+    )
+}
+
+fn effective_passive_failure_threshold_with_limit(resolved_threshold: u32, limit: usize) -> usize {
+    (resolved_threshold.max(1) as usize).min(limit.max(1))
+}
+
+pub fn prepare_channel_health_insert(
+    health: &mut HashMap<String, ChannelHealthState>,
+    key: &str,
+) -> bool {
+    prepare_channel_health_insert_with_limit(health, key, channel_health_max_entries())
+}
+
+fn prepare_channel_health_insert_with_limit(
+    health: &mut HashMap<String, ChannelHealthState>,
+    key: &str,
+    limit: usize,
+) -> bool {
+    health.contains_key(key) || health.len() < limit
+}
+
+pub fn missing_channel_health_is_saturated(
+    health: &HashMap<String, ChannelHealthState>,
+    key: &str,
+) -> bool {
+    missing_channel_health_is_saturated_with_limit(health, key, channel_health_max_entries())
+}
+
+fn missing_channel_health_is_saturated_with_limit(
+    health: &HashMap<String, ChannelHealthState>,
+    key: &str,
+    limit: usize,
+) -> bool {
+    !health.contains_key(key) && health.len() >= limit
+}
 
 impl ChannelHealthState {
     pub fn new() -> Self {
@@ -361,7 +512,7 @@ impl ChannelHealthState {
             cooldown_until: None,
             probe_success_count: 0,
             last_probe_at: None,
-            passive_samples: VecDeque::new(),
+            passive_failure_timestamps: VecDeque::new(),
         }
     }
 
@@ -395,12 +546,47 @@ fn default_channel_weight() -> i32 {
     1
 }
 
-fn parse_provider_groups_json(raw: &str) -> Vec<String> {
-    parse_groups_json(raw)
+fn decode_provider_groups_json(
+    provider_id: &str,
+    raw: Option<String>,
+) -> Result<Vec<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let groups = serde_json::from_str::<Vec<String>>(&raw)
+        .map_err(|error| format!("provider {provider_id} invalid groups JSON: {error}"))?;
+    Ok(canonicalize_groups(&groups))
 }
 
 fn serialize_provider_groups_json(groups: &[String]) -> Result<String, String> {
     serde_json::to_string(&canonicalize_groups(groups)).map_err(|e| e.to_string())
+}
+
+fn decode_database_bool(
+    entity: &str,
+    entity_id: &str,
+    field: &str,
+    value: i32,
+) -> Result<bool, String> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(format!(
+            "{entity} {entity_id} invalid {field} boolean: expected 0 or 1, got {value}"
+        )),
+    }
+}
+
+fn extend_dashboard_group_labels(
+    groups: &mut std::collections::BTreeSet<String>,
+    raw: Option<&str>,
+) {
+    if let Some(raw) = raw {
+        groups.extend(crate::users::parse_groups_json(raw));
+    }
 }
 
 fn generate_short_id() -> String {
@@ -411,6 +597,281 @@ fn generate_short_id() -> String {
         .collect()
 }
 
+fn decode_channel_model_row(row: &QueryResult, model: &str) -> Result<MonoizeChannel, String> {
+    let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+    let multiplier = row
+        .try_get::<String>("", "multiplier")
+        .map_err(|e| e.to_string())?
+        .parse()
+        .map_err(|e: String| format!("channel {id} invalid multiplier: {e}"))?;
+    let models = HashMap::from([(
+        model.to_string(),
+        MonoizeModelEntry {
+            redirect: row.try_get("", "redirect").map_err(|e| e.to_string())?,
+            multiplier,
+        },
+    )]);
+    decode_channel_row(row, models)
+}
+
+fn decode_channel_row(
+    row: &QueryResult,
+    models: HashMap<String, MonoizeModelEntry>,
+) -> Result<MonoizeChannel, String> {
+    let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+    let provider_type_raw: String = row
+        .try_get("", "provider_type")
+        .map_err(|e| format!("channel {id} missing provider_type: {e}"))?;
+    let provider_type = MonoizeProviderType::from_str(&provider_type_raw)
+        .ok_or_else(|| format!("channel {id} invalid provider type: {provider_type_raw}"))?;
+    Ok(MonoizeChannel {
+        id: id.clone(),
+        name: row.try_get("", "name").map_err(|e| e.to_string())?,
+        provider_type,
+        base_url: row.try_get("", "base_url").map_err(|e| e.to_string())?,
+        api_key: row.try_get("", "api_key").map_err(|e| e.to_string())?,
+        weight: row.try_get("", "weight").map_err(|e| e.to_string())?,
+        enabled: decode_database_bool(
+            "channel",
+            &id,
+            "enabled",
+            row.try_get::<i32>("", "enabled")
+                .map_err(|e| e.to_string())?,
+        )?,
+        passive_failure_count_threshold_override: row
+            .try_get::<Option<i32>>("", "passive_failure_count_threshold_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                decode_positive_u32(
+                    &id,
+                    "passive_failure_count_threshold_override",
+                    i64::from(value),
+                )
+            })
+            .transpose()?,
+        passive_cooldown_seconds_override: row
+            .try_get::<Option<i32>>("", "passive_cooldown_seconds_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                decode_positive_u64(&id, "passive_cooldown_seconds_override", i64::from(value))
+            })
+            .transpose()?,
+        passive_window_seconds_override: row
+            .try_get::<Option<i32>>("", "passive_window_seconds_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                decode_positive_u64(&id, "passive_window_seconds_override", i64::from(value))
+            })
+            .transpose()?,
+        passive_rate_limit_cooldown_seconds_override: row
+            .try_get::<Option<i32>>("", "passive_rate_limit_cooldown_seconds_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                decode_positive_u64(
+                    &id,
+                    "passive_rate_limit_cooldown_seconds_override",
+                    i64::from(value),
+                )
+            })
+            .transpose()?,
+        models,
+        active_probe_enabled_override: row
+            .try_get::<Option<i32>>("", "active_probe_enabled_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                decode_database_bool("channel", &id, "active_probe_enabled_override", value)
+            })
+            .transpose()?,
+        active_probe_interval_seconds_override: row
+            .try_get::<Option<i32>>("", "active_probe_interval_seconds_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                decode_positive_u64(
+                    &id,
+                    "active_probe_interval_seconds_override",
+                    i64::from(value),
+                )
+            })
+            .transpose()?,
+        active_probe_success_threshold_override: row
+            .try_get::<Option<i32>>("", "active_probe_success_threshold_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                decode_positive_u32(
+                    &id,
+                    "active_probe_success_threshold_override",
+                    i64::from(value),
+                )
+            })
+            .transpose()?,
+        active_probe_model_override: row
+            .try_get("", "active_probe_model_override")
+            .map_err(|e| e.to_string())?,
+        affinity_enabled_override: row
+            .try_get::<Option<i32>>("", "affinity_enabled_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| decode_database_bool("channel", &id, "affinity_enabled_override", value))
+            .transpose()?,
+        affinity_idle_ttl_seconds_override: row
+            .try_get::<Option<i32>>("", "affinity_idle_ttl_seconds_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                decode_positive_u64(&id, "affinity_idle_ttl_seconds_override", i64::from(value))
+            })
+            .transpose()?,
+        affinity_failback_mode_override: row
+            .try_get::<Option<String>>("", "affinity_failback_mode_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                AffinityFailbackMode::from_str(&value).ok_or_else(|| {
+                    format!("channel {id} invalid affinity_failback_mode_override: {value}")
+                })
+            })
+            .transpose()?,
+        affinity_failback_delay_seconds_override: row
+            .try_get::<Option<i32>>("", "affinity_failback_delay_seconds_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                decode_nonnegative_u64(
+                    &id,
+                    "affinity_failback_delay_seconds_override",
+                    i64::from(value),
+                )
+            })
+            .transpose()?,
+        _healthy: None,
+        _last_success_at: None,
+        _health_status: None,
+    })
+}
+
+fn decode_provider_row(
+    row: &QueryResult,
+    channels: Vec<MonoizeChannel>,
+) -> Result<MonoizeProvider, String> {
+    let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+    let mut transforms: Vec<TransformRuleConfig> = serde_json::from_str(
+        &row.try_get::<String>("", "transforms")
+            .map_err(|e| format!("provider {id} missing transforms column: {e}"))?,
+    )
+    .map_err(|e| format!("provider {id} invalid transforms JSON: {e}"))?;
+    canonicalize_transform_rules(&mut transforms);
+    let api_type_overrides: Vec<ApiTypeOverride> = serde_json::from_str(
+        &row.try_get::<String>("", "api_type_overrides")
+            .map_err(|e| format!("provider {id} missing api_type_overrides column: {e}"))?,
+    )
+    .map_err(|e| format!("provider {id} invalid api_type_overrides JSON: {e}"))?;
+    let created_at = DateTime::parse_from_rfc3339(
+        &row.try_get::<String>("", "created_at")
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("provider {id} invalid created_at RFC3339: {e}"))?
+    .with_timezone(&Utc);
+    let updated_at = DateTime::parse_from_rfc3339(
+        &row.try_get::<String>("", "updated_at")
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("provider {id} invalid updated_at RFC3339: {e}"))?
+    .with_timezone(&Utc);
+    Ok(MonoizeProvider {
+        id: id.clone(),
+        name: row.try_get("", "name").map_err(|e| e.to_string())?,
+        channels,
+        max_retries: row.try_get("", "max_retries").map_err(|e| e.to_string())?,
+        channel_max_retries: row
+            .try_get("", "channel_max_retries")
+            .map_err(|e| e.to_string())?,
+        channel_retry_interval_ms: row
+            .try_get("", "channel_retry_interval_ms")
+            .map_err(|e| e.to_string())?,
+        circuit_breaker_enabled: decode_database_bool(
+            "provider",
+            &id,
+            "circuit_breaker_enabled",
+            row.try_get::<i32>("", "circuit_breaker_enabled")
+                .map_err(|e| e.to_string())?,
+        )?,
+        per_model_circuit_break: decode_database_bool(
+            "provider",
+            &id,
+            "per_model_circuit_break",
+            row.try_get::<i32>("", "per_model_circuit_break")
+                .map_err(|e| e.to_string())?,
+        )?,
+        transforms,
+        api_type_overrides,
+        active_probe_enabled_override: row
+            .try_get::<Option<i32>>("", "active_probe_enabled_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                decode_database_bool("provider", &id, "active_probe_enabled_override", value)
+            })
+            .transpose()?,
+        active_probe_interval_seconds_override: row
+            .try_get::<Option<i32>>("", "active_probe_interval_seconds_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                decode_positive_u64(
+                    &id,
+                    "active_probe_interval_seconds_override",
+                    i64::from(value),
+                )
+            })
+            .transpose()?,
+        active_probe_success_threshold_override: row
+            .try_get::<Option<i32>>("", "active_probe_success_threshold_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| {
+                decode_positive_u32(
+                    &id,
+                    "active_probe_success_threshold_override",
+                    i64::from(value),
+                )
+            })
+            .transpose()?,
+        active_probe_model_override: row
+            .try_get("", "active_probe_model_override")
+            .map_err(|e| e.to_string())?,
+        request_timeout_ms_override: row
+            .try_get::<Option<i32>>("", "request_timeout_ms_override")
+            .map_err(|e| e.to_string())?
+            .map(|value| decode_positive_u64(&id, "request_timeout_ms_override", i64::from(value)))
+            .transpose()?,
+        extra_fields_whitelist: row
+            .try_get::<Option<String>>("", "extra_fields_whitelist")
+            .map_err(|e| format!("provider {id} invalid extra_fields_whitelist column: {e}"))?
+            .map(|raw| {
+                serde_json::from_str::<Vec<String>>(&raw)
+                    .map_err(|e| format!("provider {id} invalid extra_fields_whitelist JSON: {e}"))
+            })
+            .transpose()?,
+        strip_cross_protocol_nested_extra: row
+            .try_get::<Option<i32>>("", "strip_cross_protocol_nested_extra")
+            .map_err(|e| {
+                format!("provider {id} invalid strip_cross_protocol_nested_extra column: {e}")
+            })?
+            .map(|value| {
+                decode_database_bool("provider", &id, "strip_cross_protocol_nested_extra", value)
+            })
+            .transpose()?,
+        groups: decode_provider_groups_json(
+            &id,
+            row.try_get::<Option<String>>("", "groups")
+                .map_err(|e| format!("provider {id} invalid groups column: {e}"))?,
+        )?,
+        enabled: decode_database_bool(
+            "provider",
+            &id,
+            "enabled",
+            row.try_get::<i32>("", "enabled")
+                .map_err(|e| e.to_string())?,
+        )?,
+        priority: row.try_get("", "priority").map_err(|e| e.to_string())?,
+        created_at,
+        updated_at,
+    })
+}
+
 impl MonoizeRoutingStore {
     pub async fn new(db: DbPool) -> Result<Self, String> {
         let store = Self { db };
@@ -419,40 +880,119 @@ impl MonoizeRoutingStore {
     }
 
     async fn migrate_transform_rule_ids(&self) -> Result<(), String> {
-        let rows = self
+        let marker = self
             .db
             .read()
-            .query_all(
-                self.db
-                    .stmt("SELECT id, transforms FROM monoize_providers", vec![]),
-            )
+            .query_one(self.db.stmt(
+                "SELECT value FROM system_settings WHERE key = $1",
+                vec![TRANSFORM_MIGRATION_MARKER.into()],
+            ))
             .await
             .map_err(|e| e.to_string())?;
+        let marker_value = marker
+            .map(|row| {
+                row.try_get::<String>("", "value")
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()?;
+        if marker_value.as_deref() == Some("complete") {
+            return Ok(());
+        }
 
-        for row in rows {
-            let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
-            let raw: String = row
-                .try_get("", "transforms")
-                .unwrap_or_else(|_| "[]".to_string());
-            let Ok(mut transforms) = serde_json::from_str::<Vec<TransformRuleConfig>>(&raw) else {
-                tracing::warn!(provider_id = %id, "skip invalid provider transforms during transform id migration");
-                continue;
+        let mut last_id: Option<String> = None;
+        loop {
+            let tx = self.db.begin_write().await.map_err(|e| e.to_string())?;
+            let (sql, values) = match last_id.as_deref() {
+                Some(last_id) => (
+                    format!(
+                        "SELECT id, transforms FROM monoize_providers
+                         WHERE id > $1 ORDER BY id ASC LIMIT {TRANSFORM_MIGRATION_BATCH_SIZE}"
+                    ),
+                    vec![last_id.into()],
+                ),
+                None => (
+                    format!(
+                        "SELECT id, transforms FROM monoize_providers
+                         ORDER BY id ASC LIMIT {TRANSFORM_MIGRATION_BATCH_SIZE}"
+                    ),
+                    vec![],
+                ),
             };
-            if !canonicalize_transform_rules(&mut transforms) {
-                continue;
-            }
-            let encoded = serde_json::to_string(&transforms).map_err(|e| e.to_string())?;
-            self.db
-                .write()
+            let rows = tx
+                .query_all(self.db.stmt(&sql, values))
                 .await
-                .execute(self.db.stmt(
-                    "UPDATE monoize_providers SET transforms = $1 WHERE id = $2",
-                    vec![encoded.into(), id.into()],
+                .map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                tx.commit().await.map_err(|e| e.to_string())?;
+                break;
+            }
+            let batch_len = rows.len();
+            let next_last_id: String = rows
+                .last()
+                .expect("non-empty transform migration batch")
+                .try_get("", "id")
+                .map_err(|e| e.to_string())?;
+            let mut updates = Vec::with_capacity(batch_len);
+            for row in rows {
+                let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+                let raw: String = row.try_get("", "transforms").map_err(|e| e.to_string())?;
+                let Ok(mut transforms) = serde_json::from_str::<Vec<TransformRuleConfig>>(&raw)
+                else {
+                    tracing::warn!(provider_id = %id, "skip invalid provider transforms during transform id migration");
+                    continue;
+                };
+                if !canonicalize_transform_rules(&mut transforms) {
+                    continue;
+                }
+                let encoded = serde_json::to_string(&transforms).map_err(|e| e.to_string())?;
+                updates.push((id, encoded));
+            }
+
+            if !updates.is_empty() {
+                let mut values: Vec<sea_orm::Value> = Vec::with_capacity(updates.len() * 2);
+                let mut cases = Vec::with_capacity(updates.len());
+                let mut ids = Vec::with_capacity(updates.len());
+                for (id, transforms) in &updates {
+                    let id_index = values.len() + 1;
+                    values.push(id.clone().into());
+                    ids.push(format!("${id_index}"));
+                    let transforms_index = values.len() + 1;
+                    values.push(transforms.clone().into());
+                    cases.push(format!("WHEN ${id_index} THEN ${transforms_index}"));
+                }
+                tx.execute(self.db.stmt(
+                    &format!(
+                        "UPDATE monoize_providers
+                         SET transforms = CASE id {} ELSE transforms END
+                         WHERE id IN ({})",
+                        cases.join(" "),
+                        ids.join(", ")
+                    ),
+                    values,
                 ))
                 .await
                 .map_err(|e| e.to_string())?;
+            }
+            tx.commit().await.map_err(|e| e.to_string())?;
+            last_id = Some(next_last_id);
+            if batch_len < TRANSFORM_MIGRATION_BATCH_SIZE {
+                break;
+            }
         }
-        Ok(())
+
+        let tx = self.db.begin_write().await.map_err(|e| e.to_string())?;
+        tx.execute(self.db.stmt(
+            "INSERT INTO system_settings (key, value, updated_at) VALUES ($1, $2, $3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            vec![
+                TRANSFORM_MIGRATION_MARKER.into(),
+                "complete".into(),
+                Utc::now().to_rfc3339().into(),
+            ],
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())
     }
 
     pub async fn provider_count(&self) -> Result<i64, String> {
@@ -469,6 +1009,94 @@ impl MonoizeRoutingStore {
         row.try_get("", "cnt").map_err(|e| e.to_string())
     }
 
+    async fn load_channels_bulk(
+        &self,
+        provider_id: Option<&str>,
+    ) -> Result<HashMap<String, Vec<MonoizeChannel>>, String> {
+        let provider_filter = if provider_id.is_some() {
+            " WHERE provider_id = $1"
+        } else {
+            ""
+        };
+        let values = provider_id.map(|id| vec![id.into()]).unwrap_or_default();
+        let channel_rows = self
+            .db
+            .read()
+            .query_all(self.db.stmt(
+                &format!(
+                    "SELECT id, provider_id, name, base_url, api_key, weight, enabled,
+                            provider_type, passive_failure_count_threshold_override,
+                            passive_cooldown_seconds_override, passive_window_seconds_override,
+                            passive_rate_limit_cooldown_seconds_override,
+                            active_probe_enabled_override, active_probe_interval_seconds_override,
+                            active_probe_success_threshold_override, active_probe_model_override,
+                            affinity_enabled_override, affinity_idle_ttl_seconds_override,
+                            affinity_failback_mode_override, affinity_failback_delay_seconds_override
+                     FROM monoize_channels{provider_filter}
+                     ORDER BY created_at ASC"
+                ),
+                values,
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let (model_sql, model_values) = if let Some(provider_id) = provider_id {
+            (
+                "SELECT cm.channel_id, cm.model_name, cm.redirect, cm.multiplier
+                 FROM monoize_channel_models cm
+                 JOIN monoize_channels c ON c.id = cm.channel_id
+                 WHERE c.provider_id = $1
+                 ORDER BY cm.channel_id ASC, cm.model_name ASC",
+                vec![provider_id.into()],
+            )
+        } else {
+            (
+                "SELECT channel_id, model_name, redirect, multiplier
+                 FROM monoize_channel_models
+                 ORDER BY channel_id ASC, model_name ASC",
+                vec![],
+            )
+        };
+        let model_rows = self
+            .db
+            .read()
+            .query_all(self.db.stmt(model_sql, model_values))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut models_by_channel: HashMap<String, HashMap<String, MonoizeModelEntry>> =
+            HashMap::new();
+        for row in model_rows {
+            let channel_id: String = row.try_get("", "channel_id").map_err(|e| e.to_string())?;
+            let model_name: String = row.try_get("", "model_name").map_err(|e| e.to_string())?;
+            let multiplier = row
+                .try_get::<String>("", "multiplier")
+                .map_err(|e| e.to_string())?
+                .parse()
+                .map_err(|e: String| format!("channel {channel_id} invalid multiplier: {e}"))?;
+            models_by_channel.entry(channel_id).or_default().insert(
+                model_name,
+                MonoizeModelEntry {
+                    redirect: row.try_get("", "redirect").map_err(|e| e.to_string())?,
+                    multiplier,
+                },
+            );
+        }
+
+        let mut channels_by_provider: HashMap<String, Vec<MonoizeChannel>> = HashMap::new();
+        for row in channel_rows {
+            let provider_id: String = row.try_get("", "provider_id").map_err(|e| e.to_string())?;
+            let channel_id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+            channels_by_provider
+                .entry(provider_id)
+                .or_default()
+                .push(decode_channel_row(
+                    &row,
+                    models_by_channel.remove(&channel_id).unwrap_or_default(),
+                )?);
+        }
+        Ok(channels_by_provider)
+    }
+
     pub async fn list_providers(&self) -> Result<Vec<MonoizeProvider>, String> {
         let rows = self
             .db
@@ -479,7 +1107,8 @@ impl MonoizeRoutingStore {
                           per_model_circuit_break, transforms, api_type_overrides,
                           active_probe_enabled_override, active_probe_interval_seconds_override,
                           active_probe_success_threshold_override, active_probe_model_override,
-                          request_timeout_ms_override, extra_fields_whitelist, groups,
+                          request_timeout_ms_override, extra_fields_whitelist,
+                          strip_cross_protocol_nested_extra, groups,
                           enabled, priority, created_at, updated_at
                    FROM monoize_providers
                    ORDER BY priority ASC, created_at ASC"#,
@@ -488,24 +1117,289 @@ impl MonoizeRoutingStore {
             .await
             .map_err(|e| e.to_string())?;
 
-        let mut providers = Vec::new();
-        for row in &rows {
-            providers.push(self.row_to_provider(row).await?);
-        }
-        Ok(providers)
+        let mut channels_by_provider = self.load_channels_bulk(None).await?;
+        rows.iter()
+            .map(|row| {
+                let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+                decode_provider_row(row, channels_by_provider.remove(&id).unwrap_or_default())
+            })
+            .collect()
     }
 
-    pub async fn list_all_provider_groups_json(&self) -> Result<Vec<String>, String> {
+    pub async fn available_model_names(
+        &self,
+        candidates: &[String],
+    ) -> Result<HashSet<String>, String> {
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let candidates = candidates
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut available = HashSet::new();
+        const LOOKUP_CHUNK_SIZE: usize = 400;
+        for chunk in candidates.chunks(LOOKUP_CHUNK_SIZE) {
+            let placeholders = (0..chunk.len())
+                .map(|index| format!("${}", index + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rows = self
+                .db
+                .read()
+                .query_all(self.db.stmt(
+                    &format!(
+                        "SELECT DISTINCT cm.model_name
+                         FROM monoize_channel_models cm
+                         JOIN monoize_channels c ON c.id = cm.channel_id
+                         JOIN monoize_providers p ON p.id = c.provider_id
+                         WHERE p.enabled = 1
+                           AND c.enabled = 1
+                           AND c.weight > 0
+                           AND cm.model_name IN ({placeholders})"
+                    ),
+                    chunk.iter().cloned().map(Into::into).collect(),
+                ))
+                .await
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                available.insert(row.try_get("", "model_name").map_err(|e| e.to_string())?);
+            }
+        }
+        Ok(available)
+    }
+
+    pub async fn list_available_model_names(&self) -> Result<Vec<String>, String> {
         let rows = self
             .db
             .read()
-            .query_all(self.db.stmt("SELECT groups FROM monoize_providers", vec![]))
+            .query_all(self.db.stmt(
+                "SELECT DISTINCT cm.model_name
+                 FROM monoize_channel_models cm
+                 JOIN monoize_channels c ON c.id = cm.channel_id
+                 JOIN monoize_providers p ON p.id = c.provider_id
+                 WHERE p.enabled = 1 AND c.enabled = 1 AND c.weight > 0
+                 ORDER BY cm.model_name ASC",
+                vec![],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        rows.into_iter()
+            .map(|row| row.try_get("", "model_name").map_err(|e| e.to_string()))
+            .collect()
+    }
+
+    pub async fn list_providers_for_model(
+        &self,
+        model: &str,
+    ) -> Result<Vec<MonoizeProvider>, String> {
+        let provider_rows = self
+            .db
+            .read()
+            .query_all(self.db.stmt(
+                r#"SELECT DISTINCT p.id, p.name, p.max_retries, p.channel_max_retries,
+                          p.channel_retry_interval_ms, p.circuit_breaker_enabled,
+                          p.per_model_circuit_break, p.transforms, p.api_type_overrides,
+                          p.active_probe_enabled_override, p.active_probe_interval_seconds_override,
+                          p.active_probe_success_threshold_override, p.active_probe_model_override,
+                          p.request_timeout_ms_override, p.extra_fields_whitelist,
+                          p.strip_cross_protocol_nested_extra, p.groups,
+                          p.enabled, p.priority, p.created_at, p.updated_at
+                   FROM monoize_providers p
+                   JOIN monoize_channels c ON c.provider_id = p.id
+                   JOIN monoize_channel_models cm ON cm.channel_id = c.id
+                   WHERE cm.model_name = $1
+                     AND p.enabled = 1
+                     AND c.enabled = 1
+                     AND c.weight > 0
+                   ORDER BY p.priority ASC, p.created_at ASC"#,
+                vec![model.into()],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        if provider_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let channel_rows = self
+            .db
+            .read()
+            .query_all(self.db.stmt(
+                r#"SELECT c.id, c.provider_id, c.name, c.base_url, c.api_key, c.weight, c.enabled,
+                          c.provider_type, c.passive_failure_count_threshold_override,
+                          c.passive_cooldown_seconds_override, c.passive_window_seconds_override,
+                          c.passive_rate_limit_cooldown_seconds_override,
+                          c.active_probe_enabled_override, c.active_probe_interval_seconds_override,
+                          c.active_probe_success_threshold_override, c.active_probe_model_override,
+                          c.affinity_enabled_override, c.affinity_idle_ttl_seconds_override,
+                          c.affinity_failback_mode_override, c.affinity_failback_delay_seconds_override,
+                          cm.redirect, cm.multiplier
+                   FROM monoize_channels c
+                   JOIN monoize_providers p ON p.id = c.provider_id
+                   JOIN monoize_channel_models cm ON cm.channel_id = c.id
+                   WHERE cm.model_name = $1
+                     AND p.enabled = 1
+                     AND c.enabled = 1
+                     AND c.weight > 0
+                   ORDER BY c.created_at ASC"#,
+                vec![model.into()],
+            ))
             .await
             .map_err(|e| e.to_string())?;
 
-        rows.into_iter()
-            .map(|row| row.try_get("", "groups").map_err(|e| e.to_string()))
+        let mut channels_by_provider: HashMap<String, Vec<MonoizeChannel>> = HashMap::new();
+        for row in channel_rows {
+            let provider_id: String = row.try_get("", "provider_id").map_err(|e| e.to_string())?;
+            channels_by_provider
+                .entry(provider_id)
+                .or_default()
+                .push(decode_channel_model_row(&row, model)?);
+        }
+        provider_rows
+            .iter()
+            .map(|row| {
+                let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+                decode_provider_row(row, channels_by_provider.remove(&id).unwrap_or_default())
+            })
             .collect()
+    }
+
+    pub async fn list_active_probe_candidates(&self) -> Result<Vec<MonoizeProvider>, String> {
+        let provider_rows = self
+            .db
+            .read()
+            .query_all(self.db.stmt(
+                r#"SELECT id, name, max_retries, channel_max_retries,
+                          channel_retry_interval_ms, circuit_breaker_enabled,
+                          per_model_circuit_break, transforms, api_type_overrides,
+                          active_probe_enabled_override, active_probe_interval_seconds_override,
+                          active_probe_success_threshold_override, active_probe_model_override,
+                          request_timeout_ms_override, extra_fields_whitelist,
+                          strip_cross_protocol_nested_extra, groups,
+                          enabled, priority, created_at, updated_at
+                   FROM monoize_providers
+                   WHERE circuit_breaker_enabled = 1
+                     AND enabled = 1
+                     AND EXISTS (
+                         SELECT 1
+                         FROM monoize_channels c
+                         WHERE c.provider_id = monoize_providers.id
+                           AND c.enabled = 1
+                           AND c.weight > 0
+                     )
+                   ORDER BY priority ASC, created_at ASC"#,
+                vec![],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        if provider_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let channel_model_rows = self
+            .db
+            .read()
+            .query_all(self.db.stmt(
+                r#"SELECT c.id, c.provider_id, c.name, c.base_url, c.api_key, c.weight, c.enabled,
+                          c.provider_type, c.passive_failure_count_threshold_override,
+                          c.passive_cooldown_seconds_override, c.passive_window_seconds_override,
+                          c.passive_rate_limit_cooldown_seconds_override,
+                          c.active_probe_enabled_override, c.active_probe_interval_seconds_override,
+                          c.active_probe_success_threshold_override, c.active_probe_model_override,
+                          c.affinity_enabled_override, c.affinity_idle_ttl_seconds_override,
+                          c.affinity_failback_mode_override, c.affinity_failback_delay_seconds_override,
+                          cm.model_name, cm.redirect, cm.multiplier
+                   FROM monoize_channels c
+                   JOIN monoize_providers p ON p.id = c.provider_id
+                   JOIN monoize_channel_models cm ON cm.channel_id = c.id
+                   WHERE p.circuit_breaker_enabled = 1
+                     AND p.enabled = 1
+                     AND c.enabled = 1
+                     AND c.weight > 0
+                   ORDER BY c.created_at ASC, cm.model_name ASC"#,
+                vec![],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut channels_by_provider: HashMap<String, Vec<MonoizeChannel>> = HashMap::new();
+        let mut channel_positions: HashMap<(String, String), usize> = HashMap::new();
+        for row in channel_model_rows {
+            let provider_id: String = row.try_get("", "provider_id").map_err(|e| e.to_string())?;
+            let channel_id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+            let model_name: String = row.try_get("", "model_name").map_err(|e| e.to_string())?;
+            let channels = channels_by_provider.entry(provider_id.clone()).or_default();
+            if let Some(index) = channel_positions.get(&(provider_id.clone(), channel_id.clone())) {
+                let model_entry = decode_channel_model_row(&row, &model_name)?
+                    .models
+                    .remove(&model_name)
+                    .expect("decoded channel model row must contain its model");
+                channels[*index].models.insert(model_name, model_entry);
+            } else {
+                let index = channels.len();
+                channels.push(decode_channel_model_row(&row, &model_name)?);
+                channel_positions.insert((provider_id, channel_id), index);
+            }
+        }
+        provider_rows
+            .iter()
+            .map(|row| {
+                let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+                decode_provider_row(row, channels_by_provider.remove(&id).unwrap_or_default())
+            })
+            .collect()
+    }
+
+    pub async fn list_dashboard_group_labels(&self) -> Result<Vec<String>, String> {
+        self.list_dashboard_group_labels_with_batch_size(dashboard_group_scan_batch_rows())
+            .await
+    }
+
+    pub(crate) async fn list_dashboard_group_labels_with_batch_size(
+        &self,
+        batch_size: usize,
+    ) -> Result<Vec<String>, String> {
+        let batch_size = batch_size.max(1);
+        let mut groups = std::collections::BTreeSet::new();
+        for (table, column) in [
+            ("monoize_providers", "groups"),
+            ("users", "allowed_groups"),
+            ("api_keys", "allowed_groups"),
+        ] {
+            let mut row_id = String::new();
+            loop {
+                let rows = self
+                    .db
+                    .read()
+                    .query_all(self.db.stmt(
+                        &format!(
+                            "SELECT id AS row_id, {column} AS groups_json
+                             FROM {table}
+                             WHERE id > $1
+                             ORDER BY id ASC
+                             LIMIT {batch_size}"
+                        ),
+                        vec![row_id.clone().into()],
+                    ))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if rows.is_empty() {
+                    break;
+                }
+                let row_count = rows.len();
+                for row in rows {
+                    row_id = row.try_get("", "row_id").map_err(|e| e.to_string())?;
+                    let raw: Option<String> =
+                        row.try_get("", "groups_json").map_err(|e| e.to_string())?;
+                    extend_dashboard_group_labels(&mut groups, raw.as_deref());
+                }
+                if row_count < batch_size {
+                    break;
+                }
+            }
+        }
+        Ok(groups.into_iter().collect())
     }
 
     pub async fn get_provider(&self, id: &str) -> Result<Option<MonoizeProvider>, String> {
@@ -518,7 +1412,8 @@ impl MonoizeRoutingStore {
                           per_model_circuit_break, transforms, api_type_overrides,
                           active_probe_enabled_override, active_probe_interval_seconds_override,
                           active_probe_success_threshold_override, active_probe_model_override,
-                          request_timeout_ms_override, extra_fields_whitelist, groups,
+                          request_timeout_ms_override, extra_fields_whitelist,
+                          strip_cross_protocol_nested_extra, groups,
                           enabled, priority, created_at, updated_at
                    FROM monoize_providers
                    WHERE id = $1"#,
@@ -527,11 +1422,14 @@ impl MonoizeRoutingStore {
             .await
             .map_err(|e| e.to_string())?;
 
-        if let Some(row) = row {
-            Ok(Some(self.row_to_provider(&row).await?))
-        } else {
-            Ok(None)
-        }
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut channels_by_provider = self.load_channels_bulk(Some(id)).await?;
+        Ok(Some(decode_provider_row(
+            &row,
+            channels_by_provider.remove(id).unwrap_or_default(),
+        )?))
     }
 
     pub async fn create_provider(
@@ -568,23 +1466,38 @@ impl MonoizeRoutingStore {
 
         let id = generate_short_id();
         let now = Utc::now();
+        let txn = self.db.begin_write().await.map_err(|e| e.to_string())?;
 
         let priority = match input.priority {
             Some(v) => v,
             None => {
-                let row = self
-                    .db
-                    .read()
+                if self.db.is_postgres() {
+                    txn.execute_unprepared(
+                        "LOCK TABLE monoize_providers IN SHARE ROW EXCLUSIVE MODE",
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+                let row = txn
                     .query_one(self.db.stmt(
-                        "SELECT MAX(priority) as max_p FROM monoize_providers",
+                        "SELECT CAST(MAX(priority) AS BIGINT) AS max_p FROM monoize_providers",
                         vec![],
                     ))
                     .await
                     .map_err(|e| e.to_string())?;
-                let max_priority: Option<i64> = row
-                    .and_then(|r| r.try_get("", "max_p").ok())
-                    .unwrap_or(None);
-                max_priority.unwrap_or(-1) as i32 + 1
+                let max_priority = row
+                    .map(|row| {
+                        row.try_get::<Option<i64>>("", "max_p")
+                            .map_err(|e| e.to_string())
+                    })
+                    .transpose()?
+                    .flatten();
+                let next_priority = max_priority
+                    .unwrap_or(-1)
+                    .checked_add(1)
+                    .ok_or_else(|| "provider priority overflow".to_string())?;
+                i32::try_from(next_priority)
+                    .map_err(|_| "provider priority exceeds signed 32-bit range".to_string())?
             }
         };
 
@@ -600,10 +1513,7 @@ impl MonoizeRoutingStore {
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()));
         let strip_cross_proto = input.strip_cross_protocol_nested_extra;
 
-        self.db
-            .write()
-            .await
-            .execute(self.db.stmt(
+        txn.execute(self.db.stmt(
                 r#"INSERT INTO monoize_providers (
                         id, name, max_retries, channel_max_retries,
                         channel_retry_interval_ms, circuit_breaker_enabled,
@@ -645,7 +1555,9 @@ impl MonoizeRoutingStore {
             .await
             .map_err(|e| e.to_string())?;
 
-        self.replace_channels(&id, &input.channels).await?;
+        self.replace_channels_on(&*txn, &id, &input.channels)
+            .await?;
+        txn.commit().await.map_err(|e| e.to_string())?;
 
         self.get_provider(&id)
             .await?
@@ -657,11 +1569,6 @@ impl MonoizeRoutingStore {
         id: &str,
         input: UpdateMonoizeProviderInput,
     ) -> Result<MonoizeProvider, String> {
-        let existing = self
-            .get_provider(id)
-            .await?
-            .ok_or_else(|| "provider not found".to_string())?;
-
         if let Some(channels) = &input.channels {
             validate_channels(channels, false)?;
         }
@@ -694,106 +1601,121 @@ impl MonoizeRoutingStore {
             }
         }
 
-        let name = input.name.unwrap_or(existing.name.clone());
-        let max_retries = input.max_retries.unwrap_or(existing.max_retries);
-        let channel_max_retries = input
-            .channel_max_retries
-            .unwrap_or(existing.channel_max_retries);
-        let channel_retry_interval_ms = input
-            .channel_retry_interval_ms
-            .unwrap_or(existing.channel_retry_interval_ms);
-        let circuit_breaker_enabled = input
-            .circuit_breaker_enabled
-            .unwrap_or(existing.circuit_breaker_enabled);
-        let per_model_circuit_break = input
-            .per_model_circuit_break
-            .unwrap_or(existing.per_model_circuit_break);
-        let mut transforms = input.transforms.unwrap_or(existing.transforms.clone());
-        canonicalize_transform_rules(&mut transforms);
-        let api_type_overrides = input
-            .api_type_overrides
-            .unwrap_or(existing.api_type_overrides.clone());
-        validate_api_type_overrides(&api_type_overrides)?;
-        let active_probe_enabled_override = input
-            .active_probe_enabled_override
-            .unwrap_or(existing.active_probe_enabled_override);
-        let active_probe_interval_seconds_override = input
-            .active_probe_interval_seconds_override
-            .unwrap_or(existing.active_probe_interval_seconds_override);
-        let active_probe_success_threshold_override = input
-            .active_probe_success_threshold_override
-            .unwrap_or(existing.active_probe_success_threshold_override);
-        let active_probe_model_override = input
-            .active_probe_model_override
-            .unwrap_or(existing.active_probe_model_override.clone());
-        let request_timeout_ms_override = input
-            .request_timeout_ms_override
-            .unwrap_or(existing.request_timeout_ms_override);
-        let extra_fields_whitelist = input
-            .extra_fields_whitelist
-            .unwrap_or(existing.extra_fields_whitelist.clone());
-        let strip_cross_protocol_nested_extra = input
-            .strip_cross_protocol_nested_extra
-            .unwrap_or(existing.strip_cross_protocol_nested_extra);
-        let groups = canonicalize_groups(input.groups.as_deref().unwrap_or(&existing.groups));
-        let enabled = input.enabled.unwrap_or(existing.enabled);
-        let priority = input.priority.unwrap_or(existing.priority);
+        if let Some(api_type_overrides) = &input.api_type_overrides {
+            validate_api_type_overrides(api_type_overrides)?;
+        }
 
-        let now = Utc::now();
+        let mut set_clauses = Vec::new();
+        let mut values: Vec<SeaValue> = Vec::new();
+        let mut push_value = |column: &str, value: SeaValue| {
+            let index = values.len() + 1;
+            set_clauses.push(format!("{column} = ${index}"));
+            values.push(value);
+        };
+        if let Some(value) = &input.name {
+            push_value("name", value.clone().into());
+        }
+        if let Some(value) = input.max_retries {
+            push_value("max_retries", SeaValue::Int(Some(value)));
+        }
+        if let Some(value) = input.channel_max_retries {
+            push_value("channel_max_retries", SeaValue::Int(Some(value)));
+        }
+        if let Some(value) = input.channel_retry_interval_ms {
+            push_value("channel_retry_interval_ms", SeaValue::Int(Some(value)));
+        }
+        if let Some(value) = input.circuit_breaker_enabled {
+            push_value(
+                "circuit_breaker_enabled",
+                SeaValue::Int(Some(if value { 1 } else { 0 })),
+            );
+        }
+        if let Some(value) = input.per_model_circuit_break {
+            push_value(
+                "per_model_circuit_break",
+                SeaValue::Int(Some(if value { 1 } else { 0 })),
+            );
+        }
+        if let Some(mut transforms) = input.transforms.clone() {
+            canonicalize_transform_rules(&mut transforms);
+            push_value(
+                "transforms",
+                serde_json::to_string(&transforms)
+                    .map_err(|e| e.to_string())?
+                    .into(),
+            );
+        }
+        if let Some(value) = &input.api_type_overrides {
+            push_value(
+                "api_type_overrides",
+                serde_json::to_string(value)
+                    .map_err(|e| e.to_string())?
+                    .into(),
+            );
+        }
+        if let Some(value) = input.active_probe_enabled_override {
+            push_value("active_probe_enabled_override", opt_bool_to_value(value));
+        }
+        if let Some(value) = input.active_probe_interval_seconds_override {
+            push_value(
+                "active_probe_interval_seconds_override",
+                opt_u64_to_value(value),
+            );
+        }
+        if let Some(value) = input.active_probe_success_threshold_override {
+            push_value(
+                "active_probe_success_threshold_override",
+                opt_u64_to_value(value.map(u64::from)),
+            );
+        }
+        if let Some(value) = &input.active_probe_model_override {
+            push_value("active_probe_model_override", value.clone().into());
+        }
+        if let Some(value) = input.request_timeout_ms_override {
+            push_value("request_timeout_ms_override", opt_u64_to_value(value));
+        }
+        if let Some(value) = &input.extra_fields_whitelist {
+            let encoded = value
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            push_value("extra_fields_whitelist", encoded.into());
+        }
+        if let Some(value) = input.strip_cross_protocol_nested_extra {
+            push_value(
+                "strip_cross_protocol_nested_extra",
+                opt_bool_to_value(value),
+            );
+        }
+        if let Some(value) = &input.groups {
+            push_value("groups", serialize_provider_groups_json(value)?.into());
+        }
+        if let Some(value) = input.enabled {
+            push_value("enabled", SeaValue::Int(Some(if value { 1 } else { 0 })));
+        }
+        if let Some(value) = input.priority {
+            push_value("priority", SeaValue::Int(Some(value)));
+        }
+        push_value("updated_at", Utc::now().to_rfc3339().into());
+        drop(push_value);
 
-        let transforms_json = serde_json::to_string(&transforms).map_err(|e| e.to_string())?;
-        let api_type_overrides_json =
-            serde_json::to_string(&api_type_overrides).map_err(|e| e.to_string())?;
-        let groups_json = serialize_provider_groups_json(&groups)?;
-        let extra_fields_whitelist_json: Option<String> = extra_fields_whitelist
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()));
-
+        let id_index = values.len() + 1;
+        values.push(id.into());
         let txn = self.db.begin_write().await.map_err(|e| e.to_string())?;
-
-        txn.execute(self.db.stmt(
-            r#"UPDATE monoize_providers
-                   SET name = $1, max_retries = $2,
-                       channel_max_retries = $3,
-                       channel_retry_interval_ms = $4,
-                       circuit_breaker_enabled = $5,
-                       per_model_circuit_break = $6,
-                       transforms = $7, api_type_overrides = $8,
-                       active_probe_enabled_override = $9,
-                       active_probe_interval_seconds_override = $10,
-                       active_probe_success_threshold_override = $11,
-                       active_probe_model_override = $12,
-                       request_timeout_ms_override = $13,
-                       extra_fields_whitelist = $14,
-                       strip_cross_protocol_nested_extra = $15,
-                       groups = $16,
-                       enabled = $17, priority = $18, updated_at = $19
-                   WHERE id = $20"#,
-            vec![
-                name.into(),
-                SeaValue::Int(Some(max_retries)),
-                SeaValue::Int(Some(channel_max_retries)),
-                SeaValue::Int(Some(channel_retry_interval_ms)),
-                SeaValue::Int(Some(if circuit_breaker_enabled { 1 } else { 0 })),
-                SeaValue::Int(Some(if per_model_circuit_break { 1 } else { 0 })),
-                transforms_json.into(),
-                api_type_overrides_json.into(),
-                opt_bool_to_value(active_probe_enabled_override),
-                opt_u64_to_value(active_probe_interval_seconds_override),
-                opt_u64_to_value(active_probe_success_threshold_override.map(|v| v as u64)),
-                active_probe_model_override.into(),
-                opt_u64_to_value(request_timeout_ms_override),
-                extra_fields_whitelist_json.into(),
-                opt_bool_to_value(strip_cross_protocol_nested_extra),
-                groups_json.into(),
-                SeaValue::Int(Some(if enabled { 1 } else { 0 })),
-                SeaValue::Int(Some(priority)),
-                now.to_rfc3339().into(),
-                id.into(),
-            ],
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
+        let result = txn
+            .execute(self.db.stmt(
+                &format!(
+                    "UPDATE monoize_providers SET {} WHERE id = ${id_index}",
+                    set_clauses.join(", ")
+                ),
+                values,
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        if result.rows_affected() == 0 {
+            return Err("provider not found".to_string());
+        }
 
         if let Some(channels) = &input.channels {
             self.replace_channels_on(&*txn, id, channels).await?;
@@ -826,10 +1748,12 @@ impl MonoizeRoutingStore {
     }
 
     pub async fn reorder_providers(&self, input: ReorderProvidersInput) -> Result<(), String> {
-        if input.provider_ids.is_empty() {
-            return Err("provider_ids must not be empty".to_string());
+        if input.provider_ids.len() > provider_reorder_max_ids() {
+            return Err(format!(
+                "provider reorder accepts at most {} ids",
+                provider_reorder_max_ids()
+            ));
         }
-
         let mut uniq = HashSet::new();
         for id in &input.provider_ids {
             if !uniq.insert(id.clone()) {
@@ -837,43 +1761,57 @@ impl MonoizeRoutingStore {
             }
         }
 
-        let existing = self.list_providers().await?;
-        if existing.len() != input.provider_ids.len() {
+        let txn = self.db.begin_write().await.map_err(|e| e.to_string())?;
+        if self.db.is_postgres() {
+            txn.execute_unprepared("LOCK TABLE monoize_providers IN SHARE ROW EXCLUSIVE MODE")
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let rows = txn
+            .query_all(
+                self.db
+                    .stmt("SELECT id FROM monoize_providers ORDER BY id", vec![]),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if rows.len() != input.provider_ids.len() {
             return Err("provider_ids must contain all providers exactly once".to_string());
         }
 
-        let existing_ids: HashSet<String> = existing.into_iter().map(|p| p.id).collect();
+        let existing_ids: HashSet<String> = rows
+            .into_iter()
+            .map(|row| row.try_get("", "id").map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
         let input_ids: HashSet<String> = input.provider_ids.iter().cloned().collect();
         if existing_ids != input_ids {
             return Err("provider_ids must contain all providers exactly once".to_string());
         }
-
-        for (i, id) in input.provider_ids.iter().enumerate() {
-            self.db
-                .write()
-                .await
-                .execute(self.db.stmt(
-                    "UPDATE monoize_providers SET priority = $1, updated_at = $2 WHERE id = $3",
-                    vec![
-                        SeaValue::Int(Some(i as i32)),
-                        Utc::now().to_rfc3339().into(),
-                        id.as_str().into(),
-                    ],
-                ))
-                .await
-                .map_err(|e| e.to_string())?;
+        if input.provider_ids.is_empty() {
+            return txn.commit().await.map_err(|e| e.to_string());
         }
 
-        Ok(())
-    }
-
-    async fn replace_channels(
-        &self,
-        provider_id: &str,
-        channels: &[CreateMonoizeChannelInput],
-    ) -> Result<(), String> {
-        let w = self.db.write().await;
-        self.replace_channels_on(&*w, provider_id, channels).await
+        let mut values = Vec::with_capacity(input.provider_ids.len() * 2 + 1);
+        let mut cases = Vec::with_capacity(input.provider_ids.len());
+        for (priority, id) in input.provider_ids.iter().enumerate() {
+            let id_index = values.len() + 1;
+            values.push(id.clone().into());
+            let priority_index = values.len() + 1;
+            values.push(SeaValue::Int(Some(priority as i32)));
+            cases.push(format!("WHEN ${id_index} THEN ${priority_index}"));
+        }
+        let updated_at_index = values.len() + 1;
+        values.push(Utc::now().to_rfc3339().into());
+        txn.execute(self.db.stmt(
+            &format!(
+                "UPDATE monoize_providers
+                 SET priority = CASE id {} END, updated_at = ${updated_at_index}",
+                cases.join(" ")
+            ),
+            values,
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+        txn.commit().await.map_err(|e| e.to_string())
     }
 
     async fn replace_channels_on(
@@ -914,6 +1852,14 @@ impl MonoizeRoutingStore {
         .await
         .map_err(|e| e.to_string())?;
 
+        struct PreparedChannel<'a> {
+            id: String,
+            api_key: String,
+            input: &'a CreateMonoizeChannelInput,
+            models: HashMap<String, MonoizeModelEntry>,
+        }
+
+        let mut prepared = Vec::with_capacity(channels.len());
         for input in channels {
             let id = input
                 .id
@@ -932,370 +1878,129 @@ impl MonoizeRoutingStore {
                         )
                     })?,
             };
-            let now_str = Utc::now().to_rfc3339();
-            let models = canonicalize_models(&input.models);
-
-            conn.execute(self.db.stmt(
-                    r#"INSERT INTO monoize_channels
-                       (id, provider_id, name, provider_type, base_url, api_key, weight, enabled,
-                          passive_failure_count_threshold_override, passive_cooldown_seconds_override,
-                          passive_window_seconds_override, passive_rate_limit_cooldown_seconds_override,
-                          active_probe_enabled_override, active_probe_interval_seconds_override,
-                          active_probe_success_threshold_override, active_probe_model_override,
-                          affinity_enabled_override, affinity_idle_ttl_seconds_override,
-                          affinity_failback_mode_override, affinity_failback_delay_seconds_override,
-                          created_at, updated_at)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)"#,
-                    vec![
-                        id.clone().into(),
-                        provider_id.into(),
-                        input.name.as_str().into(),
-                        input.provider_type.as_str().into(),
-                        input.base_url.as_str().into(),
-                        api_key.into(),
-                        SeaValue::Int(Some(input.weight)),
-                        SeaValue::Int(Some(if input.enabled { 1 } else { 0 })),
-                        opt_u64_to_value(
-                            input.passive_failure_count_threshold_override.map(|v| v as u64),
-                        ),
-                        opt_u64_to_value(input.passive_cooldown_seconds_override),
-                        opt_u64_to_value(input.passive_window_seconds_override),
-                        opt_u64_to_value(input.passive_rate_limit_cooldown_seconds_override),
-                        opt_bool_to_value(input.active_probe_enabled_override),
-                        opt_u64_to_value(input.active_probe_interval_seconds_override),
-                        opt_u64_to_value(input.active_probe_success_threshold_override.map(|v| v as u64)),
-                        input.active_probe_model_override.clone().into(),
-                        opt_bool_to_value(input.affinity_enabled_override),
-                        opt_u64_to_value(input.affinity_idle_ttl_seconds_override),
-                        input
-                            .affinity_failback_mode_override
-                            .map(|mode| mode.as_str().to_string())
-                            .into(),
-                        opt_u64_to_value(input.affinity_failback_delay_seconds_override),
-                        now_str.clone().into(),
-                        now_str.into(),
-                    ],
-                ))
-                .await
-                .map_err(|e| e.to_string())?;
-
-            for (model, entry) in models {
-                conn.execute(self.db.stmt(
-                    r#"INSERT INTO monoize_channel_models
-                       (id, channel_id, model_name, redirect, multiplier, created_at)
-                       VALUES ($1, $2, $3, $4, $5, $6)"#,
-                    vec![
-                        format!("mono_ch_model_{}", uuid::Uuid::new_v4().simple()).into(),
-                        id.clone().into(),
-                        model.into(),
-                        entry.redirect.into(),
-                        entry.multiplier.to_string().into(),
-                        Utc::now().to_rfc3339().into(),
-                    ],
-                ))
-                .await
-                .map_err(|e| e.to_string())?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn row_to_provider(&self, row: &QueryResult) -> Result<MonoizeProvider, String> {
-        let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
-        let channel_rows = self
-            .db
-            .read()
-            .query_all(self.db.stmt(
-                r#"SELECT id, name, base_url, api_key, weight, enabled,
-                          provider_type,
-                          passive_failure_count_threshold_override,
-                          passive_cooldown_seconds_override,
-                          passive_window_seconds_override,
-                          passive_rate_limit_cooldown_seconds_override,
-                          active_probe_enabled_override,
-                          active_probe_interval_seconds_override,
-                          active_probe_success_threshold_override,
-                          active_probe_model_override,
-                          affinity_enabled_override,
-                          affinity_idle_ttl_seconds_override,
-                          affinity_failback_mode_override,
-                          affinity_failback_delay_seconds_override
-                   FROM monoize_channels
-                   WHERE provider_id = $1
-                   ORDER BY created_at ASC"#,
-                vec![id.clone().into()],
-            ))
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let mut channels = Vec::new();
-        for cr in &channel_rows {
-            let channel_id: String = cr.try_get("", "id").map_err(|e| e.to_string())?;
-            let provider_type_raw: String = cr
-                .try_get("", "provider_type")
-                .map_err(|e| format!("channel {channel_id} missing provider_type: {e}"))?;
-            let provider_type =
-                MonoizeProviderType::from_str(&provider_type_raw).ok_or_else(|| {
-                    format!("channel {channel_id} invalid provider type: {provider_type_raw}")
-                })?;
-            let supported_rows = self
-                .db
-                .read()
-                .query_all(self.db.stmt(
-                    r#"SELECT model_name, redirect, multiplier
-                       FROM monoize_channel_models
-                       WHERE channel_id = $1
-                       ORDER BY model_name ASC"#,
-                    vec![channel_id.clone().into()],
-                ))
-                .await
-                .map_err(|e| e.to_string())?;
-            let mut models = HashMap::new();
-            for model_row in supported_rows {
-                let model_name: String = model_row
-                    .try_get("", "model_name")
-                    .map_err(|e| e.to_string())?;
-                models.insert(
-                    model_name,
-                    MonoizeModelEntry {
-                        redirect: model_row
-                            .try_get("", "redirect")
-                            .map_err(|e| e.to_string())?,
-                        multiplier: model_row
-                            .try_get::<String>("", "multiplier")
-                            .map_err(|e| e.to_string())?
-                            .parse()
-                            .map_err(|e: String| {
-                                format!("channel {channel_id} invalid multiplier: {e}")
-                            })?,
-                    },
-                );
-            }
-            channels.push(MonoizeChannel {
-                id: channel_id.clone(),
-                name: cr.try_get("", "name").map_err(|e| e.to_string())?,
-                provider_type,
-                base_url: cr.try_get("", "base_url").map_err(|e| e.to_string())?,
-                api_key: cr.try_get("", "api_key").map_err(|e| e.to_string())?,
-                weight: cr.try_get("", "weight").map_err(|e| e.to_string())?,
-                enabled: cr
-                    .try_get::<i32>("", "enabled")
-                    .map_err(|e| e.to_string())?
-                    == 1,
-                passive_failure_count_threshold_override: cr
-                    .try_get::<Option<i32>>("", "passive_failure_count_threshold_override")
-                    .map_err(|e| e.to_string())?
-                    .map(|v| {
-                        decode_positive_u32(
-                            &id,
-                            "passive_failure_count_threshold_override",
-                            i64::from(v),
-                        )
-                    })
-                    .transpose()?,
-                passive_cooldown_seconds_override: cr
-                    .try_get::<Option<i32>>("", "passive_cooldown_seconds_override")
-                    .map_err(|e| e.to_string())?
-                    .map(|v| {
-                        decode_positive_u64(&id, "passive_cooldown_seconds_override", i64::from(v))
-                    })
-                    .transpose()?,
-                passive_window_seconds_override: cr
-                    .try_get::<Option<i32>>("", "passive_window_seconds_override")
-                    .map_err(|e| e.to_string())?
-                    .map(|v| {
-                        decode_positive_u64(&id, "passive_window_seconds_override", i64::from(v))
-                    })
-                    .transpose()?,
-                passive_rate_limit_cooldown_seconds_override: cr
-                    .try_get::<Option<i32>>("", "passive_rate_limit_cooldown_seconds_override")
-                    .map_err(|e| e.to_string())?
-                    .map(|v| {
-                        decode_positive_u64(
-                            &id,
-                            "passive_rate_limit_cooldown_seconds_override",
-                            i64::from(v),
-                        )
-                    })
-                    .transpose()?,
-                models,
-                active_probe_enabled_override: cr
-                    .try_get::<Option<i32>>("", "active_probe_enabled_override")
-                    .map_err(|e| format!("channel {channel_id} invalid active_probe_enabled_override: {e}"))?
-                    .map(|v| v != 0),
-                active_probe_interval_seconds_override: cr
-                    .try_get::<Option<i32>>("", "active_probe_interval_seconds_override")
-                    .map_err(|e| format!("channel {channel_id} invalid active_probe_interval_seconds_override: {e}"))?
-                    .map(|v| {
-                        decode_positive_u64(&channel_id, "active_probe_interval_seconds_override", i64::from(v))
-                    })
-                    .transpose()?,
-                active_probe_success_threshold_override: cr
-                    .try_get::<Option<i32>>("", "active_probe_success_threshold_override")
-                    .map_err(|e| format!("channel {channel_id} invalid active_probe_success_threshold_override: {e}"))?
-                    .map(|v| {
-                        decode_positive_u32(&channel_id, "active_probe_success_threshold_override", i64::from(v))
-                    })
-                    .transpose()?,
-                active_probe_model_override: cr
-                    .try_get("", "active_probe_model_override")
-                    .map_err(|e| format!("channel {channel_id} invalid active_probe_model_override: {e}"))?,
-                affinity_enabled_override: cr
-                    .try_get::<Option<i32>>("", "affinity_enabled_override")
-                    .map_err(|e| {
-                        format!("channel {channel_id} invalid affinity_enabled_override: {e}")
-                    })?
-                    .map(|value| value != 0),
-                affinity_idle_ttl_seconds_override: cr
-                    .try_get::<Option<i32>>("", "affinity_idle_ttl_seconds_override")
-                    .map_err(|e| {
-                        format!(
-                            "channel {channel_id} invalid affinity_idle_ttl_seconds_override: {e}"
-                        )
-                    })?
-                    .map(|value| {
-                        decode_positive_u64(
-                            &channel_id,
-                            "affinity_idle_ttl_seconds_override",
-                            i64::from(value),
-                        )
-                    })
-                    .transpose()?,
-                affinity_failback_mode_override: cr
-                    .try_get::<Option<String>>("", "affinity_failback_mode_override")
-                    .map_err(|e| {
-                        format!(
-                            "channel {channel_id} invalid affinity_failback_mode_override: {e}"
-                        )
-                    })?
-                    .map(|value| {
-                        AffinityFailbackMode::from_str(&value).ok_or_else(|| {
-                            format!(
-                                "channel {channel_id} invalid affinity_failback_mode_override: {value}"
-                            )
-                        })
-                    })
-                    .transpose()?,
-                affinity_failback_delay_seconds_override: cr
-                    .try_get::<Option<i32>>("", "affinity_failback_delay_seconds_override")
-                    .map_err(|e| {
-                        format!(
-                            "channel {channel_id} invalid affinity_failback_delay_seconds_override: {e}"
-                        )
-                    })?
-                    .map(|value| {
-                        decode_nonnegative_u64(
-                            &channel_id,
-                            "affinity_failback_delay_seconds_override",
-                            i64::from(value),
-                        )
-                    })
-                    .transpose()?,
-                _healthy: None,
-                _last_success_at: None,
-                _health_status: None,
+            prepared.push(PreparedChannel {
+                id,
+                api_key,
+                input,
+                models: canonicalize_models(&input.models),
             });
         }
 
-        let transforms_raw: String = row
-            .try_get("", "transforms")
-            .map_err(|e| format!("provider {id} missing transforms column: {e}"))?;
-        let mut transforms: Vec<TransformRuleConfig> = serde_json::from_str(&transforms_raw)
-            .map_err(|e| format!("provider {id} invalid transforms JSON: {e}"))?;
-        canonicalize_transform_rules(&mut transforms);
-        let api_type_overrides_raw: String = row
-            .try_get("", "api_type_overrides")
-            .map_err(|e| format!("provider {id} missing api_type_overrides column: {e}"))?;
-        let api_type_overrides: Vec<ApiTypeOverride> =
-            serde_json::from_str(&api_type_overrides_raw)
-                .map_err(|e| format!("provider {id} invalid api_type_overrides JSON: {e}"))?;
-        let active_probe_enabled_override: Option<bool> = row
-            .try_get::<Option<i32>>("", "active_probe_enabled_override")
-            .map_err(|e| format!("provider {id} invalid active_probe_enabled_override: {e}"))?
-            .map(|v| v != 0);
-        let active_probe_interval_seconds_override: Option<u64> = row
-            .try_get::<Option<i32>>("", "active_probe_interval_seconds_override")
-            .map_err(|e| {
-                format!("provider {id} invalid active_probe_interval_seconds_override: {e}")
-            })?
-            .map(|v| {
-                decode_positive_u64(&id, "active_probe_interval_seconds_override", i64::from(v))
-            })
-            .transpose()?;
-        let active_probe_success_threshold_override: Option<u32> = row
-            .try_get::<Option<i32>>("", "active_probe_success_threshold_override")
-            .map_err(|e| {
-                format!("provider {id} invalid active_probe_success_threshold_override: {e}")
-            })?
-            .map(|v| {
-                decode_positive_u32(&id, "active_probe_success_threshold_override", i64::from(v))
-            })
-            .transpose()?;
-        let active_probe_model_override: Option<String> = row
-            .try_get("", "active_probe_model_override")
-            .map_err(|e| format!("provider {id} invalid active_probe_model_override: {e}"))?;
-        let request_timeout_ms_override: Option<u64> = row
-            .try_get::<Option<i32>>("", "request_timeout_ms_override")
-            .map_err(|e| format!("provider {id} invalid request_timeout_ms_override: {e}"))?
-            .map(|v| decode_positive_u64(&id, "request_timeout_ms_override", i64::from(v)))
-            .transpose()?;
-        let extra_fields_whitelist: Option<Vec<String>> = row
-            .try_get::<Option<String>>("", "extra_fields_whitelist")
-            .unwrap_or(None)
-            .and_then(|raw| serde_json::from_str(&raw).ok());
-        let strip_cross_protocol_nested_extra: Option<bool> = row
-            .try_get::<Option<i32>>("", "strip_cross_protocol_nested_extra")
-            .unwrap_or(None)
-            .map(|v| v != 0);
-        let groups_raw: String = row
-            .try_get("", "groups")
-            .unwrap_or_else(|_| "[]".to_string());
-        let groups = parse_provider_groups_json(&groups_raw);
+        const CHANNEL_INSERT_CHUNK_SIZE: usize = 18;
+        let now = Utc::now().to_rfc3339();
+        for chunk in prepared.chunks(CHANNEL_INSERT_CHUNK_SIZE) {
+            let mut values: Vec<SeaValue> = Vec::with_capacity(chunk.len() * 22);
+            let mut rows = Vec::with_capacity(chunk.len());
+            for channel in chunk {
+                let start = values.len() + 1;
+                let input = channel.input;
+                values.extend([
+                    channel.id.clone().into(),
+                    provider_id.into(),
+                    input.name.as_str().into(),
+                    input.provider_type.as_str().into(),
+                    input.base_url.as_str().into(),
+                    channel.api_key.clone().into(),
+                    SeaValue::Int(Some(input.weight)),
+                    SeaValue::Int(Some(if input.enabled { 1 } else { 0 })),
+                    opt_u64_to_value(
+                        input
+                            .passive_failure_count_threshold_override
+                            .map(|value| value as u64),
+                    ),
+                    opt_u64_to_value(input.passive_cooldown_seconds_override),
+                    opt_u64_to_value(input.passive_window_seconds_override),
+                    opt_u64_to_value(input.passive_rate_limit_cooldown_seconds_override),
+                    opt_bool_to_value(input.active_probe_enabled_override),
+                    opt_u64_to_value(input.active_probe_interval_seconds_override),
+                    opt_u64_to_value(
+                        input
+                            .active_probe_success_threshold_override
+                            .map(|value| value as u64),
+                    ),
+                    input.active_probe_model_override.clone().into(),
+                    opt_bool_to_value(input.affinity_enabled_override),
+                    opt_u64_to_value(input.affinity_idle_ttl_seconds_override),
+                    input
+                        .affinity_failback_mode_override
+                        .map(|mode| mode.as_str().to_string())
+                        .into(),
+                    opt_u64_to_value(input.affinity_failback_delay_seconds_override),
+                    now.clone().into(),
+                    now.clone().into(),
+                ]);
+                rows.push(format!(
+                    "({})",
+                    (start..start + 22)
+                        .map(|index| format!("${index}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            conn.execute(self.db.stmt(
+                &format!(
+                    "INSERT INTO monoize_channels
+                     (id, provider_id, name, provider_type, base_url, api_key, weight, enabled,
+                      passive_failure_count_threshold_override, passive_cooldown_seconds_override,
+                      passive_window_seconds_override, passive_rate_limit_cooldown_seconds_override,
+                      active_probe_enabled_override, active_probe_interval_seconds_override,
+                      active_probe_success_threshold_override, active_probe_model_override,
+                      affinity_enabled_override, affinity_idle_ttl_seconds_override,
+                      affinity_failback_mode_override, affinity_failback_delay_seconds_override,
+                      created_at, updated_at)
+                     VALUES {}",
+                    rows.join(", ")
+                ),
+                values,
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        }
 
-        let created_at_str: String = row.try_get("", "created_at").map_err(|e| e.to_string())?;
-        let updated_at_str: String = row.try_get("", "updated_at").map_err(|e| e.to_string())?;
-
-        Ok(MonoizeProvider {
-            id: id.clone(),
-            name: row.try_get("", "name").map_err(|e| e.to_string())?,
-            channels,
-            max_retries: row.try_get("", "max_retries").map_err(|e| e.to_string())?,
-            channel_max_retries: row
-                .try_get("", "channel_max_retries")
-                .map_err(|e| e.to_string())?,
-            channel_retry_interval_ms: row
-                .try_get::<i32>("", "channel_retry_interval_ms")
-                .map_err(|e| e.to_string())?,
-            circuit_breaker_enabled: row
-                .try_get::<i32>("", "circuit_breaker_enabled")
-                .map_err(|e| e.to_string())?
-                != 0,
-            per_model_circuit_break: row
-                .try_get::<i32>("", "per_model_circuit_break")
-                .map_err(|e| e.to_string())?
-                != 0,
-            transforms,
-            api_type_overrides,
-            active_probe_enabled_override,
-            active_probe_interval_seconds_override,
-            active_probe_success_threshold_override,
-            active_probe_model_override,
-            request_timeout_ms_override,
-            extra_fields_whitelist,
-            strip_cross_protocol_nested_extra,
-            groups,
-            enabled: row
-                .try_get::<i32>("", "enabled")
-                .map_err(|e| e.to_string())?
-                == 1,
-            priority: row.try_get("", "priority").map_err(|e| e.to_string())?,
-            created_at: DateTime::parse_from_rfc3339(&created_at_str)
-                .map_err(|e| format!("provider {id} invalid created_at RFC3339: {e}"))?
-                .with_timezone(&Utc),
-            updated_at: DateTime::parse_from_rfc3339(&updated_at_str)
-                .map_err(|e| format!("provider {id} invalid updated_at RFC3339: {e}"))?
-                .with_timezone(&Utc),
-        })
+        let model_rows = prepared
+            .iter()
+            .flat_map(|channel| {
+                channel
+                    .models
+                    .iter()
+                    .map(|(model, entry)| (channel.id.clone(), model.clone(), entry.clone()))
+            })
+            .collect::<Vec<_>>();
+        const MODEL_INSERT_CHUNK_SIZE: usize = 66;
+        for chunk in model_rows.chunks(MODEL_INSERT_CHUNK_SIZE) {
+            let mut values: Vec<SeaValue> = Vec::with_capacity(chunk.len() * 6);
+            let mut rows = Vec::with_capacity(chunk.len());
+            for (channel_id, model, entry) in chunk {
+                let start = values.len() + 1;
+                values.extend([
+                    format!("mono_ch_model_{}", uuid::Uuid::new_v4().simple()).into(),
+                    channel_id.clone().into(),
+                    model.clone().into(),
+                    entry.redirect.clone().into(),
+                    entry.multiplier.to_string().into(),
+                    now.clone().into(),
+                ]);
+                rows.push(format!(
+                    "({})",
+                    (start..start + 6)
+                        .map(|index| format!("${index}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            conn.execute(self.db.stmt(
+                &format!(
+                    "INSERT INTO monoize_channel_models
+                     (id, channel_id, model_name, redirect, multiplier, created_at)
+                     VALUES {}",
+                    rows.join(", ")
+                ),
+                values,
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -1696,6 +2401,422 @@ fn extract_probe_usage(body: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DbPool;
+    use crate::migration::Migrator;
+    use sea_orm::ConnectionTrait;
+    use sea_orm_migration::MigratorTrait;
+
+    #[test]
+    fn entry_limit_parser_requires_a_positive_integer() {
+        assert_eq!(parse_positive_entry_limit(Some("17"), 9), 17);
+        assert_eq!(parse_positive_entry_limit(Some(" 3 "), 9), 3);
+        assert_eq!(parse_positive_entry_limit(Some("0"), 9), 9);
+        assert_eq!(parse_positive_entry_limit(Some("-1"), 9), 9);
+        assert_eq!(parse_positive_entry_limit(Some("invalid"), 9), 9);
+        assert_eq!(parse_positive_entry_limit(None, 9), 9);
+        assert_eq!(parse_provider_reorder_limit(Some("17")), 17);
+        assert_eq!(parse_provider_reorder_limit(Some("200")), 199);
+        assert_eq!(parse_provider_reorder_limit(Some("0")), 199);
+        assert_eq!(parse_provider_reorder_limit(Some("invalid")), 199);
+        assert_eq!(
+            parse_channel_affinity_cleanup_interval(Some("17")),
+            Duration::from_secs(17)
+        );
+        for raw in ["", "0", "-1", "invalid"] {
+            assert_eq!(
+                parse_channel_affinity_cleanup_interval(Some(raw)),
+                Duration::from_secs(DEFAULT_CHANNEL_AFFINITY_CLEANUP_INTERVAL_SECONDS)
+            );
+        }
+        assert_eq!(
+            parse_channel_affinity_cleanup_interval(None),
+            Duration::from_secs(DEFAULT_CHANNEL_AFFINITY_CLEANUP_INTERVAL_SECONDS)
+        );
+    }
+
+    #[test]
+    fn passive_failure_threshold_is_positive_and_capped() {
+        assert_eq!(effective_passive_failure_threshold_with_limit(0, 1024), 1);
+        assert_eq!(effective_passive_failure_threshold_with_limit(3, 1024), 3);
+        assert_eq!(
+            effective_passive_failure_threshold_with_limit(2048, 1024),
+            1024
+        );
+        assert_eq!(effective_passive_failure_threshold_with_limit(3, 0), 1);
+    }
+
+    #[test]
+    fn persisted_routing_booleans_accept_only_zero_and_one() {
+        assert!(!decode_database_bool("provider", "p1", "enabled", 0).unwrap());
+        assert!(decode_database_bool("channel", "c1", "enabled", 1).unwrap());
+        assert!(decode_database_bool("provider", "p1", "enabled", -1).is_err());
+        assert!(decode_database_bool("channel", "c1", "enabled", 2).is_err());
+    }
+
+    #[test]
+    fn dashboard_group_scan_treats_null_and_malformed_values_as_empty() {
+        let mut groups = std::collections::BTreeSet::new();
+        extend_dashboard_group_labels(&mut groups, None);
+        extend_dashboard_group_labels(&mut groups, Some("not-json"));
+        assert!(groups.is_empty());
+        extend_dashboard_group_labels(&mut groups, Some(r#"[" Beta ","alpha"]"#));
+        assert_eq!(groups.into_iter().collect::<Vec<_>>(), ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn health_capacity_fails_closed_without_scanning_or_eviction() {
+        let mut health = HashMap::from([
+            (
+                "unhealthy".to_string(),
+                ChannelHealthState {
+                    healthy: false,
+                    ..ChannelHealthState::new()
+                },
+            ),
+            ("healthy".to_string(), ChannelHealthState::new()),
+        ]);
+        assert!(!prepare_channel_health_insert_with_limit(
+            &mut health,
+            "new",
+            2
+        ));
+        assert!(health.contains_key("unhealthy"));
+        assert!(health.contains_key("healthy"));
+        assert!(missing_channel_health_is_saturated_with_limit(
+            &health, "new", 2
+        ));
+        assert_eq!(health.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn transform_id_migration_crosses_keyset_batch_boundary_and_marks_completion() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let legacy_transforms = json!([{
+            "transform": "openai_prompt_cache",
+            "phase": "request"
+        }])
+        .to_string();
+        let now = Utc::now().to_rfc3339();
+        let row_count = TRANSFORM_MIGRATION_BATCH_SIZE + 3;
+        let mut values = Vec::with_capacity(row_count * 4);
+        let mut rows = Vec::with_capacity(row_count);
+        for index in 0..row_count {
+            let start = values.len() + 1;
+            values.extend([
+                format!("provider-{index:04}").into(),
+                format!("provider {index}").into(),
+                legacy_transforms.clone().into(),
+                now.clone().into(),
+            ]);
+            rows.push(format!(
+                "(${start}, ${}, ${}, ${}, ${})",
+                start + 1,
+                start + 2,
+                start + 3,
+                start + 3
+            ));
+        }
+        db.write()
+            .await
+            .execute(db.stmt(
+                &format!(
+                    "INSERT INTO monoize_providers
+                     (id, name, transforms, created_at, updated_at) VALUES {}",
+                    rows.join(", ")
+                ),
+                values,
+            ))
+            .await
+            .expect("legacy providers insert");
+
+        MonoizeRoutingStore::new(db.clone())
+            .await
+            .expect("store migrates transforms");
+
+        let transformed = db
+            .read()
+            .query_all(db.stmt(
+                "SELECT transforms FROM monoize_providers ORDER BY id ASC",
+                vec![],
+            ))
+            .await
+            .expect("transforms load");
+        assert_eq!(transformed.len(), row_count);
+        for row in transformed {
+            let raw: String = row.try_get("", "transforms").expect("transforms decode");
+            let rules: Vec<TransformRuleConfig> =
+                serde_json::from_str(&raw).expect("transforms parse");
+            assert_eq!(rules[0].transform, "auto_cache_openai_prompt");
+        }
+        let marker = db
+            .read()
+            .query_one(db.stmt(
+                "SELECT value FROM system_settings WHERE key = $1",
+                vec![TRANSFORM_MIGRATION_MARKER.into()],
+            ))
+            .await
+            .expect("marker loads")
+            .expect("marker exists")
+            .try_get::<String>("", "value")
+            .expect("marker decodes");
+        assert_eq!(marker, "complete");
+    }
+
+    #[tokio::test]
+    async fn routing_reads_fail_closed_on_non_boolean_integer() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let store = MonoizeRoutingStore::new(db.clone())
+            .await
+            .expect("store creates");
+        let provider = store
+            .create_provider(
+                serde_json::from_value(json!({
+                    "name": "decode contract",
+                    "channels": [{
+                        "name": "channel",
+                        "provider_type": "responses",
+                        "base_url": "https://example.com",
+                        "api_key": "secret",
+                        "models": { "model-a": { "redirect": null, "multiplier": "1" } }
+                    }]
+                }))
+                .expect("provider input parses"),
+            )
+            .await
+            .expect("provider creates");
+
+        db.write()
+            .await
+            .execute(db.stmt(
+                "UPDATE monoize_providers SET enabled = 2 WHERE id = $1",
+                vec![provider.id.clone().into()],
+            ))
+            .await
+            .expect("provider boolean becomes malformed");
+        assert!(store.get_provider(&provider.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn available_model_names_are_sorted_and_exclude_ineligible_channels() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let store = MonoizeRoutingStore::new(db.clone())
+            .await
+            .expect("store creates");
+        store
+            .reorder_providers(ReorderProvidersInput {
+                provider_ids: Vec::new(),
+            })
+            .await
+            .expect("empty provider reorder succeeds");
+        let input: CreateMonoizeProviderInput = serde_json::from_value(json!({
+            "name": "visible models",
+            "strip_cross_protocol_nested_extra": false,
+            "channels": [
+                {
+                    "name": "active",
+                    "provider_type": "responses",
+                    "base_url": "https://example.com",
+                    "api_key": "secret",
+                    "models": {
+                        "model-z": { "redirect": null, "multiplier": "1" },
+                        "model-a": { "redirect": null, "multiplier": "1" }
+                    }
+                },
+                {
+                    "name": "disabled",
+                    "provider_type": "responses",
+                    "base_url": "https://example.com",
+                    "api_key": "secret",
+                    "enabled": false,
+                    "models": { "model-hidden": { "redirect": null, "multiplier": "1" } }
+                },
+                {
+                    "name": "zero weight",
+                    "provider_type": "responses",
+                    "base_url": "https://example.com",
+                    "api_key": "secret",
+                    "weight": 0,
+                    "models": { "model-zero": { "redirect": null, "multiplier": "1" } }
+                }
+            ]
+        }))
+        .expect("provider input parses");
+        let created = store
+            .create_provider(input)
+            .await
+            .expect("provider creates");
+
+        assert_eq!(
+            store
+                .list_available_model_names()
+                .await
+                .expect("names list"),
+            vec!["model-a".to_string(), "model-z".to_string()]
+        );
+        assert_eq!(
+            store
+                .available_model_names(&[
+                    "model-hidden".to_string(),
+                    "model-zero".to_string(),
+                    "model-z".to_string(),
+                ])
+                .await
+                .expect("candidate availability loads"),
+            HashSet::from(["model-z".to_string()])
+        );
+        let listed = store.list_providers().await.expect("providers list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].strip_cross_protocol_nested_extra, Some(false));
+        assert_eq!(listed[0].channels.len(), 3);
+        assert_eq!(listed[0].channels[0].models.len(), 2);
+        let fetched = store
+            .get_provider(&created.id)
+            .await
+            .expect("provider loads")
+            .expect("provider exists");
+        assert_eq!(fetched.channels.len(), 3);
+        assert_eq!(fetched.channels[0].models.len(), 2);
+        assert_eq!(fetched.strip_cross_protocol_nested_extra, Some(false));
+        assert_eq!(
+            store
+                .list_providers_for_model("model-a")
+                .await
+                .expect("model providers list")[0]
+                .strip_cross_protocol_nested_extra,
+            Some(false)
+        );
+        assert!(
+            store
+                .list_providers_for_model("model-hidden")
+                .await
+                .expect("disabled channel lookup")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_providers_for_model("model-zero")
+                .await
+                .expect("zero-weight channel lookup")
+                .is_empty()
+        );
+        let active_probe_candidates = store
+            .list_active_probe_candidates()
+            .await
+            .expect("active probe candidates list");
+        assert_eq!(active_probe_candidates.len(), 1);
+        assert_eq!(
+            active_probe_candidates[0].strip_cross_protocol_nested_extra,
+            Some(false)
+        );
+        assert_eq!(active_probe_candidates[0].channels.len(), 1);
+        assert_eq!(active_probe_candidates[0].channels[0].name, "active");
+
+        let second_input: CreateMonoizeProviderInput = serde_json::from_value(json!({
+            "name": "second",
+            "channels": [{
+                "name": "second channel",
+                "provider_type": "responses",
+                "base_url": "https://example.com",
+                "api_key": "secret",
+                "models": { "model-second": { "redirect": null, "multiplier": "1" } }
+            }]
+        }))
+        .expect("second provider input parses");
+        let second = store
+            .create_provider(second_input)
+            .await
+            .expect("second provider creates");
+        assert_eq!(created.priority, 0);
+        assert_eq!(second.priority, 1);
+        store
+            .reorder_providers(ReorderProvidersInput {
+                provider_ids: vec![second.id.clone(), created.id.clone()],
+            })
+            .await
+            .expect("providers reorder");
+        assert_eq!(
+            store
+                .list_providers()
+                .await
+                .expect("reordered providers list")
+                .into_iter()
+                .map(|provider| provider.id)
+                .collect::<Vec<_>>(),
+            vec![second.id.clone(), created.id.clone()]
+        );
+
+        let disabled_provider: CreateMonoizeProviderInput = serde_json::from_value(json!({
+            "name": "disabled provider",
+            "enabled": false,
+            "channels": [{
+                "name": "active channel",
+                "provider_type": "responses",
+                "base_url": "https://example.com",
+                "api_key": "secret",
+                "models": {
+                    "model-disabled-provider": { "redirect": null, "multiplier": "1" }
+                }
+            }]
+        }))
+        .expect("disabled provider input parses");
+        store
+            .create_provider(disabled_provider)
+            .await
+            .expect("disabled provider creates");
+        assert!(
+            store
+                .list_providers_for_model("model-disabled-provider")
+                .await
+                .expect("disabled provider lookup")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_active_probe_candidates()
+                .await
+                .expect("active probe candidates reload")
+                .iter()
+                .all(|provider| provider.enabled
+                    && provider
+                        .channels
+                        .iter()
+                        .all(|channel| channel.enabled && channel.weight > 0))
+        );
+
+        db.write()
+            .await
+            .execute(db.stmt(
+                "UPDATE monoize_providers SET extra_fields_whitelist = $1 WHERE id = $2",
+                vec!["not-json".into(), created.id.clone().into()],
+            ))
+            .await
+            .expect("corrupt whitelist writes");
+        assert!(
+            store
+                .get_provider(&created.id)
+                .await
+                .expect_err("invalid whitelist must fail provider decoding")
+                .contains("invalid extra_fields_whitelist JSON")
+        );
+    }
 
     #[test]
     fn probe_request_plan_routes_each_api_type() {
@@ -1788,11 +2909,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_provider_groups_json_is_backward_compatible_for_empty_and_malformed_values() {
-        assert!(parse_provider_groups_json("").is_empty());
-        assert!(parse_provider_groups_json("not-json").is_empty());
+    fn decode_provider_groups_json_is_compatible_only_for_absent_and_empty_values() {
+        assert!(
+            decode_provider_groups_json("provider-a", None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            decode_provider_groups_json("provider-a", Some(String::new()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(decode_provider_groups_json("provider-a", Some("not-json".to_string())).is_err());
+        assert!(decode_provider_groups_json("provider-a", Some("[1]".to_string())).is_err());
         assert_eq!(
-            parse_provider_groups_json(r#"[" Beta ","alpha","ALPHA",""]"#),
+            decode_provider_groups_json(
+                "provider-a",
+                Some(r#"[" Beta ","alpha","ALPHA",""]"#.to_string())
+            )
+            .unwrap(),
             vec!["alpha".to_string(), "beta".to_string()]
         );
     }

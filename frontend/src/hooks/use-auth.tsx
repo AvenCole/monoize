@@ -2,6 +2,7 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import type { User } from "@/lib/api";
+import { clearCache } from "@/lib/swr";
 
 interface AuthContextType {
   user: User | null;
@@ -25,6 +26,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch {
       setUser(null);
       api.setToken(null);
+      await clearCache();
     }
   };
 
@@ -34,12 +36,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const login = async (username: string, password: string) => {
     const response = await api.login(username, password);
+    await clearCache();
     api.setToken(response.token);
     setUser(response.user);
   };
 
   const register = async (username: string, password: string) => {
     const response = await api.register(username, password);
+    await clearCache();
     api.setToken(response.token);
     setUser(response.user);
   };
@@ -50,6 +54,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } finally {
       api.setToken(null);
       setUser(null);
+      await clearCache();
     }
   };
 

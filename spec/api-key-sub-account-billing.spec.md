@@ -177,9 +177,13 @@ SA-API6b. Disabling sub-account on a key with zero balance MUST succeed without 
 
 SA-DEL1. Single-key and batch-key deletion MUST run in a transaction. For every selected key, the transaction MUST lock the owning user before the API key as required by SA-CC3.
 
+SA-DEL1a. Batch deletion MUST lock all distinct owning users with one ordered set query and then lock all selected API keys with one ordered set query. It MUST NOT issue one user-lock query per user or one key-lock query per key.
+
 SA-DEL2. Before deleting a sub-account key, the transaction MUST add its complete signed `sub_account_balance_nano` to the owning finite user's balance with checked integer arithmetic. This rule applies to positive, zero, and negative key balances. The transaction MUST NOT erase sub-account debt by deleting the key.
 
 SA-DEL3. For each deleted sub-account key with a non-zero balance, the transaction MUST append `kind = "sub_account_delete_settlement"` with `delta_nano_usd` equal to the signed key balance, `balance_after_nano_usd` equal to the resulting finite user balance, and `meta_json.api_key_id` equal to the deleted key ID. For an unlimited user, the finite balance update is skipped and `balance_after_nano_usd` is null, but the settlement ledger row MUST still be appended.
+
+SA-DEL4. Batch deletion MUST compute settlements in deterministic `(user_id, api_key_id)` order in memory from the locked values. Finite user balances MUST be updated through bind-safe CASE chunks, and settlement ledger rows MUST be inserted through bind-safe multi-row chunks. The number of database round trips MAY grow by fixed chunk count but MUST NOT grow by one round trip per deleted key.
 
 SA-DEL4. The balance consolidation, ledger append, and key deletion MUST commit together. Any parse error, overflow, update error, ledger error, or delete error MUST roll back the entire single-key or batch-key operation.
 

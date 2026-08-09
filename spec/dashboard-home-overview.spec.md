@@ -43,6 +43,8 @@ DH-5. Row C right panel MUST contain downstream API information:
 
 DH-5a. Row C right panel (API information) MUST be visible to all authenticated dashboard users (including non-admin `user` role). It MUST NOT depend on admin-only endpoints.
 
+DH-5b. `GET /api/dashboard/settings/public` MUST read only the four setting keys returned by that endpoint in one set-based database query. It MUST NOT load transforms, redirects, pricing patterns, suffix maps, or other unrelated settings.
+
 ## Data Source Contract
 
 DH-6. Provider-derived metrics shown on dashboard home MUST use `GET /api/dashboard/providers` data when available.
@@ -50,6 +52,8 @@ DH-6. Provider-derived metrics shown on dashboard home MUST use `GET /api/dashbo
 DH-7. The page MUST NOT throw runtime exceptions when optional config fields are missing from `GET /api/dashboard/settings`.
 
 DH-8. Row C analysis charts MUST be driven by the server-side analytics endpoint `GET /api/dashboard/analytics` using `buckets=8` and `range_hours=24`.
+
+DH-9. `GET /api/dashboard/stats` MUST compute `my_api_keys_count` with a database count aggregate scoped to the current user. It MUST NOT load the user's API-key records to compute their count.
 
 ### Analytics Endpoint Contract
 
@@ -63,9 +67,13 @@ DH-8. Row C analysis charts MUST be driven by the server-side analytics endpoint
   - For admin users: aggregates across ALL users' request logs.
   - For non-admin users: aggregates only the requesting user's logs.
   - Bucket boundaries: `bucket_width = range_hours / buckets`. Each bucket `i` covers `[time_from + i * bucket_width, time_from + (i+1) * bucket_width)`.
+  - For every backend, `bucket_idx` MUST equal `floor((created_at_unix_ms - time_from_unix_ms) * buckets / (time_to_unix_ms - time_from_unix_ms))`. PostgreSQL MUST use `FLOOR` or exact integer division; it MUST NOT cast a fractional floating-point value directly to `BIGINT`, because PostgreSQL numeric casts round rather than floor.
   - Per bucket, the server groups by `model` and by `provider_id`, computing:
     - `cost_nano_usd: SUM(charge_nano_usd)` — total cost per model per bucket.
     - `call_count: COUNT(*)` — total calls per model (or provider) per bucket.
+  - The model aggregation query MUST execute `GROUP BY bucket_idx, model` in the database and return at most one row per group. It MUST NOT transfer one `created_at_unix_ms`, `model`, or `charge_nano_usd` value per matching request log to Rust.
+  - PostgreSQL MUST aggregate each model bucket with exact `NUMERIC`. SQLite MUST aggregate each model bucket with the five exact decimal limbs defined by `spec/request-logs.spec.md` RL-S2e. Rust MUST decode one aggregate per group with checked `i128` arithmetic.
+  - A canonical stored charge outside the signed `i128` domain MUST return an internal storage error. A per-group sum or the sum across groups outside the signed `i128` domain MUST return an aggregate-overflow error. Non-canonical stored charge text MUST not contribute to cost and MUST still contribute to `call_count`.
   - Only models/providers with nonzero totals across all buckets are included.
 - **Response:**
 

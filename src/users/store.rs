@@ -1,9 +1,9 @@
 use super::utils::parse_nano_usd;
 use super::{
-    ApiKey, BillingError, BillingErrorKind, CreateApiKeyInput, ModelRedirectRule,
-    RESERVED_INTERNAL_USER_PREFIX, RequestCaptureMode, Session, UpdateApiKeyInput, User,
-    UserBalance, UserRole, UserStore, canonicalize_groups, parse_groups_json,
-    validate_model_redirects,
+    AdminUpdateUserInput, ApiKey, BillingError, BillingErrorKind, CreateApiKeyInput,
+    CreateApiKeyWithLimitError, ModelRedirectRule, RESERVED_INTERNAL_USER_PREFIX,
+    RegisterUserError, RequestCaptureMode, Session, UpdateApiKeyInput, User, UserBalance, UserRole,
+    UserStore, canonicalize_groups, validate_model_redirects,
 };
 use crate::transforms::{
     TransformRuleConfig, canonical_transform_id, canonicalize_transform_rule,
@@ -16,9 +16,77 @@ use argon2::{
 use chrono::{DateTime, Utc};
 use sea_orm::Value as SeaValue;
 use sea_orm::{ConnectionTrait, DatabaseTransaction, QueryResult, TransactionTrait};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::sync::{Arc, OnceLock};
+
+const MAX_FORWARDING_API_KEY_BYTES: usize = 512;
+const DEFAULT_API_KEY_BATCH_DELETE_MAX_IDS: usize = 400;
+const DEFAULT_SESSION_CLEANUP_INTERVAL_SECS: u64 = 3_600;
+
+fn parse_positive_limit(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_api_key_batch_delete_limit(raw: Option<&str>) -> usize {
+    parse_positive_limit(raw, DEFAULT_API_KEY_BATCH_DELETE_MAX_IDS)
+        .min(DEFAULT_API_KEY_BATCH_DELETE_MAX_IDS)
+}
+
+fn api_key_batch_delete_max_ids() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_api_key_batch_delete_limit(
+            std::env::var("MONOIZE_API_KEY_BATCH_DELETE_MAX_IDS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_session_cleanup_interval_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SESSION_CLEANUP_INTERVAL_SECS)
+}
+
+fn session_cleanup_interval() -> std::time::Duration {
+    static INTERVAL: OnceLock<std::time::Duration> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::time::Duration::from_secs(parse_session_cleanup_interval_secs(
+            std::env::var("MONOIZE_SESSION_CLEANUP_INTERVAL_SECONDS")
+                .ok()
+                .as_deref(),
+        ))
+    })
+}
+
+fn api_key_lookup_hash(key: &str) -> String {
+    format!("{:032x}", xxhash_rust::xxh3::xxh3_128(key.as_bytes()))
+}
+
+fn canonicalize_ip_whitelist(entries: &[String]) -> Result<Vec<String>, String> {
+    let mut canonical = BTreeSet::new();
+    for entry in entries {
+        let value = entry.trim();
+        if value.is_empty() {
+            return Err("ip_whitelist entries must not be empty".to_string());
+        }
+        let normalized = if let Ok(ip) = value.parse::<IpAddr>() {
+            ip.to_string()
+        } else if let Ok(network) = value.parse::<ipnet::IpNet>() {
+            network.to_string()
+        } else {
+            return Err(format!("invalid ip_whitelist entry: {value}"));
+        };
+        canonical.insert(normalized);
+    }
+    Ok(canonical.into_iter().collect())
+}
 
 const ALLOWED_API_KEY_REQUEST_TRANSFORMS: &[&str] = &[
     "inject_system_prompt",
@@ -113,35 +181,58 @@ pub(crate) fn validate_api_key_transforms(
     Ok(())
 }
 
-fn parse_allowed_groups_json(raw: &str) -> Vec<String> {
-    parse_groups_json(raw)
+fn parse_persisted_json_array<T>(raw: &str, column: &str) -> Result<Vec<T>, String>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str(raw).map_err(|error| format!("invalid persisted {column}: {error}"))
+}
+
+fn parse_allowed_groups_json(raw: Option<&str>, column: &str) -> Result<Vec<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let groups = serde_json::from_str::<Option<Vec<String>>>(raw)
+        .map_err(|error| format!("invalid persisted {column}: {error}"))?
+        .unwrap_or_default();
+    Ok(canonicalize_groups(&groups))
+}
+
+fn decode_required_bool(row: &QueryResult, column: &str) -> Result<bool, String> {
+    let value = row
+        .try_get::<i32>("", column)
+        .map_err(|error| format!("invalid persisted {column}: {error}"))?;
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(format!(
+            "invalid persisted {column}: expected integer 0 or 1, got {value}"
+        )),
+    }
+}
+
+fn decode_request_capture_mode(row: &QueryResult) -> Result<RequestCaptureMode, String> {
+    let raw = row
+        .try_get::<Option<String>>("", "request_capture_mode")
+        .map_err(|error| format!("invalid persisted request_capture_mode: {error}"))?;
+    match raw.as_deref().map(str::trim) {
+        None => Ok(RequestCaptureMode::Off),
+        Some("off") => Ok(RequestCaptureMode::Off),
+        Some("capture-all") => Ok(RequestCaptureMode::CaptureAll),
+        Some("capture-only-abnormal") => Ok(RequestCaptureMode::CaptureOnlyAbnormal),
+        Some(value) => Err(format!(
+            "invalid persisted request_capture_mode: unsupported value {value:?}"
+        )),
+    }
 }
 
 impl UserStore {
-    pub async fn list_all_user_allowed_groups_json(&self) -> Result<Vec<String>, String> {
-        let rows = self
-            .db
-            .read()
-            .query_all(self.db.stmt("SELECT allowed_groups FROM users", vec![]))
-            .await
-            .map_err(|e| e.to_string())?;
-
-        rows.into_iter()
-            .map(|row| row.try_get("", "allowed_groups").map_err(|e| e.to_string()))
-            .collect()
-    }
-
-    pub async fn list_all_api_key_allowed_groups_json(&self) -> Result<Vec<String>, String> {
-        let rows = self
-            .db
-            .read()
-            .query_all(self.db.stmt("SELECT allowed_groups FROM api_keys", vec![]))
-            .await
-            .map_err(|e| e.to_string())?;
-
-        rows.into_iter()
-            .map(|row| row.try_get("", "allowed_groups").map_err(|e| e.to_string()))
-            .collect()
+    pub fn api_key_batch_delete_max_ids() -> usize {
+        api_key_batch_delete_max_ids()
     }
 }
 
@@ -191,55 +282,230 @@ impl UserStore {
         log_broadcast: tokio::sync::broadcast::Sender<Vec<super::InsertRequestLog>>,
         pending_request_logs: Arc<dashmap::DashMap<String, super::InsertRequestLog>>,
     ) -> Result<Self, String> {
+        Self::new_with_pending_request_logs_and_spool_dir(
+            db,
+            log_broadcast,
+            pending_request_logs,
+            None,
+        )
+        .await
+    }
+
+    pub async fn new_with_pending_request_logs_and_spool_dir(
+        db: crate::db::DbPool,
+        log_broadcast: tokio::sync::broadcast::Sender<Vec<super::InsertRequestLog>>,
+        pending_request_logs: Arc<dashmap::DashMap<String, super::InsertRequestLog>>,
+        request_log_spool_dir: Option<std::path::PathBuf>,
+    ) -> Result<Self, String> {
         use std::time::Duration;
         let store = Self {
             db,
             last_used_batcher: crate::db_cache::LastUsedBatcher::new(),
-            request_log_batcher: crate::db_cache::RequestLogBatcher::new(
+            request_log_batcher: crate::db_cache::RequestLogBatcher::new_with_spool_dir(
                 128,
+                request_log_spool_dir,
                 log_broadcast,
                 pending_request_logs,
             ),
             api_key_cache: crate::db_cache::ApiKeyCache::new(Duration::from_secs(60)),
             balance_cache: crate::db_cache::BalanceCache::new(Duration::from_secs(30)),
+            registration_lock: Arc::new(tokio::sync::Mutex::new(())),
+            api_key_creation_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         store.migrate_transform_rule_ids().await?;
+        store.migrate_api_key_lookup_hashes().await?;
+        store.cleanup_expired_sessions().await?;
         Ok(store)
     }
 
-    async fn migrate_transform_rule_ids(&self) -> Result<(), String> {
-        let rows = self
-            .db
-            .read()
-            .query_all(self.db.stmt("SELECT id, transforms FROM api_keys", vec![]))
+    async fn migrate_api_key_lookup_hashes(&self) -> Result<(), String> {
+        const HASH_BACKFILL_CHUNK_SIZE: usize = 300;
+        let mut cursor: Option<String> = None;
+        loop {
+            let tx = self.db.begin_write().await.map_err(|e| e.to_string())?;
+            let rows = match cursor.as_deref() {
+                Some(cursor) => {
+                    tx.query_all(self.db.stmt(
+                        &format!(
+                            "SELECT id, key FROM api_keys
+                             WHERE (key_hash IS NULL OR key_hash = '') AND id > $1
+                             ORDER BY id LIMIT {HASH_BACKFILL_CHUNK_SIZE}"
+                        ),
+                        vec![cursor.into()],
+                    ))
+                    .await
+                }
+                None => {
+                    tx.query_all(self.db.stmt(
+                        &format!(
+                            "SELECT id, key FROM api_keys
+                             WHERE key_hash IS NULL OR key_hash = ''
+                             ORDER BY id LIMIT {HASH_BACKFILL_CHUNK_SIZE}"
+                        ),
+                        vec![],
+                    ))
+                    .await
+                }
+            }
+            .map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                tx.commit().await.map_err(|e| e.to_string())?;
+                break;
+            }
+            let mut updates = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+                let key: String = row.try_get("", "key").map_err(|e| e.to_string())?;
+                updates.push((id, api_key_lookup_hash(&key)));
+            }
+            cursor = updates.last().map(|(id, _)| id.clone());
+            let mut values: Vec<SeaValue> = Vec::with_capacity(updates.len() * 3);
+            let mut cases = Vec::with_capacity(updates.len());
+            let mut ids = Vec::with_capacity(updates.len());
+            for (id, key_hash) in &updates {
+                let id_index = values.len() + 1;
+                values.push(id.clone().into());
+                let hash_index = values.len() + 1;
+                values.push(key_hash.clone().into());
+                cases.push(format!("WHEN ${id_index} THEN ${hash_index}"));
+            }
+            for (id, _) in &updates {
+                let id_index = values.len() + 1;
+                values.push(id.clone().into());
+                ids.push(format!("${id_index}"));
+            }
+            tx.execute(self.db.stmt(
+                &format!(
+                    "UPDATE api_keys
+                     SET key_hash = CASE id {} ELSE key_hash END
+                     WHERE id IN ({}) AND (key_hash IS NULL OR key_hash = '')",
+                    cases.join(" "),
+                    ids.join(", ")
+                ),
+                values,
+            ))
             .await
             .map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
 
-        for row in rows {
-            let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
-            let raw: String = row
-                .try_get("", "transforms")
-                .unwrap_or_else(|_| "[]".to_string());
-            let Ok(mut transforms) = serde_json::from_str::<Vec<TransformRuleConfig>>(&raw) else {
-                tracing::warn!(api_key_id = %id, "skip invalid api key transforms during transform id migration");
-                continue;
-            };
-            if !canonicalize_transform_rules(&mut transforms) {
-                continue;
+    async fn migrate_transform_rule_ids(&self) -> Result<(), String> {
+        const TRANSFORM_MIGRATION_MARKER: &str = "migration.api_key_transform_rule_ids.v1";
+        const TRANSFORM_MIGRATION_CHUNK_SIZE: usize = 300;
+        let marker = self
+            .db
+            .read()
+            .query_one(self.db.stmt(
+                "SELECT value FROM system_settings WHERE key = $1",
+                vec![TRANSFORM_MIGRATION_MARKER.into()],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        if marker
+            .as_ref()
+            .and_then(|row| row.try_get::<String>("", "value").ok())
+            .as_deref()
+            == Some("complete")
+        {
+            return Ok(());
+        }
+        let mut cursor: Option<String> = None;
+        loop {
+            let tx = self.db.begin_write().await.map_err(|e| e.to_string())?;
+            let rows = match cursor.as_deref() {
+                Some(cursor) => {
+                    tx.query_all(self.db.stmt(
+                        &format!(
+                            "SELECT id, transforms FROM api_keys
+                             WHERE id > $1 ORDER BY id LIMIT {TRANSFORM_MIGRATION_CHUNK_SIZE}"
+                        ),
+                        vec![cursor.into()],
+                    ))
+                    .await
+                }
+                None => {
+                    tx.query_all(self.db.stmt(
+                        &format!(
+                            "SELECT id, transforms FROM api_keys
+                             ORDER BY id LIMIT {TRANSFORM_MIGRATION_CHUNK_SIZE}"
+                        ),
+                        vec![],
+                    ))
+                    .await
+                }
             }
-            let encoded = serde_json::to_string(&transforms).map_err(|e| e.to_string())?;
-            self.db
-                .write()
-                .await
-                .execute(self.db.stmt(
-                    "UPDATE api_keys SET transforms = $1 WHERE id = $2",
-                    vec![encoded.into(), id.clone().into()],
+            .map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                tx.commit().await.map_err(|e| e.to_string())?;
+                break;
+            }
+
+            let mut updates = Vec::new();
+            for row in rows {
+                let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+                cursor = Some(id.clone());
+                let raw: String = row
+                    .try_get("", "transforms")
+                    .unwrap_or_else(|_| "[]".to_string());
+                let Ok(mut transforms) = serde_json::from_str::<Vec<TransformRuleConfig>>(&raw)
+                else {
+                    tracing::warn!(api_key_id = %id, "skip invalid api key transforms during transform id migration");
+                    continue;
+                };
+                if !canonicalize_transform_rules(&mut transforms) {
+                    continue;
+                }
+                let encoded = serde_json::to_string(&transforms).map_err(|e| e.to_string())?;
+                updates.push((id, encoded));
+            }
+            if !updates.is_empty() {
+                let mut values: Vec<SeaValue> = Vec::with_capacity(updates.len() * 3);
+                let mut cases = Vec::with_capacity(updates.len());
+                let mut ids = Vec::with_capacity(updates.len());
+                for (id, transforms) in &updates {
+                    let id_index = values.len() + 1;
+                    values.push(id.clone().into());
+                    let transforms_index = values.len() + 1;
+                    values.push(transforms.clone().into());
+                    cases.push(format!("WHEN ${id_index} THEN ${transforms_index}"));
+                }
+                for (id, _) in &updates {
+                    let id_index = values.len() + 1;
+                    values.push(id.clone().into());
+                    ids.push(format!("${id_index}"));
+                }
+                tx.execute(self.db.stmt(
+                    &format!(
+                        "UPDATE api_keys SET transforms = CASE id {} ELSE transforms END
+                         WHERE id IN ({})",
+                        cases.join(" "),
+                        ids.join(", ")
+                    ),
+                    values,
                 ))
                 .await
                 .map_err(|e| e.to_string())?;
-            self.api_key_cache.invalidate_by_key_id(&id);
+            }
+            tx.commit().await.map_err(|e| e.to_string())?;
+            for (id, _) in updates {
+                self.api_key_cache.invalidate_by_key_id(&id);
+            }
         }
-        Ok(())
+        let tx = self.db.begin_write().await.map_err(|e| e.to_string())?;
+        tx.execute(self.db.stmt(
+            "INSERT INTO system_settings (key, value, updated_at) VALUES ($1, $2, $3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            vec![
+                TRANSFORM_MIGRATION_MARKER.into(),
+                "complete".into(),
+                Utc::now().to_rfc3339().into(),
+            ],
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())
     }
 
     pub fn spawn_background_tasks(&self) {
@@ -255,6 +521,15 @@ impl UserStore {
         self.balance_cache
             .clone()
             .spawn_eviction_task(std::time::Duration::from_secs(30));
+        let store = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(session_cleanup_interval()).await;
+                if let Err(error) = store.cleanup_expired_sessions().await {
+                    tracing::warn!(%error, "failed to cleanup expired sessions");
+                }
+            }
+        });
         let store = self.clone();
         tokio::spawn(async move {
             loop {
@@ -346,6 +621,38 @@ impl UserStore {
             email: None,
             allowed_groups,
         })
+    }
+
+    pub async fn register_user_atomic(
+        &self,
+        username: &str,
+        password: &str,
+        registration_enabled: bool,
+    ) -> Result<User, RegisterUserError> {
+        let _registration_guard = self.registration_lock.lock().await;
+        let user_count = self
+            .user_count()
+            .await
+            .map_err(RegisterUserError::Storage)?;
+        if user_count != 0 && !registration_enabled {
+            return Err(RegisterUserError::RegistrationDisabled);
+        }
+        if self
+            .get_user_by_username(username)
+            .await
+            .map_err(RegisterUserError::Storage)?
+            .is_some()
+        {
+            return Err(RegisterUserError::UsernameExists);
+        }
+        let role = if user_count == 0 {
+            UserRole::SuperAdmin
+        } else {
+            UserRole::User
+        };
+        self.create_user(username, password, role, &[])
+            .await
+            .map_err(RegisterUserError::Storage)
     }
 
     pub async fn get_user_by_id(&self, id: &str) -> Result<Option<User>, String> {
@@ -489,7 +796,152 @@ impl UserStore {
         Ok(())
     }
 
-    pub async fn delete_user(&self, id: &str) -> Result<Vec<String>, String> {
+    pub async fn admin_update_user_atomic(
+        &self,
+        id: &str,
+        input: AdminUpdateUserInput,
+        actor_user_id: &str,
+    ) -> Result<(), String> {
+        let AdminUpdateUserInput {
+            username,
+            password,
+            role,
+            enabled,
+            balance_nano_usd,
+            balance_unlimited,
+            email,
+            allowed_groups,
+        } = input;
+        let has_balance_change = balance_nano_usd.is_some() || balance_unlimited.is_some();
+        if username.is_none()
+            && password.is_none()
+            && role.is_none()
+            && enabled.is_none()
+            && !has_balance_change
+            && email.is_none()
+            && allowed_groups.is_none()
+        {
+            return Ok(());
+        }
+
+        let password_hash = password.as_deref().map(Self::hash_password).transpose()?;
+        let parsed_balance = balance_nano_usd
+            .as_deref()
+            .map(parse_nano_usd)
+            .transpose()?;
+        let allowed_groups_json = allowed_groups
+            .as_deref()
+            .map(serialize_allowed_groups_json)
+            .transpose()?;
+
+        let write = self.db.write().await;
+        let tx = write.begin().await.map_err(|e| e.to_string())?;
+        let current = self
+            .lock_user_balance_tx(&tx, id)
+            .await
+            .map_err(|error| error.message)?;
+        let new_balance = parsed_balance.unwrap_or(current.balance);
+        let new_unlimited = balance_unlimited.unwrap_or(current.unlimited);
+        let now = Utc::now().to_rfc3339();
+        let mut set_clauses = Vec::new();
+        let mut values: Vec<SeaValue> = Vec::new();
+        let mut idx = 1usize;
+
+        if let Some(username) = username {
+            set_clauses.push(format!("username = ${idx}"));
+            values.push(username.into());
+            idx += 1;
+        }
+        if let Some(password_hash) = password_hash {
+            set_clauses.push(format!("password_hash = ${idx}"));
+            values.push(password_hash.into());
+            idx += 1;
+        }
+        if let Some(role) = role {
+            set_clauses.push(format!("role = ${idx}"));
+            values.push(role.as_str().into());
+            idx += 1;
+        }
+        if let Some(enabled) = enabled {
+            set_clauses.push(format!("enabled = ${idx}"));
+            values.push(SeaValue::Int(Some(if enabled { 1 } else { 0 })));
+            idx += 1;
+        }
+        if parsed_balance.is_some() {
+            set_clauses.push(format!("balance_nano_usd = ${idx}"));
+            values.push(new_balance.to_string().into());
+            idx += 1;
+        }
+        if balance_unlimited.is_some() {
+            set_clauses.push(format!("balance_unlimited = ${idx}"));
+            values.push(SeaValue::Int(Some(if new_unlimited { 1 } else { 0 })));
+            idx += 1;
+        }
+        if let Some(email) = email {
+            match email
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(email) => {
+                    set_clauses.push(format!("email = ${idx}"));
+                    values.push(email.into());
+                    idx += 1;
+                }
+                None => set_clauses.push("email = NULL".to_string()),
+            }
+        }
+        if let Some(allowed_groups_json) = allowed_groups_json {
+            set_clauses.push(format!("allowed_groups = ${idx}"));
+            values.push(allowed_groups_json.into());
+            idx += 1;
+        }
+        set_clauses.push(format!("updated_at = ${idx}"));
+        values.push(now.clone().into());
+        idx += 1;
+        values.push(id.into());
+        tx.execute(self.db.stmt(
+            &format!(
+                "UPDATE users SET {} WHERE id = ${idx}",
+                set_clauses.join(", ")
+            ),
+            values,
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if has_balance_change {
+            let delta = new_balance
+                .checked_sub(current.balance)
+                .ok_or_else(|| "balance delta overflow".to_string())?;
+            self.insert_billing_ledger_tx(
+                &tx,
+                id,
+                "admin_adjustment",
+                delta,
+                Some(new_balance),
+                &serde_json::json!({
+                    "actor_user_id": actor_user_id,
+                    "before_balance_nano_usd": current.balance.to_string(),
+                    "after_balance_nano_usd": new_balance.to_string(),
+                    "before_balance_unlimited": current.unlimited,
+                    "after_balance_unlimited": new_unlimited,
+                }),
+                &now,
+            )
+            .await
+            .map_err(|error| error.message)?;
+        }
+
+        tx.commit().await.map_err(|e| e.to_string())?;
+        self.api_key_cache.invalidate_by_user_id(id);
+        if has_balance_change {
+            self.balance_cache.invalidate(id);
+        }
+        Ok(())
+    }
+
+    pub async fn delete_user(&self, id: &str) -> Result<(), String> {
         let write = self.db.write().await;
         let tx = write.begin().await.map_err(|e| e.to_string())?;
         let user_lock_sql = if self.db.is_postgres() {
@@ -497,30 +949,27 @@ impl UserStore {
         } else {
             "SELECT id FROM users WHERE id = $1"
         };
-        tx.query_one(self.db.stmt(user_lock_sql, vec![id.into()]))
+        let user = tx
+            .query_one(self.db.stmt(user_lock_sql, vec![id.into()]))
             .await
             .map_err(|e| e.to_string())?;
-        let api_key_rows = tx
-            .query_all(self.db.stmt(
-                "SELECT id FROM api_keys WHERE user_id = $1",
-                vec![id.into()],
-            ))
+        if user.is_none() {
+            return Err("user not found".to_string());
+        }
+        let result = tx
+            .execute(
+                self.db
+                    .stmt("DELETE FROM users WHERE id = $1", vec![id.into()]),
+            )
             .await
             .map_err(|e| e.to_string())?;
-        let api_key_ids = api_key_rows
-            .iter()
-            .map(|row| row.try_get("", "id").map_err(|e| e.to_string()))
-            .collect::<Result<Vec<String>, String>>()?;
-        tx.execute(
-            self.db
-                .stmt("DELETE FROM users WHERE id = $1", vec![id.into()]),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        if result.rows_affected() != 1 {
+            return Err("user not found".to_string());
+        }
         tx.commit().await.map_err(|e| e.to_string())?;
         self.api_key_cache.invalidate_by_user_id(id);
         self.balance_cache.invalidate(id);
-        Ok(api_key_ids)
+        Ok(())
     }
 
     pub async fn update_last_login(&self, id: &str) -> Result<(), String> {
@@ -534,6 +983,7 @@ impl UserStore {
             ))
             .await
             .map_err(|e| e.to_string())?;
+        self.api_key_cache.invalidate_by_user_id(id);
         Ok(())
     }
 
@@ -574,6 +1024,20 @@ impl UserStore {
             created_at: now,
             expires_at,
         })
+    }
+
+    pub async fn cleanup_expired_sessions(&self) -> Result<u64, String> {
+        let result = self
+            .db
+            .write()
+            .await
+            .execute(self.db.stmt(
+                "DELETE FROM sessions WHERE expires_at <= $1",
+                vec![Utc::now().to_rfc3339().into()],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(result.rows_affected())
     }
 
     pub async fn get_session_by_token(&self, token: &str) -> Result<Option<Session>, String> {
@@ -678,6 +1142,7 @@ impl UserStore {
         canonicalize_transform_rules(&mut input.transforms);
         validate_api_key_transforms(&input.transforms, is_admin)?;
         validate_model_redirects(&input.model_redirects)?;
+        input.ip_whitelist = canonicalize_ip_whitelist(&input.ip_whitelist)?;
         if input.sub_account_balance_nano_usd.is_some() && !is_admin {
             return Err("only admins may set an initial sub-account balance".to_string());
         }
@@ -710,7 +1175,7 @@ impl UserStore {
         let id = uuid::Uuid::new_v4().to_string();
         let key = format!("sk-{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
         let key_prefix = key[..12].to_string();
-        let key_hash = String::new();
+        let key_hash = api_key_lookup_hash(&key);
         let now = Utc::now();
         let expires_at = input
             .expires_in_days
@@ -804,10 +1269,37 @@ impl UserStore {
         Ok((api_key, key))
     }
 
+    pub async fn create_api_key_extended_with_limit(
+        &self,
+        user_id: &str,
+        input: CreateApiKeyInput,
+        is_admin: bool,
+        max_per_user: i64,
+    ) -> Result<(ApiKey, String), CreateApiKeyWithLimitError> {
+        if max_per_user <= 0 {
+            return Err(CreateApiKeyWithLimitError::InvalidRequest(
+                "api_key_max_per_user must be positive".to_string(),
+            ));
+        }
+        let _creation_guard = self.api_key_creation_lock.lock().await;
+        let count = self
+            .count_user_api_keys(user_id)
+            .await
+            .map_err(CreateApiKeyWithLimitError::InvalidRequest)?;
+        if count >= max_per_user {
+            return Err(CreateApiKeyWithLimitError::LimitReached {
+                limit: max_per_user,
+            });
+        }
+        self.create_api_key_extended(user_id, input, is_admin)
+            .await
+            .map_err(CreateApiKeyWithLimitError::InvalidRequest)
+    }
+
     pub async fn get_api_key_by_prefix(&self, prefix: &str) -> Result<Option<ApiKey>, String> {
         let row = self.db.read()
             .query_one(self.db.stmt(
-                "SELECT id, user_id, name, key_prefix, key, key_hash, created_at, expires_at, last_used_at, enabled, sub_account_enabled, sub_account_balance_nano, model_limits_enabled, model_limits, ip_whitelist, allowed_groups, token_group, max_multiplier, transforms, model_redirects, reasoning_envelope_enabled, request_capture_enabled, request_capture_mode FROM api_keys WHERE key_prefix = $1",
+                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.key_hash, a.created_at, a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled, a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits, a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier, a.transforms, a.model_redirects, a.reasoning_envelope_enabled, a.request_capture_enabled, a.request_capture_mode, u.role AS owner_role FROM api_keys a JOIN users u ON u.id = a.user_id WHERE a.key_prefix = $1",
                 vec![prefix.into()],
             ))
             .await
@@ -825,7 +1317,7 @@ impl UserStore {
             .db
             .read()
             .query_one(self.db.stmt(
-                "SELECT id, user_id, name, key_prefix, key, key_hash, created_at, expires_at, last_used_at, enabled, sub_account_enabled, sub_account_balance_nano, model_limits_enabled, model_limits, ip_whitelist, allowed_groups, token_group, max_multiplier, transforms, model_redirects, reasoning_envelope_enabled, request_capture_enabled, request_capture_mode FROM api_keys WHERE key = $1",
+                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.key_hash, a.created_at, a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled, a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits, a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier, a.transforms, a.model_redirects, a.reasoning_envelope_enabled, a.request_capture_enabled, a.request_capture_mode, u.role AS owner_role FROM api_keys a JOIN users u ON u.id = a.user_id WHERE a.key = $1",
                 vec![key.into()],
             ))
             .await
@@ -837,10 +1329,108 @@ impl UserStore {
         }
     }
 
+    async fn get_api_key_auth_candidate(
+        &self,
+        key: &str,
+    ) -> Result<Option<(ApiKey, User)>, String> {
+        let row = self
+            .db
+            .read()
+            .query_one(self.db.stmt(
+                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.key_hash,
+                        a.created_at, a.expires_at, a.last_used_at, a.enabled,
+                        a.sub_account_enabled, a.sub_account_balance_nano,
+                        a.model_limits_enabled, a.model_limits, a.ip_whitelist,
+                        a.allowed_groups, a.token_group, a.max_multiplier, a.transforms,
+                        a.model_redirects, a.reasoning_envelope_enabled,
+                        a.request_capture_enabled, a.request_capture_mode,
+                        u.role AS owner_role,
+                        u.id AS owner_id, u.username AS owner_username,
+                        u.password_hash AS owner_password_hash,
+                        u.created_at AS owner_created_at, u.updated_at AS owner_updated_at,
+                        u.last_login_at AS owner_last_login_at, u.enabled AS owner_enabled,
+                        u.balance_nano_usd AS owner_balance_nano_usd,
+                        u.balance_unlimited AS owner_balance_unlimited,
+                        u.email AS owner_email, u.allowed_groups AS owner_allowed_groups
+                 FROM api_keys a
+                 JOIN users u ON u.id = a.user_id
+                 WHERE a.key_hash = $1 AND a.key = $2
+                 LIMIT 1",
+                vec![api_key_lookup_hash(key).into(), key.into()],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let api_key = self.row_to_api_key(&row).await?;
+        let role_raw: String = row.try_get("", "owner_role").map_err(|e| e.to_string())?;
+        let role = UserRole::from_str(&role_raw).ok_or_else(|| "invalid role".to_string())?;
+        let parse_time = |column: &str| -> Result<DateTime<Utc>, String> {
+            DateTime::parse_from_rfc3339(
+                &row.try_get::<String>("", column)
+                    .map_err(|e| e.to_string())?,
+            )
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|e| e.to_string())
+        };
+        let last_login_at = row
+            .try_get::<Option<String>>("", "owner_last_login_at")
+            .map_err(|e| e.to_string())?
+            .map(|value| DateTime::parse_from_rfc3339(&value).map(|v| v.with_timezone(&Utc)))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let balance_nano_usd: String = row
+            .try_get("", "owner_balance_nano_usd")
+            .map_err(|e| e.to_string())?;
+        parse_nano_usd(&balance_nano_usd)
+            .map_err(|e| format!("invalid persisted user balance: {e}"))?;
+        let owner_enabled = decode_required_bool(&row, "owner_enabled")?;
+        let owner_allowed_groups_raw = row
+            .try_get::<Option<String>>("", "owner_allowed_groups")
+            .map_err(|error| format!("invalid persisted users.allowed_groups: {error}"))?;
+        let user = User {
+            id: row.try_get("", "owner_id").map_err(|e| e.to_string())?,
+            username: row
+                .try_get("", "owner_username")
+                .map_err(|e| e.to_string())?,
+            password_hash: row
+                .try_get("", "owner_password_hash")
+                .map_err(|e| e.to_string())?,
+            role,
+            created_at: parse_time("owner_created_at")?,
+            updated_at: parse_time("owner_updated_at")?,
+            last_login_at,
+            enabled: owner_enabled,
+            balance_nano_usd,
+            balance_unlimited: row
+                .try_get::<i32>("", "owner_balance_unlimited")
+                .map_err(|e| e.to_string())?
+                == 1,
+            email: row
+                .try_get::<Option<String>>("", "owner_email")
+                .map_err(|e| e.to_string())?,
+            allowed_groups: parse_allowed_groups_json(
+                owner_allowed_groups_raw.as_deref(),
+                "users.allowed_groups",
+            )?,
+        };
+        Ok(Some((api_key, user)))
+    }
+
     pub async fn list_user_api_keys(&self, user_id: &str) -> Result<Vec<ApiKey>, String> {
-        let rows = self.db.read()
+        let rows = self
+            .db
+            .read()
             .query_all(self.db.stmt(
-                "SELECT id, user_id, name, key_prefix, key, key_hash, created_at, expires_at, last_used_at, enabled, sub_account_enabled, sub_account_balance_nano, model_limits_enabled, model_limits, ip_whitelist, allowed_groups, token_group, max_multiplier, transforms, model_redirects, reasoning_envelope_enabled, request_capture_enabled, request_capture_mode FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC",
+                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.key_hash, a.created_at,
+                        a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled,
+                        a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits,
+                        a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier,
+                        a.transforms, a.model_redirects, a.reasoning_envelope_enabled,
+                        a.request_capture_enabled, a.request_capture_mode, u.role AS owner_role
+                 FROM api_keys a JOIN users u ON u.id = a.user_id
+                 WHERE a.user_id = $1 ORDER BY a.created_at DESC",
                 vec![user_id.into()],
             ))
             .await
@@ -851,6 +1441,87 @@ impl UserStore {
             api_keys.push(self.row_to_api_key(row).await?);
         }
         Ok(api_keys)
+    }
+
+    pub async fn count_user_api_keys(&self, user_id: &str) -> Result<i64, String> {
+        let row = self
+            .db
+            .read()
+            .query_one(self.db.stmt(
+                "SELECT COUNT(*) AS cnt FROM api_keys WHERE user_id = $1",
+                vec![user_id.into()],
+            ))
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "count query returned no row".to_string())?;
+        row.try_get("", "cnt").map_err(|e| e.to_string())
+    }
+
+    pub async fn get_api_key_for_user(
+        &self,
+        id: &str,
+        user_id: &str,
+    ) -> Result<Option<ApiKey>, String> {
+        let row = self
+            .db
+            .read()
+            .query_one(self.db.stmt(
+                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.key_hash, a.created_at,
+                        a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled,
+                        a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits,
+                        a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier,
+                        a.transforms, a.model_redirects, a.reasoning_envelope_enabled,
+                        a.request_capture_enabled, a.request_capture_mode, u.role AS owner_role
+                 FROM api_keys a JOIN users u ON u.id = a.user_id
+                 WHERE a.id = $1 AND a.user_id = $2",
+                vec![id.into(), user_id.into()],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        match row {
+            Some(row) => Ok(Some(self.row_to_api_key(&row).await?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn filter_user_api_key_ids(
+        &self,
+        user_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<String>, String> {
+        if ids.len() > api_key_batch_delete_max_ids() {
+            return Err(format!(
+                "batch delete accepts at most {} ids",
+                api_key_batch_delete_max_ids()
+            ));
+        }
+        let mut ids = ids.to_vec();
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..ids.len())
+            .map(|index| format!("${}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut values: Vec<SeaValue> = Vec::with_capacity(ids.len() + 1);
+        values.push(user_id.into());
+        values.extend(ids.iter().cloned().map(Into::into));
+        let rows = self
+            .db
+            .read()
+            .query_all(self.db.stmt(
+                &format!(
+                    "SELECT id FROM api_keys WHERE user_id = $1 AND id IN ({placeholders}) ORDER BY id"
+                ),
+                values,
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        rows.into_iter()
+            .map(|row| row.try_get("", "id").map_err(|e| e.to_string()))
+            .collect()
     }
 
     pub async fn update_api_key_last_used(&self, id: &str) -> Result<(), String> {
@@ -936,6 +1607,12 @@ impl UserStore {
     }
 
     async fn delete_api_keys_transactional(&self, ids: &[String]) -> Result<usize, String> {
+        if ids.len() > api_key_batch_delete_max_ids() {
+            return Err(format!(
+                "batch delete accepts at most {} ids",
+                api_key_batch_delete_max_ids()
+            ));
+        }
         if ids.is_empty() {
             return Ok(0);
         }
@@ -947,44 +1624,124 @@ impl UserStore {
         let write = self.db.write().await;
         let tx = write.begin().await.map_err(|e| e.to_string())?;
 
-        let mut expected_owners = BTreeMap::new();
-        for key_id in &key_ids {
-            let row = tx
-                .query_one(self.db.stmt(
-                    "SELECT user_id FROM api_keys WHERE id = $1",
-                    vec![key_id.clone().into()],
+        let placeholders = (0..key_ids.len())
+            .map(|index| format!("${}", index + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let key_values = key_ids.iter().cloned().map(Into::into).collect::<Vec<_>>();
+        let owner_rows = tx
+            .query_all(self.db.stmt(
+                &format!(
+                    "SELECT id, user_id FROM api_keys WHERE id IN ({placeholders}) ORDER BY user_id, id"
+                ),
+                key_values.clone(),
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut expected_owners: BTreeMap<String, String> = BTreeMap::new();
+        for row in owner_rows {
+            expected_owners.insert(
+                row.try_get("", "id").map_err(|e| e.to_string())?,
+                row.try_get("", "user_id").map_err(|e| e.to_string())?,
+            );
+        }
+
+        let user_ids: Vec<String> = expected_owners
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut user_balances = BTreeMap::new();
+        if !user_ids.is_empty() {
+            let user_placeholders = (0..user_ids.len())
+                .map(|index| format!("${}", index + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let user_lock_suffix = if self.db.is_postgres() {
+                " FOR UPDATE"
+            } else {
+                ""
+            };
+            let user_rows = tx
+                .query_all(self.db.stmt(
+                    &format!(
+                        "SELECT id, balance_nano_usd, balance_unlimited
+                         FROM users WHERE id IN ({user_placeholders})
+                         ORDER BY id{user_lock_suffix}"
+                    ),
+                    user_ids.iter().cloned().map(Into::into).collect(),
                 ))
                 .await
                 .map_err(|e| e.to_string())?;
-            if let Some(row) = row {
-                let user_id: String = row.try_get("", "user_id").map_err(|e| e.to_string())?;
-                expected_owners.insert(key_id.clone(), user_id);
+            for row in user_rows {
+                let user_id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+                let raw: String = row
+                    .try_get("", "balance_nano_usd")
+                    .map_err(|e| e.to_string())?;
+                let balance = parse_nano_usd(&raw)
+                    .map_err(|e| format!("invalid persisted user balance: {e}"))?;
+                let unlimited = row
+                    .try_get::<i32>("", "balance_unlimited")
+                    .map_err(|e| e.to_string())?
+                    == 1;
+                user_balances.insert(user_id, LockedUserBalance { balance, unlimited });
+            }
+            if user_balances.len() != user_ids.len() {
+                return Err("api key owner was not found".to_string());
             }
         }
 
-        let mut user_balances = BTreeMap::new();
-        let user_ids: BTreeSet<String> = expected_owners.values().cloned().collect();
-        for user_id in user_ids {
-            let balance = self
-                .lock_user_balance_tx(&tx, &user_id)
-                .await
-                .map_err(|e| e.message)?;
-            user_balances.insert(user_id, balance);
-        }
-
-        let mut locked_keys = Vec::with_capacity(expected_owners.len());
-        for (key_id, user_id) in &expected_owners {
-            match self.lock_api_key_balance_tx(&tx, key_id, user_id).await {
-                Ok(key) => locked_keys.push((key_id.clone(), key)),
-                Err(error) if error.kind == BillingErrorKind::NotFound => continue,
-                Err(error) => return Err(error.message),
+        let lock_suffix = if self.db.is_postgres() {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let locked_rows = tx
+            .query_all(self.db.stmt(
+                &format!(
+                    "SELECT id, user_id, sub_account_enabled, sub_account_balance_nano
+                     FROM api_keys WHERE id IN ({placeholders})
+                     ORDER BY user_id, id{lock_suffix}"
+                ),
+                key_values.clone(),
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut locked_keys = Vec::with_capacity(locked_rows.len());
+        for row in locked_rows {
+            let key_id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+            let user_id: String = row.try_get("", "user_id").map_err(|e| e.to_string())?;
+            if expected_owners.get(&key_id) != Some(&user_id) {
+                continue;
             }
+            let raw_balance: String = row
+                .try_get("", "sub_account_balance_nano")
+                .map_err(|e| e.to_string())?;
+            let balance = parse_nano_usd(&raw_balance)
+                .map_err(|e| format!("invalid persisted sub-account balance: {e}"))?;
+            locked_keys.push((
+                key_id,
+                LockedApiKeyBalance {
+                    user_id,
+                    balance,
+                    sub_account_enabled: row
+                        .try_get::<i32>("", "sub_account_enabled")
+                        .map_err(|e| e.to_string())?
+                        == 1,
+                },
+            ));
         }
 
         let now = Utc::now().to_rfc3339();
-        let mut deleted_key_ids = Vec::with_capacity(locked_keys.len());
+        let deleted_key_ids = locked_keys
+            .iter()
+            .map(|(key_id, _)| key_id.clone())
+            .collect::<Vec<_>>();
         let mut affected_user_ids = BTreeSet::new();
-        for (key_id, key) in locked_keys {
+        let mut user_updates = BTreeMap::new();
+        let mut settlement_rows = Vec::new();
+        for (key_id, key) in &locked_keys {
             if key.balance != 0 {
                 let user = user_balances
                     .get_mut(&key.user_id)
@@ -996,43 +1753,99 @@ impl UserStore {
                         .balance
                         .checked_add(key.balance)
                         .ok_or_else(|| "sub-account delete settlement overflow".to_string())?;
-                    tx.execute(self.db.stmt(
-                        "UPDATE users SET balance_nano_usd = $1, updated_at = $2 WHERE id = $3",
-                        vec![
-                            next.to_string().into(),
-                            now.clone().into(),
-                            key.user_id.clone().into(),
-                        ],
-                    ))
-                    .await
-                    .map_err(|e| e.to_string())?;
                     user.balance = next;
+                    user_updates.insert(key.user_id.clone(), next);
                     Some(next)
                 };
-                self.insert_billing_ledger_tx(
-                    &tx,
-                    &key.user_id,
-                    "sub_account_delete_settlement",
+                settlement_rows.push((
+                    uuid::Uuid::new_v4().to_string(),
+                    key.user_id.clone(),
                     key.balance,
                     balance_after,
-                    &serde_json::json!({ "api_key_id": key_id }),
-                    &now,
-                )
-                .await
-                .map_err(|e| e.message)?;
+                    serde_json::json!({ "api_key_id": key_id }).to_string(),
+                ));
                 affected_user_ids.insert(key.user_id.clone());
             }
+        }
 
-            let result = tx
-                .execute(self.db.stmt(
-                    "DELETE FROM api_keys WHERE id = $1",
-                    vec![key_id.clone().into()],
-                ))
-                .await
-                .map_err(|e| e.to_string())?;
-            if result.rows_affected() == 1 {
-                deleted_key_ids.push(key_id);
+        const USER_UPDATE_CHUNK_SIZE: usize = 199;
+        let user_updates = user_updates.into_iter().collect::<Vec<_>>();
+        for chunk in user_updates.chunks(USER_UPDATE_CHUNK_SIZE) {
+            let mut values = Vec::with_capacity(chunk.len() * 2 + 1);
+            let mut cases = Vec::with_capacity(chunk.len());
+            let mut ids = Vec::with_capacity(chunk.len());
+            for (user_id, balance) in chunk {
+                let id_index = values.len() + 1;
+                values.push(user_id.clone().into());
+                ids.push(format!("${id_index}"));
+                let balance_index = values.len() + 1;
+                values.push(balance.to_string().into());
+                cases.push(format!("WHEN ${id_index} THEN ${balance_index}"));
             }
+            let updated_at_index = values.len() + 1;
+            values.push(now.clone().into());
+            tx.execute(self.db.stmt(
+                &format!(
+                    "UPDATE users
+                     SET balance_nano_usd = CASE id {} ELSE balance_nano_usd END,
+                         updated_at = ${updated_at_index}
+                     WHERE id IN ({})",
+                    cases.join(" "),
+                    ids.join(", ")
+                ),
+                values,
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+
+        const LEDGER_INSERT_CHUNK_SIZE: usize = 57;
+        for chunk in settlement_rows.chunks(LEDGER_INSERT_CHUNK_SIZE) {
+            let mut values = Vec::with_capacity(chunk.len() * 7);
+            let mut rows = Vec::with_capacity(chunk.len());
+            for (id, user_id, delta, balance_after, meta_json) in chunk {
+                let start = values.len() + 1;
+                values.push(id.clone().into());
+                values.push(user_id.clone().into());
+                values.push("sub_account_delete_settlement".into());
+                values.push(delta.to_string().into());
+                values.push(balance_after.map(|value| value.to_string()).into());
+                values.push(meta_json.clone().into());
+                values.push(now.clone().into());
+                rows.push(format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    start,
+                    start + 1,
+                    start + 2,
+                    start + 3,
+                    start + 4,
+                    start + 5,
+                    start + 6
+                ));
+            }
+            tx.execute(self.db.stmt(
+                &format!(
+                    "INSERT INTO billing_ledger
+                     (id, user_id, kind, delta_nano_usd, balance_after_nano_usd, meta_json, created_at)
+                     VALUES {}",
+                    rows.join(", ")
+                ),
+                values,
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        if !deleted_key_ids.is_empty() {
+            let delete_placeholders = (0..deleted_key_ids.len())
+                .map(|index| format!("${}", index + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tx.execute(self.db.stmt(
+                &format!("DELETE FROM api_keys WHERE id IN ({delete_placeholders})"),
+                deleted_key_ids.iter().cloned().map(Into::into).collect(),
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
         }
 
         tx.commit().await.map_err(|e| e.to_string())?;
@@ -1050,7 +1863,7 @@ impl UserStore {
     }
 
     pub async fn validate_api_key(&self, key: &str) -> Result<Option<(ApiKey, User)>, String> {
-        if key.len() < 12 {
+        if key.len() < 12 || key.len() > MAX_FORWARDING_API_KEY_BYTES {
             return Ok(None);
         }
 
@@ -1073,8 +1886,8 @@ impl UserStore {
             }
 
             let generation = self.api_key_cache.current_generation();
-            let api_key = match self.get_api_key_by_key(key).await? {
-                Some(api_key) => api_key,
+            let (api_key, user) = match self.get_api_key_auth_candidate(key).await? {
+                Some(candidate) => candidate,
                 None => return Ok(None),
             };
 
@@ -1091,11 +1904,6 @@ impl UserStore {
             if key != api_key.key {
                 return Ok(None);
             }
-
-            let user = match self.get_user_by_id(&api_key.user_id).await? {
-                Some(user) => user,
-                None => return Ok(None),
-            };
 
             if !user.enabled {
                 return Ok(None);
@@ -1128,10 +1936,11 @@ impl UserStore {
             .map(|s| DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)))
             .transpose()
             .map_err(|e| e.to_string())?;
-        let allowed_groups = parse_allowed_groups_json(
-            &row.try_get::<String>("", "allowed_groups")
-                .unwrap_or_else(|_| "[]".to_string()),
-        );
+        let allowed_groups_raw = row
+            .try_get::<Option<String>>("", "allowed_groups")
+            .map_err(|error| format!("invalid persisted users.allowed_groups: {error}"))?;
+        let allowed_groups =
+            parse_allowed_groups_json(allowed_groups_raw.as_deref(), "users.allowed_groups")?;
         let balance_nano_usd: String = row
             .try_get("", "balance_nano_usd")
             .map_err(|e| e.to_string())?;
@@ -1158,16 +1967,15 @@ impl UserStore {
             .map_err(|e| e.to_string())?
             .with_timezone(&Utc),
             last_login_at,
-            enabled: row
-                .try_get::<i32>("", "enabled")
-                .map_err(|e| e.to_string())?
-                == 1,
+            enabled: decode_required_bool(row, "enabled")?,
             balance_nano_usd,
             balance_unlimited: row
                 .try_get::<i32>("", "balance_unlimited")
                 .map_err(|e| e.to_string())?
                 == 1,
-            email: row.try_get::<Option<String>>("", "email").unwrap_or(None),
+            email: row
+                .try_get::<Option<String>>("", "email")
+                .map_err(|e| e.to_string())?,
             allowed_groups,
         })
     }
@@ -1187,27 +1995,31 @@ impl UserStore {
             .transpose()
             .map_err(|e| e.to_string())?;
 
-        let sub_account_enabled: i32 = row.try_get("", "sub_account_enabled").unwrap_or(0);
+        let sub_account_enabled = decode_required_bool(row, "sub_account_enabled")?;
         let sub_account_balance_nano: String = row
             .try_get("", "sub_account_balance_nano")
             .map_err(|e| e.to_string())?;
         parse_nano_usd(&sub_account_balance_nano)
             .map_err(|e| format!("invalid persisted sub-account balance: {e}"))?;
-        let model_limits_enabled: i32 = row.try_get("", "model_limits_enabled").unwrap_or(0);
+        let model_limits_enabled = decode_required_bool(row, "model_limits_enabled")?;
 
         let model_limits_str: String = row
             .try_get("", "model_limits")
-            .unwrap_or_else(|_| "[]".to_string());
-        let model_limits: Vec<String> = serde_json::from_str(&model_limits_str).unwrap_or_default();
+            .map_err(|error| format!("invalid persisted model_limits: {error}"))?;
+        let model_limits = parse_persisted_json_array(&model_limits_str, "model_limits")?;
 
         let ip_whitelist_str: String = row
             .try_get("", "ip_whitelist")
-            .unwrap_or_else(|_| "[]".to_string());
-        let ip_whitelist: Vec<String> = serde_json::from_str(&ip_whitelist_str).unwrap_or_default();
-        let allowed_groups = parse_allowed_groups_json(
-            &row.try_get::<String>("", "allowed_groups")
-                .unwrap_or_else(|_| "[]".to_string()),
-        );
+            .map_err(|error| format!("invalid persisted ip_whitelist: {error}"))?;
+        let ip_whitelist: Vec<String> =
+            parse_persisted_json_array(&ip_whitelist_str, "ip_whitelist")?;
+        let ip_whitelist = canonicalize_ip_whitelist(&ip_whitelist)
+            .map_err(|error| format!("invalid persisted ip_whitelist: {error}"))?;
+        let allowed_groups_raw = row
+            .try_get::<Option<String>>("", "allowed_groups")
+            .map_err(|error| format!("invalid persisted api_keys.allowed_groups: {error}"))?;
+        let allowed_groups =
+            parse_allowed_groups_json(allowed_groups_raw.as_deref(), "api_keys.allowed_groups")?;
 
         let max_multiplier = row
             .try_get::<Option<String>>("", "max_multiplier")
@@ -1217,44 +2029,33 @@ impl UserStore {
             .map_err(|e: String| format!("invalid persisted max_multiplier: {e}"))?;
         let transforms_str: String = row
             .try_get("", "transforms")
-            .unwrap_or_else(|_| "[]".to_string());
+            .map_err(|error| format!("invalid persisted transforms: {error}"))?;
         let model_redirects_str: String = row
             .try_get("", "model_redirects")
-            .unwrap_or_else(|_| "[]".to_string());
+            .map_err(|error| format!("invalid persisted model_redirects: {error}"))?;
         let user_id: String = row.try_get("", "user_id").map_err(|e| e.to_string())?;
-        let is_admin = self
-            .get_user_by_id(&user_id)
-            .await?
-            .is_some_and(|user| user.role.can_manage_system());
-        let transforms: Vec<TransformRuleConfig> = sanitize_api_key_transforms(
-            serde_json::from_str(&transforms_str).unwrap_or_default(),
-            is_admin,
-        );
+        let owner_role = row
+            .try_get::<String>("", "owner_role")
+            .map_err(|error| format!("invalid persisted owner_role: {error}"))?;
+        let is_admin = UserRole::from_str(&owner_role)
+            .ok_or_else(|| format!("invalid persisted owner_role: {owner_role:?}"))?
+            .can_manage_system();
+        let transforms = parse_persisted_json_array(&transforms_str, "transforms")?;
+        let transforms: Vec<TransformRuleConfig> =
+            sanitize_api_key_transforms(transforms, is_admin);
         let model_redirects: Vec<ModelRedirectRule> =
-            serde_json::from_str(&model_redirects_str).unwrap_or_default();
-        let reasoning_envelope_enabled: i32 =
-            row.try_get("", "reasoning_envelope_enabled").unwrap_or(1);
-        let request_capture_mode = row
-            .try_get::<String>("", "request_capture_mode")
-            .map(|raw| RequestCaptureMode::from_db_value(&raw))
-            .unwrap_or_else(|_| {
-                if row
-                    .try_get::<i32>("", "request_capture_enabled")
-                    .unwrap_or(0)
-                    == 1
-                {
-                    RequestCaptureMode::CaptureAll
-                } else {
-                    RequestCaptureMode::Off
-                }
-            });
+            parse_persisted_json_array(&model_redirects_str, "model_redirects")?;
+        validate_model_redirects(&model_redirects)
+            .map_err(|error| format!("invalid persisted model_redirects: {error}"))?;
+        let reasoning_envelope_enabled = decode_required_bool(row, "reasoning_envelope_enabled")?;
+        let request_capture_mode = decode_request_capture_mode(row)?;
 
         Ok(ApiKey {
             id: row.try_get("", "id").map_err(|e| e.to_string())?,
             user_id,
             name: row.try_get("", "name").map_err(|e| e.to_string())?,
             key_prefix: row.try_get("", "key_prefix").map_err(|e| e.to_string())?,
-            key: row.try_get("", "key").unwrap_or_else(|_| String::new()),
+            key: row.try_get("", "key").map_err(|e| e.to_string())?,
             key_hash: row.try_get("", "key_hash").map_err(|e| e.to_string())?,
             created_at: DateTime::parse_from_rfc3339(
                 &row.try_get::<String>("", "created_at")
@@ -1264,20 +2065,17 @@ impl UserStore {
             .with_timezone(&Utc),
             expires_at,
             last_used_at,
-            enabled: row
-                .try_get::<i32>("", "enabled")
-                .map_err(|e| e.to_string())?
-                == 1,
-            sub_account_enabled: sub_account_enabled == 1,
+            enabled: decode_required_bool(row, "enabled")?,
+            sub_account_enabled,
             sub_account_balance_nano,
-            model_limits_enabled: model_limits_enabled == 1,
+            model_limits_enabled,
             model_limits,
             ip_whitelist,
             allowed_groups,
             max_multiplier,
             transforms,
             model_redirects,
-            reasoning_envelope_enabled: reasoning_envelope_enabled == 1,
+            reasoning_envelope_enabled,
             request_capture_mode,
         })
     }
@@ -1295,6 +2093,11 @@ impl UserStore {
         if let Some(model_redirects) = &input.model_redirects {
             validate_model_redirects(model_redirects)?;
         }
+        let canonical_ip_whitelist = input
+            .ip_whitelist
+            .as_ref()
+            .map(|entries| canonicalize_ip_whitelist(entries))
+            .transpose()?;
         if input.sub_account_balance_nano_usd.is_some() && !is_admin {
             return Err("only admins may set a sub-account balance".to_string());
         }
@@ -1373,7 +2176,7 @@ impl UserStore {
             );
             idx += 1;
         }
-        if let Some(ip_whitelist) = &input.ip_whitelist {
+        if let Some(ip_whitelist) = &canonical_ip_whitelist {
             set_clauses.push(format!("ip_whitelist = ${idx}"));
             values.push(
                 serde_json::to_string(ip_whitelist)
@@ -1612,7 +2415,7 @@ impl UserStore {
     pub async fn get_api_key_by_id(&self, id: &str) -> Result<Option<ApiKey>, String> {
         let row = self.db.read()
             .query_one(self.db.stmt(
-                "SELECT id, user_id, name, key_prefix, key, key_hash, created_at, expires_at, last_used_at, enabled, sub_account_enabled, sub_account_balance_nano, model_limits_enabled, model_limits, ip_whitelist, allowed_groups, token_group, max_multiplier, transforms, model_redirects, reasoning_envelope_enabled, request_capture_enabled, request_capture_mode FROM api_keys WHERE id = $1",
+                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.key_hash, a.created_at, a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled, a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits, a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier, a.transforms, a.model_redirects, a.reasoning_envelope_enabled, a.request_capture_enabled, a.request_capture_mode, u.role AS owner_role FROM api_keys a JOIN users u ON u.id = a.user_id WHERE a.id = $1",
                 vec![id.into()],
             ))
             .await
@@ -2100,11 +2903,739 @@ impl UserStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_allowed_groups_json, sanitize_api_key_transforms, serialize_allowed_groups_json,
-        validate_api_key_allowed_groups_subset, validate_api_key_transforms,
+        DEFAULT_SESSION_CLEANUP_INTERVAL_SECS, api_key_lookup_hash, canonicalize_ip_whitelist,
+        parse_allowed_groups_json, parse_api_key_batch_delete_limit, parse_positive_limit,
+        parse_session_cleanup_interval_secs, sanitize_api_key_transforms,
+        serialize_allowed_groups_json, validate_api_key_allowed_groups_subset,
+        validate_api_key_transforms,
     };
+    use crate::db::DbPool;
+    use crate::migration::Migrator;
     use crate::transforms::{Phase, TransformRuleConfig};
+    use crate::users::{
+        AdminUpdateUserInput, CreateApiKeyInput, CreateApiKeyWithLimitError, RegisterUserError,
+        RequestCaptureMode, UserRole, UserStore,
+    };
+    use chrono::Utc;
+    use sea_orm::{ConnectionTrait, Value as SeaValue};
+    use sea_orm_migration::MigratorTrait;
     use serde_json::json;
+
+    #[test]
+    fn api_key_lookup_hash_uses_complete_token() {
+        assert_ne!(
+            api_key_lookup_hash("sk-123456789-suffix-a"),
+            api_key_lookup_hash("sk-123456789-suffix-b")
+        );
+        assert_eq!(
+            api_key_lookup_hash("sk-stable"),
+            api_key_lookup_hash("sk-stable")
+        );
+    }
+
+    #[test]
+    fn api_key_batch_limit_parser_rejects_non_positive_values() {
+        assert_eq!(parse_positive_limit(Some("399"), 400), 399);
+        assert_eq!(parse_positive_limit(Some("0"), 400), 400);
+        assert_eq!(parse_positive_limit(Some("-1"), 400), 400);
+        assert_eq!(parse_positive_limit(Some("invalid"), 400), 400);
+        assert_eq!(parse_api_key_batch_delete_limit(Some("401")), 400);
+    }
+
+    #[test]
+    fn session_cleanup_interval_parser_requires_positive_whole_seconds() {
+        assert_eq!(parse_session_cleanup_interval_secs(Some("17")), 17);
+        for invalid in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-1"),
+            Some("invalid"),
+            Some("18446744073709551616"),
+        ] {
+            assert_eq!(
+                parse_session_cleanup_interval_secs(invalid),
+                DEFAULT_SESSION_CLEANUP_INTERVAL_SECS
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compatibility_migrations_cross_the_fixed_batch_boundary() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let (log_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let store = UserStore::new(db.clone(), log_broadcast)
+            .await
+            .expect("store creates");
+        let user = store
+            .create_user("hash-migration", "password", UserRole::User, &[])
+            .await
+            .expect("user creates");
+        for index in 0..305 {
+            store
+                .create_api_key(&user.id, &format!("key-{index}"), None)
+                .await
+                .expect("key creates");
+        }
+        db.write()
+            .await
+            .execute(db.stmt("UPDATE api_keys SET key_hash = ''", vec![]))
+            .await
+            .expect("hashes clear");
+
+        store
+            .migrate_api_key_lookup_hashes()
+            .await
+            .expect("hashes migrate");
+        let rows = db
+            .read()
+            .query_all(db.stmt("SELECT key, key_hash FROM api_keys", vec![]))
+            .await
+            .expect("hashes query");
+        assert_eq!(rows.len(), 305);
+        for row in rows {
+            let key: String = row.try_get("", "key").expect("key decodes");
+            let hash: String = row.try_get("", "key_hash").expect("hash decodes");
+            assert_eq!(hash, api_key_lookup_hash(&key));
+        }
+
+        let legacy = serde_json::to_string(&vec![TransformRuleConfig {
+            transform: "remove_anthropic_billing_header".to_string(),
+            enabled: true,
+            models: None,
+            phase: Phase::Request,
+            config: json!({}),
+        }])
+        .unwrap();
+        db.write()
+            .await
+            .execute(db.stmt("UPDATE api_keys SET transforms = $1", vec![legacy.into()]))
+            .await
+            .expect("legacy transforms seed");
+        db.write()
+            .await
+            .execute(db.stmt(
+                "DELETE FROM system_settings WHERE key = $1",
+                vec!["migration.api_key_transform_rule_ids.v1".into()],
+            ))
+            .await
+            .expect("migration marker clears");
+
+        store
+            .migrate_transform_rule_ids()
+            .await
+            .expect("transforms migrate");
+        let rows = db
+            .read()
+            .query_all(db.stmt("SELECT transforms FROM api_keys", vec![]))
+            .await
+            .expect("transforms query");
+        assert_eq!(rows.len(), 305);
+        for row in rows {
+            let raw: String = row.try_get("", "transforms").expect("transforms decode");
+            let transforms: Vec<TransformRuleConfig> =
+                serde_json::from_str(&raw).expect("transforms parse");
+            assert_eq!(transforms[0].transform, "strip_anthropic_billing_header");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_last_login_invalidates_cached_user_for_api_keys() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let (log_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let store = UserStore::new(db, log_broadcast)
+            .await
+            .expect("store creates");
+        let user = store
+            .create_user("last-login-cache", "password", UserRole::User, &[])
+            .await
+            .expect("user creates");
+        let (_, token) = store
+            .create_api_key(&user.id, "cached-key", None)
+            .await
+            .expect("key creates");
+
+        let (_, cached_user) = store
+            .validate_api_key(&token)
+            .await
+            .expect("initial validation succeeds")
+            .expect("key is valid");
+        assert!(cached_user.last_login_at.is_none());
+        assert!(store.api_key_cache.get(&token).is_some());
+
+        store
+            .update_last_login(&user.id)
+            .await
+            .expect("last login updates");
+        assert!(store.api_key_cache.get(&token).is_none());
+        let (_, refreshed_user) = store
+            .validate_api_key(&token)
+            .await
+            .expect("refreshed validation succeeds")
+            .expect("key remains valid");
+        assert!(refreshed_user.last_login_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn persisted_auth_policy_corruption_returns_error_without_caching() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let (log_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let store = UserStore::new(db.clone(), log_broadcast)
+            .await
+            .expect("store creates");
+        let user = store
+            .create_user("corrupt-policy", "password", UserRole::User, &[])
+            .await
+            .expect("user creates");
+        let (api_key, token) = store
+            .create_api_key(&user.id, "corrupt-policy-key", None)
+            .await
+            .expect("key creates");
+
+        let api_key_cases: Vec<(&str, SeaValue, SeaValue)> = vec![
+            (
+                "model_limits",
+                SeaValue::Int(Some(7)),
+                "[]".to_string().into(),
+            ),
+            (
+                "ip_whitelist",
+                r#"["not-an-ip"]"#.to_string().into(),
+                "[]".to_string().into(),
+            ),
+            (
+                "allowed_groups",
+                "{".to_string().into(),
+                "[]".to_string().into(),
+            ),
+            (
+                "transforms",
+                "{".to_string().into(),
+                "[]".to_string().into(),
+            ),
+            (
+                "model_redirects",
+                r#"[{"pattern":"(","replace":"target"}]"#.to_string().into(),
+                "[]".to_string().into(),
+            ),
+            ("enabled", SeaValue::Int(Some(2)), SeaValue::Int(Some(1))),
+            (
+                "sub_account_enabled",
+                "not-an-integer".to_string().into(),
+                SeaValue::Int(Some(0)),
+            ),
+            (
+                "model_limits_enabled",
+                SeaValue::Int(Some(2)),
+                SeaValue::Int(Some(0)),
+            ),
+            (
+                "reasoning_envelope_enabled",
+                SeaValue::Int(Some(2)),
+                SeaValue::Int(Some(1)),
+            ),
+            (
+                "request_capture_mode",
+                "unsupported".to_string().into(),
+                "off".to_string().into(),
+            ),
+        ];
+
+        for (column, invalid, valid) in api_key_cases {
+            db.write()
+                .await
+                .execute(db.stmt(
+                    &format!("UPDATE api_keys SET {column} = $1 WHERE id = $2"),
+                    vec![invalid, api_key.id.clone().into()],
+                ))
+                .await
+                .expect("corrupt API-key policy column");
+
+            let error = store
+                .validate_api_key(&token)
+                .await
+                .expect_err("corrupt API-key policy must fail validation");
+            assert!(error.contains(column), "{column}: {error}");
+            assert!(store.api_key_cache.get(&token).is_none());
+
+            db.write()
+                .await
+                .execute(db.stmt(
+                    &format!("UPDATE api_keys SET {column} = $1 WHERE id = $2"),
+                    vec![valid, api_key.id.clone().into()],
+                ))
+                .await
+                .expect("restore API-key policy column");
+        }
+
+        for (column, invalid, valid) in [
+            (
+                "allowed_groups",
+                SeaValue::Int(Some(7)),
+                "[]".to_string().into(),
+            ),
+            ("enabled", SeaValue::Int(Some(2)), SeaValue::Int(Some(1))),
+        ] {
+            db.write()
+                .await
+                .execute(db.stmt(
+                    &format!("UPDATE users SET {column} = $1 WHERE id = $2"),
+                    vec![invalid, user.id.clone().into()],
+                ))
+                .await
+                .expect("corrupt user policy column");
+
+            let error = store
+                .validate_api_key(&token)
+                .await
+                .expect_err("corrupt user policy must fail validation");
+            assert!(error.contains(column), "{column}: {error}");
+            assert!(store.api_key_cache.get(&token).is_none());
+
+            db.write()
+                .await
+                .execute(db.stmt(
+                    &format!("UPDATE users SET {column} = $1 WHERE id = $2"),
+                    vec![valid, user.id.clone().into()],
+                ))
+                .await
+                .expect("restore user policy column");
+        }
+
+        let last_used_at = db
+            .read()
+            .query_one(db.stmt(
+                "SELECT last_used_at FROM api_keys WHERE id = $1",
+                vec![api_key.id.into()],
+            ))
+            .await
+            .expect("last-used query")
+            .expect("key row exists")
+            .try_get::<Option<String>>("", "last_used_at")
+            .expect("last-used decodes");
+        assert!(last_used_at.is_none());
+
+        store
+            .validate_api_key(&token)
+            .await
+            .expect("restored policy validates")
+            .expect("restored key authenticates");
+        assert!(store.api_key_cache.get(&token).is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_user_uses_reverse_invalidation_without_returning_key_ids() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let (log_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let store = UserStore::new(db.clone(), log_broadcast)
+            .await
+            .expect("store creates");
+        let user = store
+            .create_user("delete-cache", "password", UserRole::User, &[])
+            .await
+            .expect("user creates");
+        let mut tokens = Vec::new();
+        for name in ["first", "second", "third"] {
+            let (_, token) = store
+                .create_api_key(&user.id, name, None)
+                .await
+                .expect("key creates");
+            store
+                .validate_api_key(&token)
+                .await
+                .expect("key validates")
+                .expect("key exists");
+            tokens.push(token);
+        }
+        store
+            .get_user_balance(&user.id)
+            .await
+            .expect("balance reads")
+            .expect("balance exists");
+        assert!(
+            tokens
+                .iter()
+                .all(|token| store.api_key_cache.get(token).is_some())
+        );
+        assert!(store.balance_cache.get(&user.id).is_some());
+
+        store.delete_user(&user.id).await.expect("user deletes");
+
+        assert!(
+            tokens
+                .iter()
+                .all(|token| store.api_key_cache.get(token).is_none())
+        );
+        assert!(store.balance_cache.get(&user.id).is_none());
+        assert!(store.get_user_by_id(&user.id).await.unwrap().is_none());
+        assert!(store.delete_user(&user.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn session_cleanup_is_indexed_set_delete_and_runs_at_store_startup() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let index = db
+            .read()
+            .query_one(db.stmt(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = $1",
+                vec!["idx_sessions_expires_at".into()],
+            ))
+            .await
+            .expect("index query succeeds");
+        assert!(index.is_some());
+
+        let (log_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let store = UserStore::new(db.clone(), log_broadcast)
+            .await
+            .expect("store creates");
+        let user = store
+            .create_user("session-cleanup", "password", UserRole::User, &[])
+            .await
+            .expect("user creates");
+        store
+            .create_session(&user.id, -1)
+            .await
+            .expect("expired session creates");
+        let future = store
+            .create_session(&user.id, 1)
+            .await
+            .expect("future session creates");
+
+        let (second_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let restarted = UserStore::new(db.clone(), second_broadcast)
+            .await
+            .expect("restarted store creates");
+        let remaining = db
+            .read()
+            .query_one(db.stmt("SELECT COUNT(*) AS count FROM sessions", vec![]))
+            .await
+            .expect("session count succeeds")
+            .expect("count row exists");
+        let remaining: i64 = remaining.try_get("", "count").expect("count decodes");
+        assert_eq!(remaining, 1);
+        assert!(
+            restarted
+                .get_session_by_token(&future.token)
+                .await
+                .expect("future session reads")
+                .is_some()
+        );
+
+        db.write()
+            .await
+            .execute(db.stmt(
+                "UPDATE sessions SET expires_at = $1 WHERE token = $2",
+                vec![
+                    (Utc::now() - chrono::Duration::seconds(1))
+                        .to_rfc3339()
+                        .into(),
+                    future.token.into(),
+                ],
+            ))
+            .await
+            .expect("session expires");
+        assert_eq!(
+            restarted
+                .cleanup_expired_sessions()
+                .await
+                .expect("cleanup succeeds"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_registration_creates_exactly_one_first_super_admin() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let (log_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let store = UserStore::new(db, log_broadcast)
+            .await
+            .expect("store creates");
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for username in ["first-racer", "second-racer"] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .register_user_atomic(username, "password123", false)
+                    .await
+            }));
+        }
+
+        let mut users = Vec::new();
+        let mut disabled = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(user) => users.push(user),
+                Err(RegisterUserError::RegistrationDisabled) => disabled += 1,
+                Err(error) => panic!("unexpected registration result: {error:?}"),
+            }
+        }
+        assert_eq!(users.len(), 1);
+        assert_eq!(disabled, 1);
+        assert_eq!(users[0].role, UserRole::SuperAdmin);
+        assert_eq!(store.user_count().await.unwrap(), 1);
+    }
+
+    fn limited_api_key_input(name: String) -> CreateApiKeyInput {
+        CreateApiKeyInput {
+            name,
+            expires_in_days: None,
+            sub_account_enabled: false,
+            sub_account_balance_nano_usd: None,
+            model_limits_enabled: false,
+            model_limits: Vec::new(),
+            ip_whitelist: Vec::new(),
+            allowed_groups: Vec::new(),
+            max_multiplier: None,
+            transforms: Vec::new(),
+            model_redirects: Vec::new(),
+            reasoning_envelope_enabled: true,
+            request_capture_mode: RequestCaptureMode::Off,
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_api_key_creation_never_exceeds_user_limit() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let (log_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let store = UserStore::new(db, log_broadcast)
+            .await
+            .expect("store creates");
+        let user = store
+            .create_user("key-limit-user", "password123", UserRole::User, &[])
+            .await
+            .unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(6));
+        let mut tasks = Vec::new();
+        for index in 0..6 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let user_id = user.id.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .create_api_key_extended_with_limit(
+                        &user_id,
+                        limited_api_key_input(format!("key-{index}")),
+                        false,
+                        2,
+                    )
+                    .await
+            }));
+        }
+
+        let mut created = 0;
+        let mut rejected = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => created += 1,
+                Err(CreateApiKeyWithLimitError::LimitReached { limit: 2 }) => rejected += 1,
+                Err(error) => panic!("unexpected key creation result: {error:?}"),
+            }
+        }
+        assert_eq!(created, 2);
+        assert_eq!(rejected, 4);
+        assert_eq!(store.count_user_api_keys(&user.id).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn admin_user_update_rolls_back_ordinary_fields_when_ledger_insert_fails() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let (log_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let store = UserStore::new(db.clone(), log_broadcast)
+            .await
+            .expect("store creates");
+        let user = store
+            .create_user("atomic-before", "password123", UserRole::User, &[])
+            .await
+            .unwrap();
+        db.write()
+            .await
+            .execute(db.stmt(
+                "CREATE TRIGGER fail_admin_adjustment
+                 BEFORE INSERT ON billing_ledger
+                 WHEN NEW.kind = 'admin_adjustment'
+                 BEGIN SELECT RAISE(FAIL, 'ledger blocked'); END",
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let result = store
+            .admin_update_user_atomic(
+                &user.id,
+                AdminUpdateUserInput {
+                    username: Some("atomic-after".to_string()),
+                    balance_nano_usd: Some("50".to_string()),
+                    ..AdminUpdateUserInput::default()
+                },
+                "admin-1",
+            )
+            .await;
+        assert!(result.is_err());
+
+        let unchanged = store.get_user_by_id(&user.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.username, "atomic-before");
+        assert_eq!(unchanged.balance_nano_usd, "0");
+    }
+
+    #[tokio::test]
+    async fn batch_delete_settles_multiple_keys_for_one_user() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let (log_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let store = UserStore::new(db.clone(), log_broadcast)
+            .await
+            .expect("store creates");
+        let user = store
+            .create_user("batch-settlement", "password", UserRole::User, &[])
+            .await
+            .expect("user creates");
+        let (first, _) = store
+            .create_api_key(&user.id, "first", None)
+            .await
+            .expect("first key creates");
+        let (second, _) = store
+            .create_api_key(&user.id, "second", None)
+            .await
+            .expect("second key creates");
+        db.write()
+            .await
+            .execute(db.stmt(
+                "UPDATE users SET balance_nano_usd = '100' WHERE id = $1",
+                vec![user.id.clone().into()],
+            ))
+            .await
+            .expect("user balance seeds");
+        for (id, balance) in [(&first.id, "5"), (&second.id, "7")] {
+            db.write()
+                .await
+                .execute(db.stmt(
+                    "UPDATE api_keys
+                     SET sub_account_enabled = 1, sub_account_balance_nano = $1
+                     WHERE id = $2",
+                    vec![balance.into(), id.as_str().into()],
+                ))
+                .await
+                .expect("key balance seeds");
+        }
+
+        assert_eq!(
+            store
+                .batch_delete_api_keys(&[second.id.clone(), first.id.clone()])
+                .await
+                .expect("batch deletes"),
+            2
+        );
+        let user_row = db
+            .read()
+            .query_one(db.stmt(
+                "SELECT balance_nano_usd FROM users WHERE id = $1",
+                vec![user.id.clone().into()],
+            ))
+            .await
+            .expect("user query")
+            .expect("user remains");
+        assert_eq!(
+            user_row
+                .try_get::<String>("", "balance_nano_usd")
+                .expect("balance decodes"),
+            "112"
+        );
+        let ledger_rows = db
+            .read()
+            .query_all(db.stmt(
+                "SELECT delta_nano_usd FROM billing_ledger
+                 WHERE user_id = $1 AND kind = 'sub_account_delete_settlement'",
+                vec![user.id.into()],
+            ))
+            .await
+            .expect("ledger query");
+        let mut deltas = ledger_rows
+            .into_iter()
+            .map(|row| {
+                row.try_get::<String>("", "delta_nano_usd")
+                    .expect("delta decodes")
+            })
+            .collect::<Vec<_>>();
+        deltas.sort();
+        assert_eq!(deltas, vec!["5".to_string(), "7".to_string()]);
+    }
+
+    #[test]
+    fn ip_whitelist_accepts_and_canonicalizes_addresses_and_networks() {
+        let values = canonicalize_ip_whitelist(&[
+            " 2001:0db8::1 ".to_string(),
+            "192.0.2.7".to_string(),
+            "192.0.2.0/24".to_string(),
+            "192.0.2.7".to_string(),
+        ])
+        .expect("valid whitelist");
+        assert_eq!(
+            values,
+            vec![
+                "192.0.2.0/24".to_string(),
+                "192.0.2.7".to_string(),
+                "2001:db8::1".to_string(),
+            ]
+        );
+        assert!(canonicalize_ip_whitelist(&["not-an-ip".to_string()]).is_err());
+    }
 
     #[test]
     fn sanitize_api_key_transforms_drops_disallowed_rules() {
@@ -2253,11 +3784,20 @@ mod tests {
     }
 
     #[test]
-    fn allowed_groups_json_parsing_is_tolerant_and_canonical() {
-        assert!(parse_allowed_groups_json("").is_empty());
-        assert!(parse_allowed_groups_json("not-json").is_empty());
+    fn allowed_groups_json_compatibility_does_not_accept_corruption() {
+        for raw in [None, Some(""), Some("   "), Some("null"), Some("[]")] {
+            assert!(
+                parse_allowed_groups_json(raw, "allowed_groups")
+                    .expect("compatibility value parses")
+                    .is_empty()
+            );
+        }
+        for raw in ["not-json", "{}", r#"["group", 1]"#] {
+            assert!(parse_allowed_groups_json(Some(raw), "allowed_groups").is_err());
+        }
         assert_eq!(
-            parse_allowed_groups_json(r#"[" Beta ","alpha","ALPHA",""]"#),
+            parse_allowed_groups_json(Some(r#"[" Beta ","alpha","ALPHA",""]"#), "allowed_groups",)
+                .expect("valid groups parse"),
             vec!["alpha".to_string(), "beta".to_string()]
         );
         assert_eq!(

@@ -14,11 +14,12 @@ use mozjpeg::{ColorSpace, Compress};
 use oxipng::Options;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::HashMap;
-use xxhash_rust::xxh3::Xxh3;
+use std::io::Cursor;
 
-const TRANSFORM_VERSION: &str = "compress_user_message_images:v4";
+const TRANSFORM_VERSION: &str = "compress_user_message_images:v5";
 
 #[derive(Debug, Deserialize, Clone)]
 struct Config {
@@ -526,10 +527,22 @@ async fn compress_base64_image(
     if !is_supported_media_type(&media_type) {
         return Ok(None);
     }
+    let limits = context.image_transform_cache.limits();
+    let max_base64_bytes = limits
+        .max_encoded_bytes
+        .saturating_add(2)
+        .saturating_div(3)
+        .saturating_mul(4);
+    if base64_data.len() > max_base64_bytes {
+        return Ok(None);
+    }
     let original = match STANDARD.decode(base64_data.as_bytes()) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(None),
     };
+    if original.len() > limits.max_encoded_bytes {
+        return Ok(None);
+    }
     let cache_key = build_cache_key(&media_type, &cfg, &original);
     if let Some(hit) = context
         .image_transform_cache
@@ -544,11 +557,22 @@ async fn compress_base64_image(
     }
 
     let original_len = original.len();
+    let _permit = context
+        .image_transform_cache
+        .acquire_transform_permit()
+        .await
+        .map_err(TransformError::Apply)?;
     let media_type_for_task = media_type.clone();
     let cfg_for_task = cfg.clone();
     let original_for_task = original.clone();
+    let max_pixels = limits.max_pixels;
     let transformed = tokio::task::spawn_blocking(move || {
-        compress_image_bytes(&media_type_for_task, &original_for_task, &cfg_for_task)
+        compress_image_bytes_with_limit(
+            &media_type_for_task,
+            &original_for_task,
+            &cfg_for_task,
+            max_pixels,
+        )
     })
     .await
     .map_err(|err| TransformError::Apply(format!("image compression task join failed: {err}")))??;
@@ -586,21 +610,21 @@ fn is_supported_media_type(media_type: &str) -> bool {
 }
 
 fn build_cache_key(media_type: &str, cfg: &Config, original: &[u8]) -> String {
-    let mut hasher = Xxh3::new();
-    hasher.update(TRANSFORM_VERSION.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(media_type.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(&cfg.max_edge_px.unwrap_or_default().to_le_bytes());
-    hasher.update(&[cfg.jpeg_quality]);
-    hasher.update(&[cfg.jpegxl_quality]);
-    hasher.update(&[cfg.jpegxl_effort]);
-    hasher.update(&[cfg.webp_quality]);
-    hasher.update(&[u8::from(cfg.skip_if_smaller)]);
-    hasher.update(cfg.output_format.as_str().as_bytes());
-    hasher.update(&[0]);
-    hasher.update(original);
-    format!("{:032x}", hasher.digest128())
+    let mut digest = Sha256::new();
+    digest.update(TRANSFORM_VERSION.as_bytes());
+    digest.update([0]);
+    digest.update(media_type.as_bytes());
+    digest.update([0]);
+    digest.update(cfg.max_edge_px.unwrap_or_default().to_le_bytes());
+    digest.update([cfg.jpeg_quality]);
+    digest.update([cfg.jpegxl_quality]);
+    digest.update([cfg.jpegxl_effort]);
+    digest.update([cfg.webp_quality]);
+    digest.update([u8::from(cfg.skip_if_smaller)]);
+    digest.update(cfg.output_format.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(original);
+    digest_hex(&digest.finalize())
 }
 
 struct CompressedImageBytes {
@@ -608,11 +632,32 @@ struct CompressedImageBytes {
     bytes: Vec<u8>,
 }
 
+#[cfg(test)]
 fn compress_image_bytes(
     media_type: &str,
     original: &[u8],
     cfg: &Config,
 ) -> Result<Option<CompressedImageBytes>, TransformError> {
+    compress_image_bytes_with_limit(media_type, original, cfg, u64::MAX)
+}
+
+fn compress_image_bytes_with_limit(
+    media_type: &str,
+    original: &[u8],
+    cfg: &Config,
+    max_pixels: u64,
+) -> Result<Option<CompressedImageBytes>, TransformError> {
+    let reader = match image::ImageReader::new(Cursor::new(original)).with_guessed_format() {
+        Ok(reader) => reader,
+        Err(_) => return Ok(None),
+    };
+    let dimensions = match reader.into_dimensions() {
+        Ok(dimensions) => dimensions,
+        Err(_) => return Ok(None),
+    };
+    if u64::from(dimensions.0).saturating_mul(u64::from(dimensions.1)) > max_pixels {
+        return Ok(None);
+    }
     let decoded = match image::load_from_memory(original) {
         Ok(image) => image,
         Err(_) => return Ok(None),
@@ -654,6 +699,21 @@ fn compress_image_bytes(
         },
     };
     Ok(Some(transformed))
+}
+
+#[cfg(test)]
+fn sha256_hex(input: &[u8]) -> String {
+    digest_hex(&Sha256::digest(input))
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 fn output_format_for_media_type(media_type: &str) -> Option<OutputFormat> {
@@ -1033,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn image_cache_key_uses_128_bit_hex_digest_material() {
+    fn image_cache_key_uses_sha256_digest_material() {
         let cfg = Config {
             max_edge_px: None,
             jpeg_quality: 80,
@@ -1071,7 +1131,7 @@ mod tests {
             b"original bytes",
         );
 
-        assert_eq!(key.len(), 32);
+        assert_eq!(key.len(), 64);
         assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(!key.chars().any(|c| c.is_ascii_uppercase()));
         assert_eq!(key, same);
@@ -1079,6 +1139,29 @@ mod tests {
         assert_ne!(key, changed_original);
         assert_ne!(key, changed_jpegxl_effort);
         assert_ne!(key, changed_output_format);
+    }
+
+    #[test]
+    fn sha256_matches_standard_vector() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn pixel_limit_is_checked_before_full_decode() {
+        let original = STANDARD.decode(build_png_base64(64, 48)).unwrap();
+        let cfg: Config = serde_json::from_value(json!({})).unwrap();
+        assert!(
+            compress_image_bytes_with_limit("image/png", &original, &cfg, 64 * 48 - 1)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

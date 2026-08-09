@@ -42,6 +42,17 @@ RCD-C12. If `request_capture_mode == "capture-only-abnormal"`, Monoize MUST pers
 
 RCD-C13. For RCD-C12, synthetic usage created only for estimated billing MUST NOT cause condition 2 to become false. The abnormal-only decision MUST be based on upstream-provided usage data before estimated billing fallback.
 
+RCD-C14. Capture resource bounds MUST be process configuration. Defaults are:
+
+- `MONOIZE_REQUEST_CAPTURE_MAX_ATTEMPTS=16`;
+- `MONOIZE_REQUEST_CAPTURE_MAX_FRAMES=4096`;
+- `MONOIZE_REQUEST_CAPTURE_MAX_FRAME_BYTES=262144`; and
+- `MONOIZE_REQUEST_CAPTURE_MAX_SESSION_BYTES=16777216`.
+
+Each positive integer environment value replaces its default, except `MONOIZE_REQUEST_CAPTURE_MAX_SESSION_BYTES` values below `8192`, which resolve to `8192`. Zero or invalid values use the default.
+
+RCD-C15. The captured top-level `request_id` and every identifying string retained in an oversized-attempt placeholder MUST contain at most `256` UTF-8 bytes. Truncation MUST occur on a valid UTF-8 boundary and MUST increase `capture_truncation.omitted_bytes` for the top-level request id.
+
 ## 2. Directory and filename
 
 RCD-S1. Dumps MUST be written under a directory named `dumps` inside the Monoize data directory.
@@ -86,6 +97,7 @@ RCD-D2. A dump file MUST contain at least these top-level fields:
 - `downstream_protocol: string`
 - `is_stream: boolean`
 - `attempts: object[]`
+- `capture_truncation: object`
 
 RCD-D3. Each `attempts[]` entry MUST contain:
 
@@ -115,13 +127,19 @@ RCD-D8. For a buffered synthetic stream, `downstream_response` MUST be the provi
 
 RCD-D9. For a pass-through streaming response, `downstream_sse_frames` MUST contain the SSE frame data strings emitted to the downstream client in emission order after response transforms and downstream encoding.
 
-RCD-D9a. If downstream SSE frame emission occurs inside asynchronous tasks spawned by the pass-through streaming pipeline, all such tasks MUST record emitted frames into the same per-attempt `downstream_sse_frames` array.
+RCD-D9a. If downstream SSE frame emission occurs inside asynchronous tasks spawned by the pass-through streaming pipeline, all such tasks MUST record emitted frames into the same per-attempt `downstream_sse_frames` array and MUST share one retained-byte counter, omitted-frame counter, omitted-byte counter, and one immutable limit set. Synthetic terminal error and `[DONE]` frames MUST use the same bounded recorder. Their aggregate capture and metadata MUST obey RCD-D14.
 
 RCD-D10. For a pass-through streaming response, `downstream_response` MUST be null or absent.
 
 RCD-D11. If an upstream call fails before a response body is available, the attempt entry MUST include `error` with at least `message` and `code` when available.
 
 RCD-D12. Capture MUST NOT redact prompt text, tool arguments, image payloads, or provider response bodies because the feature is explicitly a raw diagnostic dump. Operators MUST keep the feature disabled unless they accept that sensitive payloads are persisted.
+
+RCD-D13. One session MUST retain no more than the configured attempt count and no more than the effective serialized session byte count. Capacity validation and filesystem writing MUST use the same compact UTF-8 JSON byte vector; the writer MUST NOT re-encode the accepted payload. An attempt that cannot fit MAY be replaced by bounded identifying fields plus explicit `capture_truncation` metadata. A capture-all request that recorded an attempt MUST retain at least one full or placeholder attempt and MUST persist the bounded envelope. Further attempts MUST be counted as omitted rather than appended.
+
+RCD-D14. One captured downstream SSE frame MUST retain no more than the configured frame byte count. One session MUST retain no more than the configured frame count and total session byte count. Truncation MUST occur on a valid UTF-8 boundary.
+
+RCD-D15. The top-level `capture_truncation` object MUST include `truncated`, `omitted_attempts`, `omitted_frames`, `omitted_bytes`, and `retained_bytes`. Each attempt whose frame list was truncated MUST include `downstream_sse_frames_truncation` with the corresponding omitted counts. An oversized-attempt placeholder that removes retained frames MUST preserve prior frame-omission counts, add the removed retained-frame count and byte count, and report zero retained frames and bytes. A non-truncated dump MUST include zero counts.
 
 ## 4. Retention cleanup
 

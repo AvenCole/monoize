@@ -364,6 +364,7 @@ async fn fan_out_subrequests(
     request_ip: Option<String>,
 ) -> Vec<Result<(urp::UrpResponse, String), AppError>> {
     let mut join_set = tokio::task::JoinSet::new();
+    let mut task_contexts = HashMap::new();
 
     for i in 0..n {
         let state = state.clone();
@@ -389,21 +390,83 @@ async fn fan_out_subrequests(
             .clone()
             .map(|id| if n > 1 { format!("{id}:img:{i}") } else { id });
         let rip = request_ip.clone();
+        let task_state = Arc::new(AdmittedRequestTaskState::new(std::time::Instant::now()));
+        let task_state_for_task = task_state.clone();
+        let task_request_id = rid.clone();
+        let task_request_ip = rip.clone();
 
-        join_set.spawn(async move {
-            execute_image_subrequest_typed(&state, &auth, req, max_multiplier, rid, rip).await
+        let abort_handle = join_set.spawn(async move {
+            execute_image_subrequest_typed(
+                &state,
+                &auth,
+                req,
+                max_multiplier,
+                rid,
+                rip,
+                &task_state_for_task,
+            )
+            .await
         });
+        task_contexts.insert(
+            abort_handle.id(),
+            (task_state, task_request_id, task_request_ip),
+        );
     }
 
     let mut results = Vec::with_capacity(n);
-    while let Some(join_result) = join_set.join_next().await {
+    while let Some(join_result) = join_set.join_next_with_id().await {
         match join_result {
-            Ok(inner) => results.push(inner),
-            Err(e) => results.push(Err(AppError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                format!("sub-request task panicked: {e}"),
-            ))),
+            Ok((task_id, inner)) => {
+                task_contexts.remove(&task_id);
+                results.push(inner);
+            }
+            Err(join_error) => {
+                let task_context = task_contexts.remove(&join_error.id());
+                let code = if join_error.is_cancelled() {
+                    "task_cancelled"
+                } else {
+                    "task_panic"
+                };
+                let err = AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    code,
+                    format!("image sub-request task failed: {join_error}"),
+                )
+                .with_type("server_error");
+                if let Some((task_state, task_request_id, task_request_ip)) = task_context
+                    && let Some((started_at, is_stream, attempt)) = task_state.terminal_snapshot()
+                {
+                    if let Some(attempt) = attempt {
+                        spawn_request_log_error(
+                            state,
+                            auth,
+                            &attempt,
+                            model,
+                            is_stream,
+                            started_at,
+                            task_request_id,
+                            task_request_ip,
+                            &err,
+                            None,
+                            Vec::new(),
+                        );
+                    } else {
+                        spawn_request_log_error_no_attempt(
+                            state,
+                            auth,
+                            model,
+                            is_stream,
+                            started_at,
+                            task_request_id,
+                            task_request_ip,
+                            &err,
+                            None,
+                            Vec::new(),
+                        );
+                    }
+                }
+                results.push(Err(err));
+            }
         }
     }
     results
@@ -416,6 +479,7 @@ async fn execute_image_subrequest_typed(
     max_multiplier: Option<Multiplier>,
     request_id: Option<String>,
     request_ip: Option<String>,
+    task_state: &AdmittedRequestTaskState,
 ) -> AppResult<(urp::UrpResponse, String)> {
     let routing_stub = build_routing_stub(&req, max_multiplier);
     let attempts = build_monoize_attempts(state, &routing_stub, auth).await?;
@@ -423,6 +487,7 @@ async fn execute_image_subrequest_typed(
         && attempts
             .iter()
             .all(|attempt| attempt.provider_type == ProviderType::Responses);
+    task_state.set_stream(all_responses);
 
     if all_responses {
         return execute_stream_collected_image_typed(
@@ -432,11 +497,12 @@ async fn execute_image_subrequest_typed(
             max_multiplier,
             request_id,
             request_ip,
+            task_state,
         )
         .await;
     }
 
-    execute_nonstream_typed(
+    execute_nonstream_typed_with_validator(
         state,
         auth,
         req,
@@ -448,8 +514,39 @@ async fn execute_image_subrequest_typed(
             raw_input: Value::Object(serde_json::Map::new()),
             session: None,
         },
+        Some(validate_image_subrequest_response),
+        Some(task_state),
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_image_stream_error(
+    state: &AppState,
+    auth: &crate::auth::AuthResult,
+    attempt: &MonoizeAttempt,
+    logical_model: &str,
+    started_at: std::time::Instant,
+    request_id: &Option<String>,
+    request_ip: &Option<String>,
+    reasoning_effort: Option<String>,
+    tried_providers: Vec<TriedProvider>,
+    error: AppError,
+) -> AppError {
+    spawn_request_log_error(
+        state,
+        auth,
+        attempt,
+        logical_model,
+        true,
+        started_at,
+        request_id.clone(),
+        request_ip.clone(),
+        &error,
+        reasoning_effort,
+        tried_providers,
+    );
+    error
 }
 
 async fn execute_stream_collected_image_typed(
@@ -459,18 +556,16 @@ async fn execute_stream_collected_image_typed(
     max_multiplier: Option<Multiplier>,
     request_id: Option<String>,
     request_ip: Option<String>,
+    task_state: &AdmittedRequestTaskState,
 ) -> AppResult<(urp::UrpResponse, String)> {
-    let started_at = std::time::Instant::now();
-    let requested_model = req.model.clone();
-    let transform_match_model =
-        normalized_logical_model_for_matching(state, &requested_model).await;
-    resolve_model_suffix(state, &mut req).await;
+    let started_at = task_state.started_at();
+    let transform_match_model = resolve_model_suffix(state, &mut req).await?;
     let original_req = req.clone();
     let logical_model = req.model.clone();
     let routing_stub = build_routing_stub(&req, max_multiplier);
     let attempts = build_monoize_attempts(state, &routing_stub, auth).await?;
     ensure_balance_before_forward_for_attempts(state, auth, &attempts).await?;
-    let _pending_request_log_guard = insert_pending_request_log(
+    let pending_request_log_guard = insert_pending_request_log(
         state,
         auth,
         &req.model,
@@ -479,7 +574,8 @@ async fn execute_stream_collected_image_typed(
         request_ip.as_deref(),
         started_at,
     )
-    .await;
+    .await?;
+    task_state.retain_pending_guard(pending_request_log_guard);
 
     let mut last_failed_attempt: Option<MonoizeAttempt> = None;
     let mut tried_providers: Vec<TriedProvider> = Vec::new();
@@ -497,6 +593,7 @@ async fn execute_stream_collected_image_typed(
             }
 
             let attempt_number = execution_state.record_upstream_attempt(&attempt);
+            task_state.set_attempt(&attempt);
             let mut req_attempt = original_req.clone();
             if let Some(target_protocol) = super::provider_type_protocol(attempt.provider_type) {
                 urp::retain_provider_items_for_protocol(&mut req_attempt.input, target_protocol);
@@ -511,39 +608,97 @@ async fn execute_stream_collected_image_typed(
             }
             inject_monoize_context(auth, &mut req_attempt);
             req_attempt.model = attempt.upstream_model.clone();
-            apply_transform_rules_request(
+            if let Err(err) = apply_transform_rules_request(
                 state,
                 &mut req_attempt,
                 &attempt.provider_transforms,
                 &transform_match_model,
                 Some(attempt.provider_type),
             )
-            .await?;
+            .await
+            {
+                return Err(finish_image_stream_error(
+                    state,
+                    auth,
+                    &attempt,
+                    &logical_model,
+                    started_at,
+                    &request_id,
+                    &request_ip,
+                    req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                    tried_providers,
+                    err,
+                ));
+            }
             let global_transforms = state.monoize_runtime.read().await.global_transforms.clone();
-            apply_transform_rules_request(
+            if let Err(err) = apply_transform_rules_request(
                 state,
                 &mut req_attempt,
                 &global_transforms,
                 &transform_match_model,
                 Some(attempt.provider_type),
             )
-            .await?;
-            apply_transform_rules_request(
+            .await
+            {
+                return Err(finish_image_stream_error(
+                    state,
+                    auth,
+                    &attempt,
+                    &logical_model,
+                    started_at,
+                    &request_id,
+                    &request_ip,
+                    req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                    tried_providers,
+                    err,
+                ));
+            }
+            if let Err(err) = apply_transform_rules_request(
                 state,
                 &mut req_attempt,
                 &auth.transforms,
                 &transform_match_model,
                 Some(attempt.provider_type),
             )
-            .await?;
+            .await
+            {
+                return Err(finish_image_stream_error(
+                    state,
+                    auth,
+                    &attempt,
+                    &logical_model,
+                    started_at,
+                    &request_id,
+                    &request_ip,
+                    req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                    tried_providers,
+                    err,
+                ));
+            }
             strip_monoize_context(&mut req_attempt);
             req_attempt.stream = Some(true);
 
-            let upstream_body = encode_request_for_provider(
+            let upstream_body = match encode_request_for_provider(
                 &mut req_attempt,
                 &attempt,
                 super::DownstreamProtocol::Responses,
-            )?;
+            ) {
+                Ok(body) => body,
+                Err(err) => {
+                    return Err(finish_image_stream_error(
+                        state,
+                        auth,
+                        &attempt,
+                        &logical_model,
+                        started_at,
+                        &request_id,
+                        &request_ip,
+                        req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                        tried_providers,
+                        err,
+                    ));
+                }
+            };
             let provider = build_channel_provider_config(&attempt);
             let path = upstream_path_for_model(attempt.provider_type, &req_attempt.model, true);
             let call = upstream::call_upstream_raw_with_timeout_and_headers(
@@ -572,7 +727,23 @@ async fn execute_stream_collected_image_typed(
                     .await;
                     mark_channel_success(state, &attempt).await;
 
-                    let legacy = typed_request_to_legacy(&req_attempt, max_multiplier)?;
+                    let legacy = match typed_request_to_legacy(&req_attempt, max_multiplier) {
+                        Ok(legacy) => legacy,
+                        Err(err) => {
+                            return Err(finish_image_stream_error(
+                                state,
+                                auth,
+                                &attempt,
+                                &logical_model,
+                                started_at,
+                                &request_id,
+                                &request_ip,
+                                req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                                tried_providers,
+                                err,
+                            ));
+                        }
+                    };
                     let pending_request_envelope_extra =
                         req.input.clone().into_iter().find_map(|node| match node {
                             crate::urp::Node::NextDownstreamEnvelopeExtra { extra_body }
@@ -675,36 +846,118 @@ async fn execute_stream_collected_image_typed(
                         }
                     }
 
-                    let decode_result = decode_handle.await.map_err(|e| {
-                        AppError::new(
+                    let (decode_join, transform_join) =
+                        tokio::join!(decode_handle, transform_handle);
+                    let decode_result = match decode_join {
+                        Ok(result) => result,
+                        Err(join_error) => Err(AppError::new(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            "task_panic",
-                            e.to_string(),
+                            if join_error.is_cancelled() {
+                                "task_cancelled"
+                            } else {
+                                "task_panic"
+                            },
+                            format!("image stream decoder task failed: {join_error}"),
                         )
-                    })?;
-                    let transform_result = transform_handle.await.map_err(|e| {
-                        AppError::new(
+                        .with_type("server_error")),
+                    };
+                    let transform_result = match transform_join {
+                        Ok(result) => result,
+                        Err(join_error) => Err(AppError::new(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            "task_panic",
-                            e.to_string(),
+                            if join_error.is_cancelled() {
+                                "task_cancelled"
+                            } else {
+                                "task_panic"
+                            },
+                            format!("image stream transform task failed: {join_error}"),
                         )
-                    })?;
-                    decode_result?;
-                    transform_result?;
+                        .with_type("server_error")),
+                    };
+                    if let Err(err) = decode_result {
+                        return Err(finish_image_stream_error(
+                            state,
+                            auth,
+                            &attempt,
+                            &logical_model,
+                            started_at,
+                            &request_id,
+                            &request_ip,
+                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                            tried_providers,
+                            err,
+                        ));
+                    }
+                    if let Err(err) = transform_result {
+                        return Err(finish_image_stream_error(
+                            state,
+                            auth,
+                            &attempt,
+                            &logical_model,
+                            started_at,
+                            &request_id,
+                            &request_ip,
+                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                            tried_providers,
+                            err,
+                        ));
+                    }
                     if let Some(err) = stream_error {
                         clear_channel_affinity(state, &attempt).await;
-                        return Err(err);
+                        return Err(finish_image_stream_error(
+                            state,
+                            auth,
+                            &attempt,
+                            &logical_model,
+                            started_at,
+                            &request_id,
+                            &request_ip,
+                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                            tried_providers,
+                            err,
+                        ));
                     }
 
-                    let resp = final_response.ok_or_else(|| {
-                        AppError::new(
-                            StatusCode::BAD_GATEWAY,
-                            "upstream_stream_error",
-                            "stream completed without terminal response",
-                        )
-                    })?;
+                    let resp = match final_response {
+                        Some(resp) => resp,
+                        None => {
+                            let err = AppError::new(
+                                StatusCode::BAD_GATEWAY,
+                                "upstream_stream_error",
+                                "stream completed without terminal response",
+                            );
+                            return Err(finish_image_stream_error(
+                                state,
+                                auth,
+                                &attempt,
+                                &logical_model,
+                                started_at,
+                                &request_id,
+                                &request_ip,
+                                req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                                tried_providers,
+                                err,
+                            ));
+                        }
+                    };
 
-                    let charge = maybe_charge_response(
+                    if let Err(err) = validate_image_subrequest_response(&resp) {
+                        return Err(finish_image_stream_error(
+                            state,
+                            auth,
+                            &attempt,
+                            &logical_model,
+                            started_at,
+                            &request_id,
+                            &request_ip,
+                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                            tried_providers,
+                            err,
+                        ));
+                    }
+
+                    refresh_channel_affinity(state, &attempt).await;
+                    let charge = match maybe_charge_response(
                         state,
                         auth,
                         &attempt,
@@ -712,8 +965,24 @@ async fn execute_stream_collected_image_typed(
                         &resp,
                         request_id.as_deref(),
                     )
-                    .await?;
-                    refresh_channel_affinity(state, &attempt).await;
+                    .await
+                    {
+                        Ok(charge) => charge,
+                        Err(err) => {
+                            return Err(finish_image_stream_error(
+                                state,
+                                auth,
+                                &attempt,
+                                &logical_model,
+                                started_at,
+                                &request_id,
+                                &request_ip,
+                                req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                                tried_providers,
+                                err,
+                            ));
+                        }
+                    };
                     spawn_request_log(
                         state,
                         auth,
@@ -902,6 +1171,23 @@ fn extract_images_from_response(resp: &urp::UrpResponse) -> Vec<ExtractedImage> 
     images
 }
 
+fn validate_image_subrequest_response(resp: &urp::UrpResponse) -> AppResult<()> {
+    if !extract_images_from_response(resp).is_empty() {
+        return Ok(());
+    }
+    let upstream_text = collect_response_text(resp);
+    let detail = if upstream_text.is_empty() {
+        "upstream response contained no images".to_string()
+    } else {
+        format!("upstream response contained no images. upstream output: {upstream_text}")
+    };
+    Err(AppError::new(
+        StatusCode::BAD_GATEWAY,
+        "upstream_error",
+        detail,
+    ))
+}
+
 fn assemble_image_response(
     results: Vec<Result<(urp::UrpResponse, String), AppError>>,
 ) -> AppResult<Response> {
@@ -912,23 +1198,11 @@ fn assemble_image_response(
     for result in results {
         match result {
             Ok((resp, _logical_model)) => {
-                let images = extract_images_from_response(&resp);
-                if images.is_empty() {
-                    let upstream_text = collect_response_text(&resp);
-                    let detail = if upstream_text.is_empty() {
-                        "upstream response contained no images".to_string()
-                    } else {
-                        format!(
-                            "upstream response contained no images. upstream output: {upstream_text}"
-                        )
-                    };
-                    last_error = Some(AppError::new(
-                        StatusCode::BAD_GATEWAY,
-                        "upstream_error",
-                        detail,
-                    ));
+                if let Err(err) = validate_image_subrequest_response(&resp) {
+                    last_error = Some(err);
                     continue;
                 }
+                let images = extract_images_from_response(&resp);
                 for img in images {
                     let mut item = Map::new();
                     if let Some(b64) = img.b64_json {
@@ -1027,4 +1301,52 @@ struct AggregatedUsage {
     input_cached_image_tokens: u64,
     output_text_tokens: u64,
     output_image_tokens: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(output: Vec<urp::Node>) -> urp::UrpResponse {
+        urp::UrpResponse {
+            id: "resp_test".to_string(),
+            model: "image-test".to_string(),
+            created_at: None,
+            output,
+            finish_reason: Some(urp::FinishReason::Stop),
+            usage: None,
+            extra_body: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn image_subrequest_validation_accepts_an_image() {
+        let resp = response(vec![urp::Node::Image {
+            id: None,
+            role: urp::OrdinaryRole::Assistant,
+            source: urp::ImageSource::Url {
+                url: "https://example.com/generated.png".to_string(),
+                detail: None,
+            },
+            extra_body: HashMap::new(),
+        }]);
+
+        assert!(validate_image_subrequest_response(&resp).is_ok());
+    }
+
+    #[test]
+    fn image_subrequest_validation_returns_the_typed_conversion_error() {
+        let resp = response(vec![urp::Node::Text {
+            id: None,
+            role: urp::OrdinaryRole::Assistant,
+            content: "generation refused".to_string(),
+            phase: None,
+            extra_body: HashMap::new(),
+        }]);
+
+        let err = validate_image_subrequest_response(&resp).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(err.code, "upstream_error");
+        assert!(err.message.contains("generation refused"));
+    }
 }

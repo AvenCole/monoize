@@ -72,7 +72,7 @@ IE3. File upload processing:
 
 - For each uploaded file (`image`, `mask`), Monoize MUST read the file bytes and base64-encode them.
 - The media type MUST be determined from the `Content-Type` header of the multipart part. If absent, Monoize MUST infer from file extension or default to `application/octet-stream`.
-- Maximum individual file size is bounded by the existing 50 MiB body limit (`unified_responses_proxy.spec.md` §C5).
+- Maximum individual file size is bounded by the configured HTTP body limit (`unified_responses_proxy.spec.md` §C5), whose default is 50 MiB.
 
 ## 4. Request mapping to URP
 
@@ -274,6 +274,6 @@ CO1. Image API endpoints are non-streaming only. `stream` field in the Image API
 
 CO2. Monoize MUST NOT implement `POST /v1/images/variations`. Only generations and edits are supported.
 
-CO3. The 50 MiB body limit from `unified_responses_proxy.spec.md` §C5 applies to Image API endpoints.
+CO3. The configured HTTP body limit from `unified_responses_proxy.spec.md` §C5 applies to Image API endpoints.
 
 CO4. Image API endpoints MUST NOT be listed in `GET /v1/models` output (they are not model endpoints; they are adapters).

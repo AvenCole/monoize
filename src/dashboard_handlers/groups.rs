@@ -1,25 +1,14 @@
 use crate::app::AppState;
 use crate::dashboard_handlers::session_helpers::get_current_user;
 use crate::error::{AppError, AppResult};
-use crate::users::parse_groups_json;
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use serde::Serialize;
-use std::collections::BTreeSet;
 
 #[derive(Debug, Serialize)]
 pub struct DashboardGroupsResponse {
     pub groups: Vec<String>,
-}
-
-fn aggregate_group_labels(raw_group_arrays: impl IntoIterator<Item = String>) -> Vec<String> {
-    raw_group_arrays
-        .into_iter()
-        .flat_map(|raw| parse_groups_json(&raw).into_iter())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
 }
 
 pub async fn list_dashboard_groups(
@@ -28,35 +17,18 @@ pub async fn list_dashboard_groups(
 ) -> AppResult<Json<DashboardGroupsResponse>> {
     get_current_user(&headers, &state).await?;
 
-    let provider_groups = state
+    let groups = state
         .monoize_store
-        .list_all_provider_groups_json()
+        .list_dashboard_group_labels()
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-    let user_groups = state
-        .user_store
-        .list_all_user_allowed_groups_json()
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-    let api_key_groups = state
-        .user_store
-        .list_all_api_key_allowed_groups_json()
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    let groups = aggregate_group_labels(
-        provider_groups
-            .into_iter()
-            .chain(user_groups)
-            .chain(api_key_groups),
-    );
 
     Ok(Json(DashboardGroupsResponse { groups }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DashboardGroupsResponse, aggregate_group_labels, list_dashboard_groups};
+    use super::{DashboardGroupsResponse, list_dashboard_groups};
     use crate::app::{RuntimeConfig, load_state_with_runtime};
     use crate::users::UserRole;
     use axum::Json;
@@ -64,27 +36,13 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
     use sea_orm::ConnectionTrait;
 
-    #[test]
-    fn aggregate_group_labels_is_tolerant_unique_and_sorted() {
-        let groups = aggregate_group_labels(vec![
-            r#"[" Beta ","alpha","ALPHA",""]"#.to_string(),
-            "not-json".to_string(),
-            "   ".to_string(),
-            r#"["gamma","beta"]"#.to_string(),
-        ]);
-
-        assert_eq!(
-            groups,
-            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
-        );
-    }
-
     #[tokio::test]
     async fn dashboard_groups_endpoint_returns_aggregated_labels_for_authenticated_user() {
         let state = load_state_with_runtime(RuntimeConfig {
             listen: "127.0.0.1:0".to_string(),
             metrics_path: "/metrics".to_string(),
             database_dsn: "sqlite::memory:".to_string(),
+            request_log_spool_dir: None,
         })
         .await
         .expect("state loads");
@@ -193,7 +151,7 @@ mod tests {
             .await
             .execute(state.user_store.db.stmt(
                 "UPDATE users SET allowed_groups = $1 WHERE id = $2",
-                vec!["not-json".into(), user.id.clone().into()],
+                vec!["not-json".into(), api_key_owner.id.clone().into()],
             ))
             .await
             .expect("corrupt user groups");
@@ -209,11 +167,6 @@ mod tests {
             .await
             .expect("override api key groups");
         state
-            .monoize_store
-            .list_all_provider_groups_json()
-            .await
-            .expect("provider groups query works");
-        state
             .user_store
             .db
             .write()
@@ -224,6 +177,21 @@ mod tests {
             ))
             .await
             .expect("override provider groups");
+
+        assert_eq!(
+            state
+                .monoize_store
+                .list_dashboard_group_labels_with_batch_size(2)
+                .await
+                .expect("bounded group scan succeeds"),
+            vec![
+                "beta".to_string(),
+                "delta".to_string(),
+                "epsilon".to_string(),
+                "gamma".to_string(),
+                "team-a".to_string(),
+            ]
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -244,6 +212,7 @@ mod tests {
                 "delta".to_string(),
                 "epsilon".to_string(),
                 "gamma".to_string(),
+                "team-a".to_string(),
             ]
         );
     }

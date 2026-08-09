@@ -10,7 +10,6 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde_json::json;
-use std::collections::HashSet;
 
 pub async fn list_models(
     State(state): State<AppState>,
@@ -52,8 +51,6 @@ pub async fn create_model(
     Json(body): Json<CreateModelInput>,
 ) -> AppResult<impl IntoResponse> {
     require_admin(&headers, &state).await?;
-    let _update_guard = state.model_registry_update_lock.lock().await;
-
     let model_registry_store = &state.model_registry_store;
 
     let model = model_registry_store.create_model(body).await.map_err(|e| {
@@ -63,13 +60,6 @@ pub async fn create_model(
             AppError::new(StatusCode::BAD_REQUEST, "invalid_request", e)
         }
     })?;
-
-    let all_enabled = model_registry_store
-        .list_enabled_models()
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    state.model_registry.replace_db_records(all_enabled).await;
 
     Ok((StatusCode::CREATED, Json(model)))
 }
@@ -81,8 +71,6 @@ pub async fn update_model(
     Json(body): Json<UpdateModelInput>,
 ) -> AppResult<impl IntoResponse> {
     require_admin(&headers, &state).await?;
-    let _update_guard = state.model_registry_update_lock.lock().await;
-
     let model_registry_store = &state.model_registry_store;
 
     let model = model_registry_store
@@ -98,13 +86,6 @@ pub async fn update_model(
             }
         })?;
 
-    let all_enabled = model_registry_store
-        .list_enabled_models()
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    state.model_registry.replace_db_records(all_enabled).await;
-
     Ok(Json(model))
 }
 
@@ -114,8 +95,6 @@ pub async fn delete_model(
     Path(model_id): Path<String>,
 ) -> AppResult<impl IntoResponse> {
     require_admin(&headers, &state).await?;
-    let _update_guard = state.model_registry_update_lock.lock().await;
-
     let model_registry_store = &state.model_registry_store;
 
     model_registry_store
@@ -128,13 +107,6 @@ pub async fn delete_model(
                 AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e)
             }
         })?;
-
-    let all_enabled = model_registry_store
-        .list_enabled_models()
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    state.model_registry.replace_db_records(all_enabled).await;
 
     Ok(Json(json!({ "success": true })))
 }
@@ -253,30 +225,11 @@ pub async fn list_marketplace_models(
 ) -> AppResult<impl IntoResponse> {
     get_current_user(&headers, &state).await?;
 
-    let providers = state
-        .monoize_store
-        .list_providers()
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    let offered: HashSet<String> = providers
-        .into_iter()
-        .filter(|p| p.enabled)
-        .flat_map(|p| p.channels)
-        .filter(|channel| channel.enabled && channel.weight > 0)
-        .flat_map(|channel| channel.models.into_keys())
-        .collect();
-
-    let all_metadata: Vec<DbModelMetadataRecord> = state
+    let metadata = state
         .model_registry_store
-        .list_model_metadata()
+        .list_marketplace_model_metadata()
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
-    let filtered: Vec<DbModelMetadataRecord> = all_metadata
-        .into_iter()
-        .filter(|r| offered.contains(&r.model_id))
-        .collect();
-
-    Ok(Json(filtered))
+    Ok(Json(metadata))
 }

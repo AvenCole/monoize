@@ -57,19 +57,24 @@ pub(super) fn upstream_path_for_model(
     }
 }
 
-pub(super) async fn resolve_model_suffix(state: &AppState, req: &mut urp::UrpRequest) {
+pub(super) async fn resolve_model_suffix(
+    state: &AppState,
+    req: &mut urp::UrpRequest,
+) -> AppResult<String> {
     let requested_model = req.model.clone();
-    let normalized = normalized_logical_model_for_matching(state, &requested_model).await;
-    if normalized == requested_model {
-        return;
-    }
-    req.model = normalized;
-
     let settings_map = state
-        .settings_store
-        .get_reasoning_suffix_map()
+        .monoize_runtime
+        .read()
         .await
-        .unwrap_or_default();
+        .reasoning_suffix_map
+        .clone();
+    let normalized =
+        normalized_logical_model_for_matching_with_map(state, &requested_model, &settings_map)
+            .await?;
+    if normalized == requested_model {
+        return Ok(normalized);
+    }
+    req.model = normalized.clone();
 
     let mut settings_entries: Vec<(&str, &str)> = settings_map
         .iter()
@@ -85,7 +90,9 @@ pub(super) async fn resolve_model_suffix(state: &AppState, req: &mut urp::UrpReq
             if !base.is_empty() {
                 match req.reasoning.as_mut() {
                     Some(r) => {
-                        r.effort = Some(effort.to_string());
+                        if r.effort.is_none() {
+                            r.effort = Some(effort.to_string());
+                        }
                     }
                     None => {
                         req.reasoning = Some(urp::ReasoningConfig {
@@ -94,40 +101,18 @@ pub(super) async fn resolve_model_suffix(state: &AppState, req: &mut urp::UrpReq
                         });
                     }
                 }
-                return;
+                return Ok(normalized);
             }
         }
     }
+    Ok(normalized)
 }
 
-pub(super) async fn normalized_logical_model_for_matching(
+async fn normalized_logical_model_for_matching_with_map(
     state: &AppState,
     requested_model: &str,
-) -> String {
-    let providers = match state.monoize_store.list_providers().await {
-        Ok(p) => p,
-        Err(_) => return requested_model.to_string(),
-    };
-
-    let model_exists = |model: &str| -> bool {
-        providers.iter().any(|provider| {
-            provider.enabled
-                && provider
-                    .channels
-                    .iter()
-                    .any(|channel| channel.models.contains_key(model))
-        })
-    };
-    if model_exists(requested_model) {
-        return requested_model.to_string();
-    }
-
-    let settings_map = state
-        .settings_store
-        .get_reasoning_suffix_map()
-        .await
-        .unwrap_or_default();
-
+    settings_map: &std::collections::HashMap<String, String>,
+) -> AppResult<String> {
     // Sort by suffix length descending so longer suffixes match first
     // (e.g. "-nothinking" before "-thinking").
     let mut settings_entries: Vec<(&str, &str)> = settings_map
@@ -136,18 +121,28 @@ pub(super) async fn normalized_logical_model_for_matching(
         .collect();
     settings_entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
+    let mut candidates = vec![requested_model.to_string()];
     for (suffix, _effort) in settings_entries
         .iter()
         .chain(BUILTIN_REASONING_EFFORT_SUFFIXES.iter())
     {
         if let Some(base) = requested_model.strip_suffix(suffix) {
-            if !base.is_empty() && model_exists(base) {
-                return base.to_string();
+            if !base.is_empty() && !candidates.iter().any(|candidate| candidate == base) {
+                candidates.push(base.to_string());
             }
         }
     }
-
-    requested_model.to_string()
+    let available = state
+        .monoize_store
+        .available_model_names(&candidates)
+        .await
+        .map_err(|error| {
+            AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error)
+        })?;
+    Ok(candidates
+        .into_iter()
+        .find(|candidate| available.contains(candidate))
+        .unwrap_or_else(|| requested_model.to_string()))
 }
 
 pub(super) async fn build_monoize_attempts(
@@ -165,10 +160,11 @@ pub(super) async fn build_monoize_attempts_for_provider_type(
     required_provider_type: Option<ProviderType>,
 ) -> AppResult<Vec<MonoizeAttempt>> {
     let routing_config_revision = state.routing_config_revision.load(Ordering::Acquire);
-    let providers =
-        state.monoize_store.list_providers().await.map_err(|e| {
-            AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "provider_store_error", e)
-        })?;
+    let providers = state
+        .monoize_store
+        .list_providers_for_model(&urp.model)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "provider_store_error", e))?;
     let mut attempts = Vec::new();
     for provider in providers {
         collect_provider_attempts(
@@ -188,9 +184,16 @@ pub(super) async fn build_monoize_attempts_for_provider_type(
         return Ok(attempts);
     }
 
+    let pricing_inputs = attempts
+        .iter()
+        .map(|attempt| (attempt.upstream_model.clone(), attempt.provider_type))
+        .collect::<Vec<_>>();
+    let pricing_snapshot =
+        build_billing_rate_resolution_snapshot(state, &pricing_inputs, &urp.model).await?;
+
     let mut pricing_cache: std::collections::HashMap<
         (String, String, String),
-        Result<bool, String>,
+        Result<Option<BillingRateResolution>, String>,
     > = std::collections::HashMap::new();
     let mut blocked_models: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut blocked_meter_errors: std::collections::BTreeSet<String> =
@@ -207,23 +210,28 @@ pub(super) async fn build_monoize_attempts_for_provider_type(
                 reasoning_envelope_provider_type(attempt.provider_type)
             ),
         );
-        let has_pricing = if let Some(cached) = pricing_cache.get(&cache_key) {
+        let pricing = if let Some(cached) = pricing_cache.get(&cache_key) {
             cached.clone()
         } else {
-            let priced = match resolve_billing_rate_matrix(
-                state,
+            let priced = match pricing_snapshot.resolve(
                 &attempt.upstream_model,
                 &urp.model,
                 attempt.provider_type,
-            )
-            .await?
-            {
+            ) {
                 Some(resolution) => {
-                    billing_rate_matrix_allows_request(&resolution, &urp.server_tool_usage_classes)
+                    let allowed = billing_rate_matrix_allows_request(
+                        &resolution,
+                        &urp.server_tool_usage_classes,
+                    );
+                    match allowed {
+                        Ok(true) => Ok(Some(resolution)),
+                        Ok(false) => Ok(None),
+                        Err(error) => Err(error),
+                    }
                 }
                 None => {
                     if urp.server_tool_usage_classes.is_empty() {
-                        Ok(false)
+                        Ok(None)
                     } else {
                         Err(format!(
                             "meter rate required for server-native tool usage class: {}",
@@ -236,15 +244,16 @@ pub(super) async fn build_monoize_attempts_for_provider_type(
             priced
         };
 
-        match has_pricing {
+        match pricing {
             Err(err) => {
                 blocked_meter_errors.insert(err);
             }
-            Ok(true) => {
+            Ok(Some(resolution)) => {
                 attempt.billable_pricing_available = true;
+                attempt.billing_rate_resolution = Some(resolution);
                 allowed_attempts.push(attempt);
             }
-            Ok(false) => {
+            Ok(None) => {
                 blocked_models.insert(attempt.upstream_model);
             }
         }
@@ -316,7 +325,18 @@ pub(super) async fn apply_channel_affinity(
         return Ok(attempts);
     };
     let now = now_ts();
-    let binding = state.channel_affinity.lock().await.get(&key).cloned();
+    let binding = {
+        let mut guard = state.channel_affinity.lock().await;
+        let expired = guard
+            .get(&key)
+            .is_some_and(|binding| now >= binding.expires_at);
+        if expired {
+            guard.remove(&key);
+            None
+        } else {
+            guard.get(&key).cloned()
+        }
+    };
     let had_binding = binding.is_some();
 
     let mut bound_target = None;
@@ -326,10 +346,7 @@ pub(super) async fn apply_channel_affinity(
             attempt.provider_id == binding.provider_id && attempt.channel_id == binding.channel_id
         }) {
             let bound_attempt = &attempts[pos];
-            let idle_ttl =
-                i64::try_from(bound_attempt.affinity_idle_ttl_seconds).unwrap_or(i64::MAX);
-            let expired = now.saturating_sub(binding.updated_at) > idle_ttl;
-            if !bound_attempt.affinity_enabled || expired {
+            if !bound_attempt.affinity_enabled {
                 state.channel_affinity.lock().await.remove(&key);
             } else {
                 let failback_delay = i64::try_from(bound_attempt.affinity_failback_delay_seconds)
@@ -380,13 +397,29 @@ fn insert_channel_affinity(
     key: String,
     binding: crate::monoize_routing::ChannelAffinityBinding,
 ) {
-    if !cache.contains_key(&key)
-        && cache.len() >= crate::monoize_routing::CHANNEL_AFFINITY_MAX_ENTRIES
-        && let Some(evicted_key) = cache.keys().next().cloned()
-    {
-        cache.remove(&evicted_key);
+    insert_channel_affinity_with_limit(
+        cache,
+        key,
+        binding,
+        crate::monoize_routing::channel_affinity_max_entries(),
+    );
+}
+
+pub(super) fn insert_channel_affinity_with_limit(
+    cache: &mut std::collections::HashMap<String, crate::monoize_routing::ChannelAffinityBinding>,
+    key: String,
+    binding: crate::monoize_routing::ChannelAffinityBinding,
+    limit: usize,
+) {
+    if !cache.contains_key(&key) && cache.len() >= limit {
+        return;
     }
     cache.insert(key, binding);
+}
+
+fn channel_affinity_expires_at(now: i64, idle_ttl_seconds: u64) -> i64 {
+    let idle_ttl_seconds = i64::try_from(idle_ttl_seconds).unwrap_or(i64::MAX);
+    now.saturating_add(idle_ttl_seconds.max(1))
 }
 
 pub(super) async fn refresh_channel_affinity(state: &AppState, attempt: &MonoizeAttempt) {
@@ -421,7 +454,8 @@ pub(super) async fn refresh_channel_affinity(state: &AppState, attempt: &Monoize
             provider_id: attempt.provider_id.clone(),
             channel_id: attempt.channel_id.clone(),
             bound_at,
-            updated_at: now,
+            last_used_at: now,
+            expires_at: channel_affinity_expires_at(now, attempt.affinity_idle_ttl_seconds),
         },
     );
 }
@@ -469,7 +503,8 @@ pub(super) async fn refresh_response_id_affinity(
             provider_id: attempt.provider_id.clone(),
             channel_id: attempt.channel_id.clone(),
             bound_at,
-            updated_at: now,
+            last_used_at: now,
+            expires_at: channel_affinity_expires_at(now, attempt.affinity_idle_ttl_seconds),
         },
     );
 }
@@ -578,8 +613,10 @@ pub(super) async fn collect_provider_attempts(
             .unwrap_or(runtime.affinity_failback_delay_seconds);
         out.push(MonoizeAttempt {
             provider_id: provider.id.clone(),
+            provider_name: provider.name.clone(),
             provider_type: effective_provider_type.to_config_type(),
             channel_id: channel.id.clone(),
+            channel_name: channel.name.clone(),
             base_url: channel.base_url.clone(),
             api_key: channel.api_key.clone(),
             logical_model: urp.model.clone(),
@@ -606,6 +643,7 @@ pub(super) async fn collect_provider_attempts(
                 .strip_cross_protocol_nested_extra
                 .unwrap_or(runtime.strip_cross_protocol_nested_extra),
             billable_pricing_available: false,
+            billing_rate_resolution: None,
             affinity_key: None,
             affinity_key_hash: None,
             affinity_hit: None,
@@ -650,6 +688,9 @@ pub(super) async fn filter_eligible_channels(
             continue;
         }
         let key = health_key(&channel.id, model);
+        if crate::monoize_routing::missing_channel_health_is_saturated(&health, &key) {
+            continue;
+        }
         let channel_health = health
             .get(&key)
             .cloned()
@@ -681,6 +722,9 @@ pub(super) async fn is_attempt_channel_healthy(state: &AppState, attempt: &Monoi
     }
     let health = state.channel_health.lock().await;
     let key = health_key(&attempt.channel_id, attempt_health_model(attempt));
+    if crate::monoize_routing::missing_channel_health_is_saturated(&health, &key) {
+        return false;
+    }
     health
         .get(&key)
         .cloned()
@@ -859,15 +903,16 @@ pub(super) fn classify_retryable_failure(err: &UpstreamCallError) -> RetryableFa
     RetryableFailureClass::Transient
 }
 
-pub(super) fn prune_passive_samples(
-    samples: &mut std::collections::VecDeque<crate::monoize_routing::PassiveHealthSample>,
+pub(super) fn prune_passive_failure_timestamps(
+    failure_timestamps: &mut std::collections::VecDeque<i64>,
     now_ts: i64,
     window_seconds: u64,
 ) {
-    let cutoff = now_ts.saturating_sub(window_seconds as i64);
-    while let Some(front) = samples.front() {
-        if front.at_ts < cutoff {
-            let _ = samples.pop_front();
+    let window_seconds = i64::try_from(window_seconds).unwrap_or(i64::MAX);
+    let cutoff = now_ts.saturating_sub(window_seconds);
+    while let Some(front) = failure_timestamps.front() {
+        if *front < cutoff {
+            let _ = failure_timestamps.pop_front();
         } else {
             break;
         }
@@ -875,12 +920,20 @@ pub(super) fn prune_passive_samples(
 }
 
 pub(super) async fn mark_channel_success(state: &AppState, attempt: &MonoizeAttempt) {
+    if !attempt.circuit_breaker_enabled {
+        return;
+    }
     let now = now_ts();
     let mut health = state.channel_health.lock().await;
     if state.routing_config_revision.load(Ordering::Acquire) != attempt.routing_config_revision {
         return;
     }
     let key = health_key(&attempt.channel_id, attempt_health_model(attempt));
+    if !health.contains_key(&key)
+        && health.len() >= crate::monoize_routing::channel_health_max_entries()
+    {
+        return;
+    }
     let entry = health
         .entry(key)
         .or_insert_with(crate::monoize_routing::ChannelHealthState::new);
@@ -890,14 +943,8 @@ pub(super) async fn mark_channel_success(state: &AppState, attempt: &MonoizeAtte
     entry.last_success_at = Some(now);
     entry.probe_success_count = 0;
     entry.last_probe_at = None;
-    entry
-        .passive_samples
-        .push_back(crate::monoize_routing::PassiveHealthSample {
-            at_ts: now,
-            failed: false,
-        });
-    prune_passive_samples(
-        &mut entry.passive_samples,
+    prune_passive_failure_timestamps(
+        &mut entry.passive_failure_timestamps,
         now,
         attempt.passive_window_seconds,
     );
@@ -920,23 +967,26 @@ pub(super) async fn mark_channel_retryable_failure(
         return;
     }
     let key = health_key(&attempt.channel_id, attempt_health_model(attempt));
+    if !crate::monoize_routing::prepare_channel_health_insert(&mut health, &key) {
+        return;
+    }
     let entry = health
         .entry(key)
         .or_insert_with(crate::monoize_routing::ChannelHealthState::new);
-    entry
-        .passive_samples
-        .push_back(crate::monoize_routing::PassiveHealthSample {
-            at_ts: now,
-            failed: true,
-        });
-    prune_passive_samples(
-        &mut entry.passive_samples,
+    prune_passive_failure_timestamps(
+        &mut entry.passive_failure_timestamps,
         now,
         attempt.passive_window_seconds,
     );
+    let failure_threshold = crate::monoize_routing::effective_passive_failure_threshold(
+        attempt.passive_failure_count_threshold,
+    );
+    if entry.passive_failure_timestamps.len() < failure_threshold {
+        entry.passive_failure_timestamps.push_back(now);
+    }
 
-    let failure_samples = entry.passive_samples.iter().filter(|s| s.failed).count() as u32;
-    if failure_samples >= attempt.passive_failure_count_threshold {
+    let failure_samples = entry.passive_failure_timestamps.len();
+    if failure_samples >= failure_threshold {
         entry.healthy = false;
         let cooldown_seconds = if failure_class == RetryableFailureClass::RateLimited {
             attempt.passive_rate_limit_cooldown_seconds

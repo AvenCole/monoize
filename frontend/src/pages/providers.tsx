@@ -1,6 +1,5 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import useSWR from 'swr'
 import { AlertTriangle, Plus, Server } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -14,10 +13,10 @@ import {
 	AlertDialogTitle
 } from '@/components/ui/alert-dialog'
 import { toast } from 'sonner'
-import { api } from '@/lib/api'
 import type { Provider } from '@/lib/api'
 import {
 	useProviders,
+	useModelMetadata,
 	useSettings,
 	useTransformRegistry,
 	deleteProviderOptimistic,
@@ -38,9 +37,7 @@ export function ProvidersPage() {
 	const providers = providersData ?? []
 	const { data: settings } = useSettings()
 	const { data: transformRegistry = [] } = useTransformRegistry()
-	const { data: modelMetadata = [] } = useSWR('model-metadata', () =>
-		api.listModelMetadata()
-	)
+	const { data: modelMetadata = [] } = useModelMetadata()
 	const reasoningSuffixMap =
 		settings?.reasoning_suffix_map ?? DEFAULT_REASONING_SUFFIX_MAP
 	const [createOpen, setCreateOpen] = useState(false)

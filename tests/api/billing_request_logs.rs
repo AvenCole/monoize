@@ -261,7 +261,7 @@ async fn chat_streaming_downstream_disconnect_still_drains_final_usage_and_bills
 }
 
 #[tokio::test]
-async fn request_logs_join_api_key_name_when_name_cache_misses() {
+async fn request_logs_join_api_key_name_from_current_table() {
     let ctx = setup().await;
     let req = Request::builder()
         .method("POST")
@@ -520,6 +520,7 @@ async fn request_log_batcher_broadcasts_immediately_before_flush() {
         provider_id: None,
         upstream_model: None,
         channel_id: None,
+        names: monoize::users::RequestLogNameSnapshots::default(),
         is_stream: false,
         input_tokens: Some(12),
         output_tokens: Some(8),
@@ -1074,6 +1075,7 @@ async fn request_log_retention_deletes_only_rows_older_than_ninety_days() {
             provider_id: None,
             upstream_model: None,
             channel_id: None,
+            names: monoize::users::RequestLogNameSnapshots::default(),
             is_stream: false,
             input_tokens: Some(1),
             output_tokens: Some(1),
@@ -1121,6 +1123,7 @@ async fn request_log_retention_deletes_only_rows_older_than_ninety_days() {
             provider_id: None,
             upstream_model: None,
             channel_id: None,
+            names: monoize::users::RequestLogNameSnapshots::default(),
             is_stream: false,
             input_tokens: Some(1),
             output_tokens: Some(1),

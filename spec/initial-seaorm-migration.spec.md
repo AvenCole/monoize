@@ -284,6 +284,8 @@ ISM4.12b. Migration `m20260809_000025_storage_ledger_integrity` MUST remove the 
 
 ISM4.12c. On SQLite and PostgreSQL, every backend-specific DDL/data-copy statement in each of migrations `m20260809_000025_storage_ledger_integrity` and `m20260809_000026_exact_multiplier_text` MUST execute inside one database transaction. Any failed statement MUST roll back every earlier statement from that migration.
 
+ISM4.12d. Migration `m20260809_000029_sessions_expires_at_index` MUST create `idx_sessions_expires_at` on `sessions(expires_at)` on SQLite and PostgreSQL. Its down migration MUST remove that index.
+
 ISM4.13. Legacy `providers`, `model_mappings`, and `group_members` tables MUST NOT be created.
 
 ISM4.15. `state_records` columns:
@@ -315,6 +317,7 @@ ISM5.2. Required indexes:
 
 - `idx_sessions_user_id` on `sessions(user_id)`
 - `idx_sessions_token` on `sessions(token)`
+- `idx_sessions_expires_at` on `sessions(expires_at)`
 - `idx_api_keys_user_id` on `api_keys(user_id)`
 - `idx_api_keys_key_hash` on `api_keys(key_hash)`
 - `idx_billing_ledger_user_id` on `billing_ledger(user_id)`

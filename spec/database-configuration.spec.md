@@ -40,7 +40,7 @@ DB6. SQLite MUST use a split read/write pool architecture:
 - Read pool: 10 connections (`max_connections=10`).
 - Both pools: `acquire_timeout=10s`, `connect_timeout=5s`, `sqlx_logging=false`.
 
-DB7. On both SQLite pools, the following PRAGMAs MUST be executed at connection time:
+DB7. Every physical SQLite connection in both pools MUST execute the following PRAGMAs as part of establishing that connection, including connections that the pool opens after startup:
 
 - `PRAGMA journal_mode=WAL`
 - `PRAGMA synchronous=NORMAL`
@@ -48,6 +48,8 @@ DB7. On both SQLite pools, the following PRAGMAs MUST be executed at connection 
 - `PRAGMA foreign_keys=ON`
 - `PRAGMA cache_size=-65536` (64 MB page cache)
 - `PRAGMA mmap_size=268435456` (256 MB memory-mapped I/O)
+
+The implementation MUST configure these values through per-connection SQLx/SeaORM connection options. Executing each PRAGMA once through a pooled `DatabaseConnection` after pool creation is insufficient because it configures only the physical connection selected for that statement. For an in-memory SQLite database, SQLite may report the effective `journal_mode` as `memory`; all connection-local PRAGMAs remain required.
 
 DB8. If the SQLite DSN does not contain a `?` query string, `?mode=rwc` MUST be appended.
 
@@ -77,7 +79,7 @@ DB12. `DbPool` MUST implement `Clone` (all connections are `Arc`-backed internal
 
 DB13. All application SQL MUST be written with PostgreSQL-style `$1, $2, ...` placeholders.
 
-DB14. `stmt()` MUST convert `$N` placeholders to `?` when `backend == DbBackend::Sqlite`. The conversion replaces any `$` followed by one or more ASCII digits with a single `?`.
+DB14. `stmt()` MUST convert each PostgreSQL-style `$N` placeholder to the SQLite numbered placeholder `?N` when `backend == DbBackend::Sqlite`. The decimal digits in `N` MUST be preserved. Repeated occurrences of `$N` MUST continue to address one bind value, and placeholders written out of numeric order MUST retain their original indices. For example, `$2 || $1 || $2` MUST become `?2 || ?1 || ?2` and MUST bind a two-element value vector without adding a third value.
 
 DB15. `stmt()` MUST pass SQL through unchanged when `backend == DbBackend::Postgres`.
 
@@ -131,7 +133,7 @@ DBO1.1. `users` MUST include billing fields:
 
 DBO1.2. Every persisted user or API-key balance MUST be parsed as a signed `i128` before it is returned or used. A missing or malformed balance MUST return an explicit internal storage error. Dashboard reads MUST NOT silently replace malformed balance data with zero.
 
-DBO2. `model_registry_records` is the persistent source of dashboard-managed model registry rows merged into in-memory registry at startup.
+DBO2. `model_registry_records` is the authoritative source of dashboard-managed model registry rows. Startup MUST NOT enumerate it to construct an in-memory full-table mirror.
 
 DBO2.1. `model_metadata_records` is the persistent source of per-model pricing/capability metadata used by billing and dashboard diagnostics.
 
@@ -167,11 +169,31 @@ DB20. All SQL statements MUST be compatible with both SQLite and PostgreSQL. Spe
 
 DB21. Request-log storage MUST use a single canonical table schema across SQLite and PostgreSQL. PostgreSQL-specific shadow columns for type-specialized mirrors are forbidden. If an older PostgreSQL database still contains such shadow columns, migrations MUST remove them while preserving canonical data.
 
+### 10.1 Backend parity tests
+
+DB-T1. SQLite database-semantic tests MUST run without external services. PostgreSQL parity tests MUST use `MONOIZE_TEST_POSTGRES_DSN` when that environment variable is present and non-empty, and MUST skip without failure when it is absent. PostgreSQL parity tests MUST isolate their fixtures in a transaction or temporary tables and MUST NOT mutate persistent application tables.
+
 ## 11. Settings Mutation Ordering
 
-DB22. The process MUST serialize dashboard settings updates from the initial `get_all()` read through database writes, the final `get_all()` read, and publication to `monoize_runtime`.
+DB22. The process MUST serialize every dashboard settings mutation, including the dedicated `pricing_profile_model_patterns` endpoint, from its initial read or validation through database writes and publication to `monoize_runtime`, using one process-local settings-update lock.
 
 DB23. A settings update MUST read its base state after every earlier settings update in the same process has published its runtime snapshot. An earlier update's snapshot MUST NOT overwrite a later update's snapshot.
+
+DB23a. One dashboard settings update MUST write all changed `system_settings` rows in one database transaction. If any row write or commit fails, no row from that update may remain committed and `monoize_runtime` MUST remain unchanged.
+
+DB23b. After the transaction commits, Monoize MUST construct and publish `monoize_runtime` from the committed values before returning success. The supported single-process writer model is defined by `unified_responses_proxy.spec.md` C6.
+
+DB23c. `monoize_runtime` MUST contain the committed `reasoning_suffix_map`, `pricing_profile_model_patterns`, and `codex_model_ids`. A forwarding request MUST clone the suffix and pricing values from one runtime read and MUST NOT query `system_settings` for either value. `GET /v1/models` MUST clone `codex_model_ids` from the runtime snapshot and MUST NOT load all settings. The dedicated pricing-pattern mutation MUST publish its committed pattern list before returning success.
+
+DB23d. Authentication code that needs only `session_ttl_days`, and API-key creation code that needs only `api_key_max_per_user`, MUST execute one point lookup for that key. It MUST NOT call `get_all()` or parse unrelated setting payloads. A missing, malformed, or non-positive point value MUST resolve to `7` and `1000`, respectively. A database error from either point lookup MUST return HTTP `500`; authentication MUST NOT create a session and API-key creation MUST NOT insert a key after that error.
+
+DB23e. `GET /api/dashboard/settings/public` MUST execute one set-based query restricted to `registration_enabled`, `site_name`, `site_description`, and `api_base_url`. It MUST return defaults for any missing row and MUST NOT load or parse unrelated settings rows. If a persisted `registration_enabled` row exists, its value MUST be exactly the boolean text `true` or `false`; any other value MUST return a storage error and MUST NOT be interpreted as enabled.
+
+DB23f. `GET /api/dashboard/stats` MUST obtain `my_api_keys_count` with `COUNT(*) WHERE user_id = ?`. It MUST NOT load or deserialize the user's API-key rows to compute the count.
+
+DB23g. `PUT /api/dashboard/settings` MUST reject `session_ttl_days <= 0` and `api_key_max_per_user <= 0` with HTTP `400` and code `invalid_request`. A committed value for either setting MUST be a positive signed integer.
+
+DB23h. `POST /api/dashboard/auth/logout` MUST return success only after the current session delete commits. A session-delete database error MUST return HTTP `500`; the endpoint MUST NOT report a successful logout for a session that may remain valid.
 
 DB24. `system_settings` MUST persist `monoize_affinity_enabled`, `monoize_affinity_idle_ttl_seconds`, `monoize_affinity_failback_mode`, and `monoize_affinity_failback_delay_seconds`. Missing rows MUST resolve to `true`, `1800`, `"sticky"`, and `300`, respectively.
 

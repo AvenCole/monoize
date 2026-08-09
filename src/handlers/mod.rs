@@ -177,33 +177,20 @@ fn codex_model_descriptor(model_id: &str, priority: usize) -> Value {
 
 pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
     let auth = auth_tenant(&headers, &state).await?;
-    let providers =
-        state.monoize_store.list_providers().await.map_err(|e| {
-            AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "provider_store_error", e)
-        })?;
-
-    let mut model_ids: Vec<String> = providers
-        .into_iter()
-        .filter(|provider| provider.enabled)
-        .flat_map(|provider| provider.channels)
-        .filter(|channel| channel.enabled && channel.weight > 0)
-        .flat_map(|channel| channel.models.into_keys())
-        .collect();
-    model_ids.sort();
-    model_ids.dedup();
+    let mut model_ids = state
+        .monoize_store
+        .list_available_model_names()
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "provider_store_error", e))?;
 
     if auth.model_limits_enabled && !auth.model_limits.is_empty() {
         let allowed: HashSet<&str> = auth.model_limits.iter().map(|s| s.as_str()).collect();
         model_ids.retain(|id| allowed.contains(id.as_str()));
     }
 
-    let settings =
-        state.settings_store.get_all().await.map_err(|e| {
-            AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "settings_store_error", e)
-        })?;
+    let codex_model_ids = state.monoize_runtime.read().await.codex_model_ids.clone();
     let visible_model_ids: HashSet<&str> = model_ids.iter().map(String::as_str).collect();
-    let codex_models: Vec<Value> = settings
-        .codex_model_ids
+    let codex_models: Vec<Value> = codex_model_ids
         .iter()
         .filter(|model_id| visible_model_ids.contains(model_id.as_str()))
         .enumerate()
@@ -556,7 +543,7 @@ pub async fn create_embeddings(
         request_ip.as_deref(),
         started_at,
     )
-    .await;
+    .await?;
     let mut last_failed_attempt: Option<MonoizeAttempt> = None;
     let mut tried_providers: Vec<TriedProvider> = Vec::new();
     let mut execution_state = AttemptExecutionState::default();
@@ -610,7 +597,7 @@ pub async fn create_embeddings(
                     let usage = parse_usage_from_embeddings_object(&value);
                     let charge = match usage.as_ref() {
                         Some(usage_row) => {
-                            maybe_charge_usage(
+                            match maybe_charge_usage(
                                 &state,
                                 &auth,
                                 &attempt,
@@ -618,14 +605,47 @@ pub async fn create_embeddings(
                                 usage_row,
                                 request_id.as_deref(),
                             )
-                            .await?
+                            .await
+                            {
+                                Ok(charge) => charge,
+                                Err(err) => {
+                                    spawn_request_log_error(
+                                        &state,
+                                        &auth,
+                                        &attempt,
+                                        &logical_model,
+                                        false,
+                                        started_at,
+                                        request_id.clone(),
+                                        request_ip.clone(),
+                                        &err,
+                                        None,
+                                        tried_providers,
+                                    );
+                                    return Err(err);
+                                }
+                            }
                         }
                         None => {
-                            return Err(AppError::new(
+                            let err = AppError::new(
                                 StatusCode::BAD_GATEWAY,
                                 "upstream_usage_required",
                                 "upstream response did not include billable usage",
-                            ));
+                            );
+                            spawn_request_log_error(
+                                &state,
+                                &auth,
+                                &attempt,
+                                &logical_model,
+                                false,
+                                started_at,
+                                request_id.clone(),
+                                request_ip.clone(),
+                                &err,
+                                None,
+                                tried_providers,
+                            );
+                            return Err(err);
                         }
                     };
 
@@ -796,8 +816,10 @@ pub(crate) struct UrpRequest {
 #[derive(Clone, Debug)]
 struct MonoizeAttempt {
     provider_id: String,
+    provider_name: String,
     provider_type: ProviderType,
     channel_id: String,
+    channel_name: String,
     base_url: String,
     api_key: String,
     logical_model: String,
@@ -818,6 +840,7 @@ struct MonoizeAttempt {
     extra_fields_whitelist: Option<Vec<String>>,
     strip_cross_protocol_nested_extra: bool,
     billable_pricing_available: bool,
+    billing_rate_resolution: Option<billing::BillingRateResolution>,
     affinity_key: Option<String>,
     affinity_key_hash: Option<String>,
     affinity_hit: Option<bool>,
@@ -849,15 +872,6 @@ async fn maybe_sleep_before_channel_retry(attempt: &MonoizeAttempt) {
         attempt.channel_retry_interval_ms,
     ))
     .await;
-}
-
-async fn normalized_pricing_model_key(state: &AppState, model_id: &str) -> String {
-    let reasoning_suffix_map = state
-        .settings_store
-        .get_reasoning_suffix_map()
-        .await
-        .unwrap_or_default();
-    normalize_pricing_model_key(model_id, &reasoning_suffix_map)
 }
 
 #[derive(Clone, Debug, serde::Serialize)]

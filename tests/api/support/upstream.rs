@@ -1,3 +1,49 @@
+#[derive(Clone, Copy)]
+enum MockUsageProtocol {
+    Responses,
+    Chat,
+    Anthropic,
+}
+
+fn inject_default_mock_usage(body: &mut Value, protocol: MockUsageProtocol) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("usage".to_string())
+        .or_insert_with(|| match protocol {
+            MockUsageProtocol::Responses => json!({
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+                "input_tokens_details": { "cached_tokens": 0 },
+                "output_tokens_details": { "reasoning_tokens": 0 }
+            }),
+            MockUsageProtocol::Chat => json!({
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+                "prompt_tokens_details": { "cached_tokens": 0 },
+                "completion_tokens_details": { "reasoning_tokens": 0 }
+            }),
+            MockUsageProtocol::Anthropic => json!({
+                "input_tokens": 1,
+                "output_tokens": 1
+            }),
+        });
+}
+
+fn successful_mock_json(
+    mut body: Value,
+    protocol: MockUsageProtocol,
+    inject_usage: bool,
+) -> axum::response::Response {
+    if inject_usage {
+        inject_default_mock_usage(&mut body, protocol);
+    }
+    Json(body).into_response()
+}
+
 async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
     let captured_headers: CapturedHeaders = Arc::new(Mutex::new(Vec::new()));
     let captured_bodies: CapturedBodies = Arc::new(Mutex::new(Vec::new()));
@@ -35,6 +81,7 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
             return resp;
         }
         maybe_forced_upstream_delay(&body).await;
+        let inject_nonstream_usage = body.get("emit_usage").and_then(Value::as_bool) != Some(false);
         let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("mock");
         let text = collect_responses_text(body.get("input")) + &echo_suffix(&body);
         let input = body.get("input");
@@ -148,22 +195,26 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                     ),
                 )];
                 for (output_index, item) in output.iter().enumerate() {
-                    events.push(Ok(Event::default().event("response.output_item.added").data(
-                        json!({
-                            "type": "response.output_item.added",
-                            "output_index": output_index,
-                            "item": item
-                        })
-                        .to_string(),
-                    )));
-                    events.push(Ok(Event::default().event("response.output_item.done").data(
-                        json!({
-                            "type": "response.output_item.done",
-                            "output_index": output_index,
-                            "item": item
-                        })
-                        .to_string(),
-                    )));
+                    events.push(Ok(Event::default()
+                        .event("response.output_item.added")
+                        .data(
+                            json!({
+                                "type": "response.output_item.added",
+                                "output_index": output_index,
+                                "item": item
+                            })
+                            .to_string(),
+                        )));
+                    events.push(Ok(Event::default()
+                        .event("response.output_item.done")
+                        .data(
+                            json!({
+                                "type": "response.output_item.done",
+                                "output_index": output_index,
+                                "item": item
+                            })
+                            .to_string(),
+                        )));
                 }
                 events.push(Ok(Event::default().event("response.completed").data(
                     json!({
@@ -214,7 +265,12 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                                         "id": "ig_mock",
                                         "result": image_b64,
                                         "output_format": "png"
-                                    }]
+                                    }],
+                                    "usage": {
+                                        "input_tokens": 1,
+                                        "output_tokens": 1,
+                                        "total_tokens": 2
+                                    }
                                 }
                             })
                             .to_string(),
@@ -246,7 +302,12 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                                         "id": "ig_mock",
                                         "result": image_b64,
                                         "output_format": "webp"
-                                    }]
+                                    }],
+                                    "usage": {
+                                        "input_tokens": 1,
+                                        "output_tokens": 1,
+                                        "total_tokens": 2
+                                    }
                                 }
                             })
                             .to_string(),
@@ -2122,185 +2183,202 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
         if body.get("stream_mode").and_then(|v| v.as_str())
             == Some("responses_same_family_passthrough")
         {
-            return Json(json!({
-                "id": "resp_same_family_passthrough",
-                "object": "response",
-                "created_at": 0,
-                "model": model,
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "message",
-                        "id": "msg_same_family_passthrough",
-                        "role": "assistant",
-                        "status": "completed",
-                        "response_envelope_unknown": { "scope": "message" },
-                        "content": [{
-                            "type": "output_text",
-                            "text": text,
-                            "annotations": [],
-                            "response_node_unknown": { "scope": "content" }
-                        }]
-                    },
-                    {
-                        "type": "function_call",
-                        "id": "fc_same_family_passthrough",
-                        "call_id": "call_same_family_passthrough",
-                        "name": "noop",
-                        "arguments": "{}",
-                        "status": "completed",
-                        "response_tool_node_unknown": true
-                    }
-                ],
-                "response_top_unknown": { "scope": "response" }
-            }))
-            .into_response();
+            return successful_mock_json(
+                json!({
+                    "id": "resp_same_family_passthrough",
+                    "object": "response",
+                    "created_at": 0,
+                    "model": model,
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "id": "msg_same_family_passthrough",
+                            "role": "assistant",
+                            "status": "completed",
+                            "response_envelope_unknown": { "scope": "message" },
+                            "content": [{
+                                "type": "output_text",
+                                "text": text,
+                                "annotations": [],
+                                "response_node_unknown": { "scope": "content" }
+                            }]
+                        },
+                        {
+                            "type": "function_call",
+                            "id": "fc_same_family_passthrough",
+                            "call_id": "call_same_family_passthrough",
+                            "name": "noop",
+                            "arguments": "{}",
+                            "status": "completed",
+                            "response_tool_node_unknown": true
+                        }
+                    ],
+                    "response_top_unknown": { "scope": "response" }
+                }),
+                MockUsageProtocol::Responses,
+                inject_nonstream_usage,
+            );
         }
 
         if body.get("native_response_mode").and_then(Value::as_str) == Some("responses_ptc") {
-            return Json(json!({
-                "id": "resp_ptc",
-                "object": "response",
-                "created_at": 0,
-                "model": model,
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "program",
-                        "id": "prog_1",
-                        "call_id": "program_call_1",
-                        "code": "const result = await lookup({ query: 'monoize' });",
-                        "fingerprint": "fp_ptc_1"
-                    },
-                    {
-                        "type": "function_call",
-                        "id": "fc_ptc_1",
-                        "call_id": "call_ptc_1",
-                        "name": "lookup",
-                        "arguments": "{\"query\":\"monoize\"}",
-                        "status": "completed",
-                        "caller": { "type": "programmatic", "caller_id": "prog_1" }
-                    },
-                    {
-                        "type": "program_output",
-                        "id": "po_1",
-                        "call_id": "program_call_1",
-                        "status": "completed",
-                        "output": "lookup complete"
-                    }
-                ]
-            }))
-            .into_response();
+            return successful_mock_json(
+                json!({
+                    "id": "resp_ptc",
+                    "object": "response",
+                    "created_at": 0,
+                    "model": model,
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "program",
+                            "id": "prog_1",
+                            "call_id": "program_call_1",
+                            "code": "const result = await lookup({ query: 'monoize' });",
+                            "fingerprint": "fp_ptc_1"
+                        },
+                        {
+                            "type": "function_call",
+                            "id": "fc_ptc_1",
+                            "call_id": "call_ptc_1",
+                            "name": "lookup",
+                            "arguments": "{\"query\":\"monoize\"}",
+                            "status": "completed",
+                            "caller": { "type": "programmatic", "caller_id": "prog_1" }
+                        },
+                        {
+                            "type": "program_output",
+                            "id": "po_1",
+                            "call_id": "program_call_1",
+                            "status": "completed",
+                            "output": "lookup complete"
+                        }
+                    ]
+                }),
+                MockUsageProtocol::Responses,
+                inject_nonstream_usage,
+            );
         }
 
-        if body.get("native_response_mode").and_then(Value::as_str)
-            == Some("responses_tool_search")
+        if body.get("native_response_mode").and_then(Value::as_str) == Some("responses_tool_search")
         {
-            return Json(json!({
-                "id": "resp_tool_search",
-                "object": "response",
-                "created_at": 0,
-                "model": model,
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "tool_search_call",
-                        "id": "tsc_1",
-                        "call_id": "tool_search_call_1",
-                        "arguments": { "query": "lookup docs" },
-                        "status": "completed"
-                    },
-                    {
-                        "type": "tool_search_output",
-                        "id": "tso_1",
-                        "call_id": "tool_search_call_1",
-                        "status": "completed",
-                        "tools": [{ "type": "function", "name": "lookup_docs" }]
-                    },
-                    {
-                        "type": "additional_tools",
-                        "id": "at_1",
-                        "tools": [{ "type": "function", "name": "lookup_docs" }]
-                    }
-                ]
-            }))
-            .into_response();
+            return successful_mock_json(
+                json!({
+                    "id": "resp_tool_search",
+                    "object": "response",
+                    "created_at": 0,
+                    "model": model,
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "tool_search_call",
+                            "id": "tsc_1",
+                            "call_id": "tool_search_call_1",
+                            "arguments": { "query": "lookup docs" },
+                            "status": "completed"
+                        },
+                        {
+                            "type": "tool_search_output",
+                            "id": "tso_1",
+                            "call_id": "tool_search_call_1",
+                            "status": "completed",
+                            "tools": [{ "type": "function", "name": "lookup_docs" }]
+                        },
+                        {
+                            "type": "additional_tools",
+                            "id": "at_1",
+                            "tools": [{ "type": "function", "name": "lookup_docs" }]
+                        }
+                    ]
+                }),
+                MockUsageProtocol::Responses,
+                inject_nonstream_usage,
+            );
         }
 
         if body.get("native_response_mode").and_then(Value::as_str)
             == Some("responses_compaction_item")
         {
-            return Json(json!({
-                "id": "resp_compaction_item",
-                "object": "response",
-                "created_at": 0,
-                "model": model,
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "compaction",
-                        "id": "cmp_response_1",
-                        "encrypted_content": "opaque_response_compaction",
-                        "vendor_compaction": { "preserve": true }
-                    },
-                    {
-                        "type": "message",
-                        "id": "msg_after_compaction",
-                        "role": "assistant",
-                        "status": "completed",
-                        "content": [{ "type": "output_text", "text": "continued" }]
-                    }
-                ]
-            }))
-            .into_response();
+            return successful_mock_json(
+                json!({
+                    "id": "resp_compaction_item",
+                    "object": "response",
+                    "created_at": 0,
+                    "model": model,
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "compaction",
+                            "id": "cmp_response_1",
+                            "encrypted_content": "opaque_response_compaction",
+                            "vendor_compaction": { "preserve": true }
+                        },
+                        {
+                            "type": "message",
+                            "id": "msg_after_compaction",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{ "type": "output_text", "text": "continued" }]
+                        }
+                    ]
+                }),
+                MockUsageProtocol::Responses,
+                inject_nonstream_usage,
+            );
         }
 
         if body.get("stream_mode").and_then(|v| v.as_str()) == Some("nested_usage_details") {
-            return Json(json!({
-                "id": "resp_nested_usage",
-                "object": "response",
-                "created_at": 0,
-                "model": model,
-                "status": "completed",
-                "output": [{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{ "type": "output_text", "text": text }]
-                }],
-                "usage": {
-                    "input_tokens": 14,
-                    "output_tokens": 9,
-                    "total_tokens": 23,
-                    "input_tokens_details": {
-                        "cached_tokens": 0,
-                        "vendor_input_detail": { "kind": "warm" }
-                    },
-                    "output_tokens_details": {
-                        "reasoning_tokens": 0,
-                        "vendor_output_detail": [3, 4]
-                    }
-                }
-            }))
-            .into_response();
-        }
-
-        if tools_present && tool_outputs.is_empty() {
-            if image_generation_tool {
-                let image_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9p4N2VwAAAAASUVORK5CYII=";
-                return Json(json!({
-                    "id": "resp_mock",
+            return successful_mock_json(
+                json!({
+                    "id": "resp_nested_usage",
                     "object": "response",
                     "created_at": 0,
                     "model": model,
                     "status": "completed",
                     "output": [{
-                        "type": "image_generation_call",
-                        "id": "ig_mock",
-                        "result": image_b64,
-                        "output_format": "png"
-                    }]
-                }))
-                .into_response();
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": text }]
+                    }],
+                    "usage": {
+                        "input_tokens": 14,
+                        "output_tokens": 9,
+                        "total_tokens": 23,
+                        "input_tokens_details": {
+                            "cached_tokens": 0,
+                            "vendor_input_detail": { "kind": "warm" }
+                        },
+                        "output_tokens_details": {
+                            "reasoning_tokens": 0,
+                            "vendor_output_detail": [3, 4]
+                        }
+                    }
+                }),
+                MockUsageProtocol::Responses,
+                inject_nonstream_usage,
+            );
+        }
+
+        if tools_present && tool_outputs.is_empty() {
+            if image_generation_tool {
+                let image_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9p4N2VwAAAAASUVORK5CYII=";
+                return successful_mock_json(
+                    json!({
+                        "id": "resp_mock",
+                        "object": "response",
+                        "created_at": 0,
+                        "model": model,
+                        "status": "completed",
+                        "output": [{
+                            "type": "image_generation_call",
+                            "id": "ig_mock",
+                            "result": image_b64,
+                            "output_format": "png"
+                        }]
+                    }),
+                    MockUsageProtocol::Responses,
+                    inject_nonstream_usage,
+                );
             }
             let calls = if parallel {
                 vec![
@@ -2329,7 +2407,11 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
             {
                 obj.insert("service_tier".to_string(), service_tier);
             }
-            return Json(response).into_response();
+            return successful_mock_json(
+                response,
+                MockUsageProtocol::Responses,
+                inject_nonstream_usage,
+            );
         }
 
         if !tool_outputs.is_empty() {
@@ -2351,7 +2433,11 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
             {
                 obj.insert("service_tier".to_string(), service_tier);
             }
-            return Json(response).into_response();
+            return successful_mock_json(
+                response,
+                MockUsageProtocol::Responses,
+                inject_nonstream_usage,
+            );
         }
 
         let mut output = Vec::new();
@@ -2378,7 +2464,11 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
         {
             obj.insert("service_tier".to_string(), service_tier);
         }
-        Json(response).into_response()
+        successful_mock_json(
+            response,
+            MockUsageProtocol::Responses,
+            inject_nonstream_usage,
+        )
     }
 
     async fn responses_compact(
@@ -2395,35 +2485,39 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
             return resp;
         }
         maybe_forced_upstream_delay(&body).await;
-        Json(json!({
-            "id": "resp_compact_mock",
-            "object": "response.compaction",
-            "created_at": 1764967971,
-            "output": [
-                {
-                    "id": "msg_compact_mock",
-                    "type": "message",
-                    "status": "completed",
-                    "role": "user",
-                    "content": [{ "type": "input_text", "text": "compacted context" }]
+        let inject_nonstream_usage = body.get("emit_usage").and_then(Value::as_bool) != Some(false);
+        successful_mock_json(
+            json!({
+                "id": "resp_compact_mock",
+                "object": "response.compaction",
+                "created_at": 1764967971,
+                "output": [
+                    {
+                        "id": "msg_compact_mock",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "compacted context" }]
+                    },
+                    {
+                        "id": "cmp_mock",
+                        "type": "compaction",
+                        "encrypted_content": "opaque_compaction_payload",
+                        "vendor_compaction": { "preserve": true }
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 139,
+                    "input_tokens_details": { "cached_tokens": 0 },
+                    "output_tokens": 438,
+                    "output_tokens_details": { "reasoning_tokens": 64 },
+                    "total_tokens": 577
                 },
-                {
-                    "id": "cmp_mock",
-                    "type": "compaction",
-                    "encrypted_content": "opaque_compaction_payload",
-                    "vendor_compaction": { "preserve": true }
-                }
-            ],
-            "usage": {
-                "input_tokens": 139,
-                "input_tokens_details": { "cached_tokens": 0 },
-                "output_tokens": 438,
-                "output_tokens_details": { "reasoning_tokens": 64 },
-                "total_tokens": 577
-            },
-            "vendor_response": { "preserve": true }
-        }))
-        .into_response()
+                "vendor_response": { "preserve": true }
+            }),
+            MockUsageProtocol::Responses,
+            inject_nonstream_usage,
+        )
     }
 
     async fn chat(
@@ -2454,6 +2548,7 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
             return resp;
         }
         maybe_forced_upstream_delay(&body).await;
+        let inject_nonstream_usage = body.get("emit_usage").and_then(Value::as_bool) != Some(false);
         let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("mock");
         let messages = body
             .get("messages")
@@ -3325,50 +3420,56 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                 .into_response();
             }
             Some("chat_insufficient_system_resource") => {
-                return Json(json!({
-                    "id": "chatcmpl_mock",
-                    "object": "chat.completion",
-                    "created": 0,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "message": { "role": "assistant", "content": "partial" },
-                        "finish_reason": "insufficient_system_resource",
-                        "native_finish_reason": "insufficient_system_resource",
-                        "provider_marker": "deepseek"
-                    }]
-                }))
-                .into_response();
+                return successful_mock_json(
+                    json!({
+                        "id": "chatcmpl_mock",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": "partial" },
+                            "finish_reason": "insufficient_system_resource",
+                            "native_finish_reason": "insufficient_system_resource",
+                            "provider_marker": "deepseek"
+                        }]
+                    }),
+                    MockUsageProtocol::Chat,
+                    inject_nonstream_usage,
+                );
             }
             _ => {}
         }
 
         if body.get("stream_mode").and_then(|v| v.as_str()) == Some("nested_usage_details") {
-            return Json(json!({
-                "id": "chatcmpl_nested_usage",
-                "object": "chat.completion",
-                "created": 0,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": text },
-                    "finish_reason": "stop"
-                }],
-                "usage": {
-                    "prompt_tokens": 12,
-                    "completion_tokens": 8,
-                    "total_tokens": 20,
-                    "prompt_tokens_details": {
-                        "cached_tokens": 0,
-                        "vendor_prompt_detail": { "kind": "warm" }
-                    },
-                    "completion_tokens_details": {
-                        "reasoning_tokens": 0,
-                        "vendor_completion_detail": [1, 2]
+            return successful_mock_json(
+                json!({
+                    "id": "chatcmpl_nested_usage",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": text },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 12,
+                        "completion_tokens": 8,
+                        "total_tokens": 20,
+                        "prompt_tokens_details": {
+                            "cached_tokens": 0,
+                            "vendor_prompt_detail": { "kind": "warm" }
+                        },
+                        "completion_tokens_details": {
+                            "reasoning_tokens": 0,
+                            "vendor_completion_detail": [1, 2]
+                        }
                     }
-                }
-            }))
-            .into_response();
+                }),
+                MockUsageProtocol::Chat,
+                inject_nonstream_usage,
+            );
         }
 
         if tools_present && tool_outputs.is_empty() {
@@ -3382,40 +3483,46 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                     json!({"id":"call_1","type":"function","function":{"name":"tool_a","arguments":"{\"a\":1}"}}),
                 ]
             };
-            return Json(json!({
-                "id": "chatcmpl_mock",
-                "object": "chat.completion",
-                "created": 0,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": calls,
-                        "reasoning": "mock_reasoning",
-                        "reasoning_details": [reasoning_text_detail("mock_reasoning"), reasoning_encrypted_detail("mock_sig")]
-                    },
-                    "finish_reason": "tool_calls"
-                }]
-            }))
-            .into_response();
+            return successful_mock_json(
+                json!({
+                    "id": "chatcmpl_mock",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": calls,
+                            "reasoning": "mock_reasoning",
+                            "reasoning_details": [reasoning_text_detail("mock_reasoning"), reasoning_encrypted_detail("mock_sig")]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+                MockUsageProtocol::Chat,
+                inject_nonstream_usage,
+            );
         }
 
         if !tool_outputs.is_empty() {
             let joined = tool_outputs.join("|");
-            return Json(json!({
-                "id": "chatcmpl_mock",
-                "object": "chat.completion",
-                "created": 0,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": format!("tool_ok:{joined}") },
-                    "finish_reason": "stop"
-                }]
-            }))
-            .into_response();
+            return successful_mock_json(
+                json!({
+                    "id": "chatcmpl_mock",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": format!("tool_ok:{joined}") },
+                        "finish_reason": "stop"
+                    }]
+                }),
+                MockUsageProtocol::Chat,
+                inject_nonstream_usage,
+            );
         }
 
         let message = if reasoning_enabled {
@@ -3428,18 +3535,21 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
         } else {
             json!({ "role": "assistant", "content": text })
         };
-        Json(json!({
-            "id": "chatcmpl_mock",
-            "object": "chat.completion",
-            "created": 0,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": message,
-                "finish_reason": "stop"
-            }]
-        }))
-        .into_response()
+        successful_mock_json(
+            json!({
+                "id": "chatcmpl_mock",
+                "object": "chat.completion",
+                "created": 0,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": "stop"
+                }]
+            }),
+            MockUsageProtocol::Chat,
+            inject_nonstream_usage,
+        )
     }
 
     async fn messages(
@@ -3475,6 +3585,7 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
             return resp;
         }
         maybe_forced_upstream_delay(&body).await;
+        let inject_nonstream_usage = body.get("emit_usage").and_then(Value::as_bool) != Some(false);
         let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("mock");
         let messages = body
             .get("messages")
@@ -4358,77 +4469,85 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
         }
 
         if body.get("stream_mode").and_then(|v| v.as_str()) == Some("messages_pause_turn") {
-            return Json(json!({
-                "id": "msg_pause_turn",
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": [{ "type": "text", "text": "paused" }],
-                "stop_reason": "pause_turn",
-                "stop_sequence": Value::Null,
-                "usage": { "input_tokens": 4, "output_tokens": 1 }
-            }))
-            .into_response();
+            return successful_mock_json(
+                json!({
+                    "id": "msg_pause_turn",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [{ "type": "text", "text": "paused" }],
+                    "stop_reason": "pause_turn",
+                    "stop_sequence": Value::Null,
+                    "usage": { "input_tokens": 4, "output_tokens": 1 }
+                }),
+                MockUsageProtocol::Anthropic,
+                inject_nonstream_usage,
+            );
         }
 
         if body.get("native_response_mode").and_then(Value::as_str) == Some("messages_ptc") {
-            return Json(json!({
-                "id": "msg_ptc",
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "container": { "id": "container_ptc_1", "expires_at": "2099-01-01T00:00:00Z" },
-                "content": [
-                    {
-                        "type": "server_tool_use",
-                        "id": "srvtoolu_code_1",
-                        "name": "code_execution",
-                        "input": { "code": "await lookup({query: 'monoize'})" }
-                    },
-                    {
-                        "type": "tool_use",
-                        "id": "toolu_ptc_1",
-                        "name": "lookup",
-                        "input": { "query": "monoize" },
-                        "caller": { "type": "code_execution_20260120", "tool_id": "srvtoolu_code_1" }
-                    },
-                    {
-                        "type": "code_execution_tool_result",
-                        "tool_use_id": "srvtoolu_code_1",
-                        "content": { "stdout": "done", "stderr": "", "return_code": 0 }
-                    }
-                ],
-                "stop_reason": "tool_use",
-                "usage": { "input_tokens": 8, "output_tokens": 5 }
-            }))
-            .into_response();
+            return successful_mock_json(
+                json!({
+                    "id": "msg_ptc",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "container": { "id": "container_ptc_1", "expires_at": "2099-01-01T00:00:00Z" },
+                    "content": [
+                        {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_code_1",
+                            "name": "code_execution",
+                            "input": { "code": "await lookup({query: 'monoize'})" }
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_ptc_1",
+                            "name": "lookup",
+                            "input": { "query": "monoize" },
+                            "caller": { "type": "code_execution_20260120", "tool_id": "srvtoolu_code_1" }
+                        },
+                        {
+                            "type": "code_execution_tool_result",
+                            "tool_use_id": "srvtoolu_code_1",
+                            "content": { "stdout": "done", "stderr": "", "return_code": 0 }
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                    "usage": { "input_tokens": 8, "output_tokens": 5 }
+                }),
+                MockUsageProtocol::Anthropic,
+                inject_nonstream_usage,
+            );
         }
 
-        if body.get("native_response_mode").and_then(Value::as_str)
-            == Some("messages_tool_search")
+        if body.get("native_response_mode").and_then(Value::as_str) == Some("messages_tool_search")
         {
-            return Json(json!({
-                "id": "msg_tool_search",
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": [
-                    {
-                        "type": "server_tool_use",
-                        "id": "srvtoolu_search_1",
-                        "name": "tool_search_tool_regex",
-                        "input": { "query": "lookup_.*" }
-                    },
-                    {
-                        "type": "tool_search_tool_result",
-                        "tool_use_id": "srvtoolu_search_1",
-                        "content": [{ "type": "tool_reference", "tool_name": "lookup_docs" }]
-                    }
-                ],
-                "stop_reason": "end_turn",
-                "usage": { "input_tokens": 7, "output_tokens": 3 }
-            }))
-            .into_response();
+            return successful_mock_json(
+                json!({
+                    "id": "msg_tool_search",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [
+                        {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_search_1",
+                            "name": "tool_search_tool_regex",
+                            "input": { "query": "lookup_.*" }
+                        },
+                        {
+                            "type": "tool_search_tool_result",
+                            "tool_use_id": "srvtoolu_search_1",
+                            "content": [{ "type": "tool_reference", "tool_name": "lookup_docs" }]
+                        }
+                    ],
+                    "stop_reason": "end_turn",
+                    "usage": { "input_tokens": 7, "output_tokens": 3 }
+                }),
+                MockUsageProtocol::Anthropic,
+                inject_nonstream_usage,
+            );
         }
 
         if tools_present && tool_results.is_empty() {
@@ -4444,26 +4563,32 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                     json!({ "type": "tool_use", "id": "call_1", "name": "tool_a", "input": { "a": 1 } }),
                 ]
             };
-            return Json(json!({
-                "id": "msg_mock",
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": blocks
-            }))
-            .into_response();
+            return successful_mock_json(
+                json!({
+                    "id": "msg_mock",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": blocks
+                }),
+                MockUsageProtocol::Anthropic,
+                inject_nonstream_usage,
+            );
         }
 
         if !tool_results.is_empty() {
             let joined = tool_results.join("|");
-            return Json(json!({
-                "id": "msg_mock",
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": [{ "type": "text", "text": format!("tool_ok:{joined}") }]
-            }))
-            .into_response();
+            return successful_mock_json(
+                json!({
+                    "id": "msg_mock",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [{ "type": "text", "text": format!("tool_ok:{joined}") }]
+                }),
+                MockUsageProtocol::Anthropic,
+                inject_nonstream_usage,
+            );
         }
 
         let content = if thinking_enabled {
@@ -4474,14 +4599,17 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
         } else {
             json!([{ "type": "text", "text": text }])
         };
-        Json(json!({
-            "id": "msg_mock",
-            "type": "message",
-            "role": "assistant",
-            "model": model,
-            "content": content
-        }))
-        .into_response()
+        successful_mock_json(
+            json!({
+                "id": "msg_mock",
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": content
+            }),
+            MockUsageProtocol::Anthropic,
+            inject_nonstream_usage,
+        )
     }
 
     async fn gemini_dispatch(
@@ -4596,7 +4724,11 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
             "data": [{
                 "b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9p4N2VwAAAAASUVORK5CYII=",
                 "revised_prompt": body.get("prompt").and_then(|v| v.as_str()).unwrap_or("")
-            }]
+            }],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+            }
         }))
     }
 
@@ -4648,7 +4780,11 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
             "created": 0,
             "data": [{
                 "b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9p4N2VwAAAAASUVORK5CYII="
-            }]
+            }],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+            }
         }))
     }
 
@@ -4972,6 +5108,7 @@ async fn setup_with_unknown_fields() -> TestContext {
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: format!("sqlite://{}", db_path.display()),
+        request_log_spool_dir: Some(temp_dir.path().join("request-log-spool")),
     })
     .await
     .expect("load state");
@@ -5081,6 +5218,41 @@ async fn setup_with_unknown_fields() -> TestContext {
 
 async fn setup() -> TestContext {
     setup_with_unknown_fields().await
+}
+
+#[test]
+fn mock_usage_defaults_preserve_explicit_usage() {
+    let mut responses = json!({ "id": "resp" });
+    inject_default_mock_usage(&mut responses, MockUsageProtocol::Responses);
+    assert_eq!(responses["usage"]["input_tokens"], json!(1));
+    assert_eq!(responses["usage"]["output_tokens"], json!(1));
+
+    let mut explicit = json!({
+        "id": "msg",
+        "usage": { "input_tokens": 9, "output_tokens": 7, "vendor": true }
+    });
+    let expected = explicit["usage"].clone();
+    inject_default_mock_usage(&mut explicit, MockUsageProtocol::Anthropic);
+    assert_eq!(explicit["usage"], expected);
+}
+
+#[tokio::test]
+async fn mock_nonstream_usage_can_be_explicitly_omitted_for_negative_billing_tests() {
+    let ctx = setup().await;
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5-mini",
+            "input": "missing usage",
+            "emit_usage": false
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    let error: Value = serde_json::from_str(&body).expect("error response JSON");
+    assert_eq!(error["error"]["code"], json!("upstream_usage_required"));
 }
 
 async fn json_post(ctx: &TestContext, path: &str, body: Value) -> (StatusCode, String) {

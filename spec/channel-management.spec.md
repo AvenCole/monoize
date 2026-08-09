@@ -32,6 +32,8 @@ A provider object MUST include:
 - `request_timeout_ms_override?: integer | null`
 - `extra_fields_whitelist?: string[] | null`
 - `strip_cross_protocol_nested_extra?: boolean | null`
+
+CM-READ-1. Provider list, Provider detail, model-constrained routing, and active-probe candidate reads MUST return the persisted `strip_cross_protocol_nested_extra` value exactly. `true`, `false`, and `null` MUST remain distinct on every read path.
 - `groups: string[]` (default empty; provider-level group labels for routing eligibility)
 - `created_at: RFC3339`
 - `updated_at: RFC3339`
@@ -198,8 +200,13 @@ CP-DEL-2. After delete completes, in-flight work created before deletion MUST NO
   - The request body `provider_type` and `base_url` are the source of truth for the upstream request. They MAY differ from the stored Channel values when the editor has unsaved changes.
   - For `responses`, `chat_completion`, `messages`, `openai_image`, and `replicate`, call `GET {base}/v1/models` with bearer authentication.
   - For `gemini`, call Gemini list models with `x-goog-api-key`.
+  - Read both successful and non-successful upstream response bodies through the bounded discovery reader defined by RRB-UD1 through RRB-UD6 in `spec/runtime-resource-bounds.spec.md`.
+  - Parse a successful upstream response as JSON only after the bounded reader returns the complete body.
   - Return unique model ids sorted ascending.
 - Response: `{ "models": string[] }`
+- Errors:
+  - `502 upstream_discovery_response_too_large` when a declared or streamed upstream body exceeds `MONOIZE_UPSTREAM_DISCOVERY_MAX_BYTES`.
+  - `502 upstream_fetch_failed` when the upstream request, bounded body read, upstream status, or JSON decode fails for another reason.
 
 ### 3.8 Test channel liveness
 
@@ -207,10 +214,14 @@ CP-DEL-2. After delete completes, in-flight work created before deletion MUST NO
 - Body: `{ "model"?: string }`
 - If `model` is provided, it MUST be a key in the Channel `models` object.
 - If `model` is omitted, use the Channel active probe model override, then Provider active probe model override, then global probe model, then the first Channel model key in lexicographic order.
+- The global probe model and request timeout MUST be read from one `monoize_runtime` snapshot. This endpoint MUST NOT read the settings database.
 - The upstream probe model MUST be the selected Channel model entry `redirect` when non-empty, otherwise the logical model key.
 - The effective API type is the first matching Provider `api_type_overrides[]` entry for the logical model, otherwise the Channel `provider_type`.
 - Replicate channels MUST be rejected for active completion probes.
-- On success, clear all health entries for the tested channel.
+- On success, define the candidate health keys as the base Channel id and, when `per_model_circuit_break = true`, one `{channel_id}::{model}` key for each current Channel model key.
+- On success, reset every existing candidate health entry to healthy. Candidate health keys that do not exist MUST NOT be inserted when at least one candidate entry exists.
+- On success, when no candidate health entry exists and capacity remains, insert and reset only the base Channel health key. When capacity is full, do not insert an entry.
+- A successful test MUST NOT inspect or mutate health-map keys outside the candidate set. Its health-map work MUST be `O(channel.models.length)` and independent of the number of global health entries.
 - Response: `{ "success": boolean, "latency_ms": integer, "model": string, "error": string | null }`
 
 ## 4. Security

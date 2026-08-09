@@ -37,7 +37,125 @@ fn has_responses_state_reference(req: &urp::UrpRequest) -> bool {
         })
 }
 
+pub(super) struct AdmittedRequestTaskState {
+    started_at: std::time::Instant,
+    admitted: std::sync::atomic::AtomicBool,
+    is_stream: std::sync::atomic::AtomicBool,
+    attempt: std::sync::Mutex<Option<MonoizeAttempt>>,
+    pending_guard: std::sync::Mutex<Option<PendingRequestLogGuard>>,
+}
+
+impl AdmittedRequestTaskState {
+    pub(super) fn new(started_at: std::time::Instant) -> Self {
+        Self {
+            started_at,
+            admitted: std::sync::atomic::AtomicBool::new(false),
+            is_stream: std::sync::atomic::AtomicBool::new(false),
+            attempt: std::sync::Mutex::new(None),
+            pending_guard: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(super) fn set_stream(&self, is_stream: bool) {
+        self.is_stream
+            .store(is_stream, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn started_at(&self) -> std::time::Instant {
+        self.started_at
+    }
+
+    pub(super) fn retain_pending_guard(&self, guard: Option<PendingRequestLogGuard>) {
+        let admitted = guard.is_some();
+        *self.pending_guard.lock().unwrap_or_else(|e| e.into_inner()) = guard;
+        self.admitted
+            .store(admitted, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn set_attempt(&self, attempt: &MonoizeAttempt) {
+        *self.attempt.lock().unwrap_or_else(|e| e.into_inner()) = Some(attempt.clone());
+    }
+
+    pub(super) fn terminal_snapshot(
+        &self,
+    ) -> Option<(std::time::Instant, bool, Option<MonoizeAttempt>)> {
+        if !self.admitted.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        Some((
+            self.started_at,
+            self.is_stream.load(std::sync::atomic::Ordering::Acquire),
+            self.attempt
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_nonstream_error(
+    state: &AppState,
+    auth: &crate::auth::AuthResult,
+    attempt: &MonoizeAttempt,
+    logical_model: &str,
+    started_at: std::time::Instant,
+    request_id: &Option<String>,
+    request_ip: &Option<String>,
+    reasoning_effort: Option<String>,
+    tried_providers: Vec<TriedProvider>,
+    capture: &RequestCaptureContext,
+    capture_upstream_failure: bool,
+    error: AppError,
+) -> AppError {
+    spawn_request_log_error(
+        state,
+        auth,
+        attempt,
+        logical_model,
+        false,
+        started_at,
+        request_id.clone(),
+        request_ip.clone(),
+        &error,
+        reasoning_effort,
+        tried_providers,
+    );
+    if let Some(session) = capture.session.as_ref() {
+        session
+            .persist_with_result(None, capture_upstream_failure)
+            .await;
+    }
+    error
+}
+
 pub(super) async fn execute_nonstream_typed(
+    state: &AppState,
+    auth: &crate::auth::AuthResult,
+    req: urp::UrpRequest,
+    max_multiplier: Option<Multiplier>,
+    downstream: DownstreamProtocol,
+    request_id: Option<String>,
+    request_ip: Option<String>,
+    capture: RequestCaptureContext,
+) -> AppResult<(urp::UrpResponse, String)> {
+    execute_nonstream_typed_with_validator(
+        state,
+        auth,
+        req,
+        max_multiplier,
+        downstream,
+        request_id,
+        request_ip,
+        capture,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn execute_nonstream_typed_with_validator(
     state: &AppState,
     auth: &crate::auth::AuthResult,
     mut req: urp::UrpRequest,
@@ -46,12 +164,13 @@ pub(super) async fn execute_nonstream_typed(
     request_id: Option<String>,
     request_ip: Option<String>,
     capture: RequestCaptureContext,
+    response_validator: Option<fn(&urp::UrpResponse) -> AppResult<()>>,
+    task_state: Option<&AdmittedRequestTaskState>,
 ) -> AppResult<(urp::UrpResponse, String)> {
-    let started_at = std::time::Instant::now();
-    let requested_model = req.model.clone();
-    let transform_match_model =
-        normalized_logical_model_for_matching(state, &requested_model).await;
-    resolve_model_suffix(state, &mut req).await;
+    let started_at = task_state
+        .map(AdmittedRequestTaskState::started_at)
+        .unwrap_or_else(std::time::Instant::now);
+    let transform_match_model = resolve_model_suffix(state, &mut req).await?;
     // Preserve the suffix-normalized request so each per-attempt iteration can
     // re-derive the transformed request from a pristine base. This matters
     // because cross-family strip runs BEFORE all transforms per-attempt
@@ -62,7 +181,7 @@ pub(super) async fn execute_nonstream_typed(
     let routing_stub = build_routing_stub(&req, max_multiplier);
     let attempts = build_monoize_attempts(state, &routing_stub, auth).await?;
     ensure_balance_before_forward_for_attempts(state, auth, &attempts).await?;
-    let _pending_request_log_guard = insert_pending_request_log(
+    let pending_request_log_guard = insert_pending_request_log(
         state,
         auth,
         &req.model,
@@ -71,7 +190,13 @@ pub(super) async fn execute_nonstream_typed(
         request_ip.as_deref(),
         started_at,
     )
-    .await;
+    .await?;
+    let _local_pending_request_log_guard = if let Some(task_state) = task_state {
+        task_state.retain_pending_guard(pending_request_log_guard);
+        None
+    } else {
+        pending_request_log_guard
+    };
     let mut last_failed_attempt: Option<MonoizeAttempt> = None;
     let mut tried_providers: Vec<TriedProvider> = Vec::new();
     let mut execution_state = AttemptExecutionState::default();
@@ -87,6 +212,9 @@ pub(super) async fn execute_nonstream_typed(
             }
 
             let attempt_number = execution_state.record_upstream_attempt(&attempt);
+            if let Some(task_state) = task_state {
+                task_state.set_attempt(&attempt);
+            }
             // Clone from the pristine original request (pre-transforms) so
             // that the cross-family strip can run BEFORE provider, global,
             // and API-key transforms. This guarantees that transforms which
@@ -121,35 +249,105 @@ pub(super) async fn execute_nonstream_typed(
                 &req_attempt.model,
                 auth.reasoning_envelope_enabled,
             );
-            apply_transform_rules_request(
+            if let Err(err) = apply_transform_rules_request(
                 state,
                 &mut req_attempt,
                 &attempt.provider_transforms,
                 &transform_match_model,
                 Some(attempt.provider_type),
             )
-            .await?;
+            .await
+            {
+                return Err(finish_nonstream_error(
+                    state,
+                    auth,
+                    &attempt,
+                    &logical_model,
+                    started_at,
+                    &request_id,
+                    &request_ip,
+                    req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                    tried_providers,
+                    &capture,
+                    false,
+                    err,
+                )
+                .await);
+            }
             let global_transforms = state.monoize_runtime.read().await.global_transforms.clone();
-            apply_transform_rules_request(
+            if let Err(err) = apply_transform_rules_request(
                 state,
                 &mut req_attempt,
                 &global_transforms,
                 &transform_match_model,
                 Some(attempt.provider_type),
             )
-            .await?;
-            apply_transform_rules_request(
+            .await
+            {
+                return Err(finish_nonstream_error(
+                    state,
+                    auth,
+                    &attempt,
+                    &logical_model,
+                    started_at,
+                    &request_id,
+                    &request_ip,
+                    req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                    tried_providers,
+                    &capture,
+                    false,
+                    err,
+                )
+                .await);
+            }
+            if let Err(err) = apply_transform_rules_request(
                 state,
                 &mut req_attempt,
                 &auth.transforms,
                 &transform_match_model,
                 Some(attempt.provider_type),
             )
-            .await?;
+            .await
+            {
+                return Err(finish_nonstream_error(
+                    state,
+                    auth,
+                    &attempt,
+                    &logical_model,
+                    started_at,
+                    &request_id,
+                    &request_ip,
+                    req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                    tried_providers,
+                    &capture,
+                    false,
+                    err,
+                )
+                .await);
+            }
             strip_monoize_context(&mut req_attempt);
 
             let upstream_body =
-                encode_request_for_provider(&mut req_attempt, &attempt, downstream)?;
+                match encode_request_for_provider(&mut req_attempt, &attempt, downstream) {
+                    Ok(body) => body,
+                    Err(err) => {
+                        return Err(finish_nonstream_error(
+                            state,
+                            auth,
+                            &attempt,
+                            &logical_model,
+                            started_at,
+                            &request_id,
+                            &request_ip,
+                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                            tried_providers,
+                            &capture,
+                            false,
+                            err,
+                        )
+                        .await);
+                    }
+                };
             let provider = build_channel_provider_config(&attempt);
             let openai_image_edit = attempt.provider_type == ProviderType::OpenaiImage
                 && urp::encode::openai_image::has_user_image_input(&req_attempt);
@@ -194,16 +392,52 @@ pub(super) async fn execute_nonstream_typed(
                     .await
                     {
                         Ok(resp) => Ok((None, Some(resp))),
-                        Err(err) => return Err(err),
+                        Err(err) => {
+                            return Err(finish_nonstream_error(
+                                state,
+                                auth,
+                                &attempt,
+                                &logical_model,
+                                started_at,
+                                &request_id,
+                                &request_ip,
+                                req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                                tried_providers,
+                                &capture,
+                                false,
+                                err,
+                            )
+                            .await);
+                        }
                     },
                     Err(err) => Err(err),
                 }
             } else if openai_image_edit {
-                let form =
-                    urp::encode::openai_image::multipart_form(&req_attempt, &req_attempt.model)
-                        .map_err(|e| {
-                            AppError::new(StatusCode::BAD_REQUEST, "invalid_request", e)
-                        })?;
+                let form = match urp::encode::openai_image::multipart_form(
+                    &req_attempt,
+                    &req_attempt.model,
+                ) {
+                    Ok(form) => form,
+                    Err(message) => {
+                        let err =
+                            AppError::new(StatusCode::BAD_REQUEST, "invalid_request", message);
+                        return Err(finish_nonstream_error(
+                            state,
+                            auth,
+                            &attempt,
+                            &logical_model,
+                            started_at,
+                            &request_id,
+                            &request_ip,
+                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                            tried_providers,
+                            &capture,
+                            false,
+                            err,
+                        )
+                        .await);
+                    }
+                };
                 match upstream::call_upstream_multipart_with_timeout_and_headers(
                     client_http(state),
                     &provider,
@@ -285,17 +519,53 @@ pub(super) async fn execute_nonstream_typed(
                     refresh_channel_affinity(state, &attempt).await;
                     let mut resp = match collected_resp {
                         Some(resp) => resp,
-                        None => match decode_response_from_provider(
-                            attempt.provider_type,
-                            &value.expect("non-stream upstream value"),
-                            &req_attempt.model,
-                        ) {
-                            Ok(resp) => resp,
-                            Err(err) => {
-                                if let Some(session) = capture.session.as_ref() {
-                                    session.persist_with_result(None, false).await;
+                        None => match value.as_ref() {
+                            Some(value) => match decode_response_from_provider(
+                                attempt.provider_type,
+                                value,
+                                &req_attempt.model,
+                            ) {
+                                Ok(resp) => resp,
+                                Err(err) => {
+                                    return Err(finish_nonstream_error(
+                                        state,
+                                        auth,
+                                        &attempt,
+                                        &logical_model,
+                                        started_at,
+                                        &request_id,
+                                        &request_ip,
+                                        req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                                        tried_providers,
+                                        &capture,
+                                        false,
+                                        err,
+                                    )
+                                    .await);
                                 }
-                                return Err(err);
+                            },
+                            None => {
+                                let err = AppError::new(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "internal_error",
+                                    "non-stream upstream response value is missing",
+                                )
+                                .with_type("server_error");
+                                return Err(finish_nonstream_error(
+                                    state,
+                                    auth,
+                                    &attempt,
+                                    &logical_model,
+                                    started_at,
+                                    &request_id,
+                                    &request_ip,
+                                    req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                                    tried_providers,
+                                    &capture,
+                                    false,
+                                    err,
+                                )
+                                .await);
                             }
                         },
                     };
@@ -332,10 +602,21 @@ pub(super) async fn execute_nonstream_typed(
                     )
                     .await
                     {
-                        if let Some(session) = capture.session.as_ref() {
-                            session.persist_with_result(None, false).await;
-                        }
-                        return Err(err);
+                        return Err(finish_nonstream_error(
+                            state,
+                            auth,
+                            &attempt,
+                            &logical_model,
+                            started_at,
+                            &request_id,
+                            &request_ip,
+                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                            tried_providers,
+                            &capture,
+                            false,
+                            err,
+                        )
+                        .await);
                     }
                     if let Err(err) = apply_transform_rules_response(
                         state,
@@ -346,10 +627,21 @@ pub(super) async fn execute_nonstream_typed(
                     )
                     .await
                     {
-                        if let Some(session) = capture.session.as_ref() {
-                            session.persist_with_result(None, false).await;
-                        }
-                        return Err(err);
+                        return Err(finish_nonstream_error(
+                            state,
+                            auth,
+                            &attempt,
+                            &logical_model,
+                            started_at,
+                            &request_id,
+                            &request_ip,
+                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                            tried_providers,
+                            &capture,
+                            false,
+                            err,
+                        )
+                        .await);
                     }
                     if let Err(err) = apply_transform_rules_response(
                         state,
@@ -360,15 +652,45 @@ pub(super) async fn execute_nonstream_typed(
                     )
                     .await
                     {
-                        if let Some(session) = capture.session.as_ref() {
-                            session.persist_with_result(None, false).await;
-                        }
-                        return Err(err);
+                        return Err(finish_nonstream_error(
+                            state,
+                            auth,
+                            &attempt,
+                            &logical_model,
+                            started_at,
+                            &request_id,
+                            &request_ip,
+                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                            tried_providers,
+                            &capture,
+                            false,
+                            err,
+                        )
+                        .await);
                     }
                     if attempt.provider_type == ProviderType::OpenaiImage
                         && !matches!(downstream, DownstreamProtocol::Responses)
                     {
                         convert_assistant_images_to_markdown(&mut resp);
+                    }
+                    if let Some(validate) = response_validator
+                        && let Err(err) = validate(&resp)
+                    {
+                        return Err(finish_nonstream_error(
+                            state,
+                            auth,
+                            &attempt,
+                            &logical_model,
+                            started_at,
+                            &request_id,
+                            &request_ip,
+                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                            tried_providers,
+                            &capture,
+                            false,
+                            err,
+                        )
+                        .await);
                     }
                     let charge = match maybe_charge_response(
                         state,
@@ -382,10 +704,21 @@ pub(super) async fn execute_nonstream_typed(
                     {
                         Ok(charge) => charge,
                         Err(err) => {
-                            if let Some(session) = capture.session.as_ref() {
-                                session.persist_with_result(None, false).await;
-                            }
-                            return Err(err);
+                            return Err(finish_nonstream_error(
+                                state,
+                                auth,
+                                &attempt,
+                                &logical_model,
+                                started_at,
+                                &request_id,
+                                &request_ip,
+                                req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                                tried_providers,
+                                &capture,
+                                false,
+                                err,
+                            )
+                            .await);
                         }
                     };
                     spawn_request_log(

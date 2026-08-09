@@ -85,7 +85,7 @@ pub async fn compact_response(
         request_ip.as_deref(),
         started_at,
     )
-    .await;
+    .await?;
 
     let mut last_failed_attempt: Option<MonoizeAttempt> = None;
     let mut tried_providers = Vec::new();
@@ -158,7 +158,7 @@ pub async fn compact_response(
                     let usage = parse_usage_from_responses_object(&value);
                     let charge = match usage.as_ref() {
                         Some(usage) => {
-                            maybe_charge_usage(
+                            match maybe_charge_usage(
                                 &state,
                                 &auth,
                                 &attempt,
@@ -166,17 +166,53 @@ pub async fn compact_response(
                                 usage,
                                 request_id.as_deref(),
                             )
-                            .await?
+                            .await
+                            {
+                                Ok(charge) => charge,
+                                Err(err) => {
+                                    spawn_request_log_error(
+                                        &state,
+                                        &auth,
+                                        &attempt,
+                                        &logical_model,
+                                        false,
+                                        started_at,
+                                        request_id.clone(),
+                                        request_ip.clone(),
+                                        &err,
+                                        None,
+                                        tried_providers,
+                                    );
+                                    if let Some(session) = capture.session.as_ref() {
+                                        session.persist_with_result(None, false).await;
+                                    }
+                                    return Err(err);
+                                }
+                            }
                         }
                         None => {
-                            if let Some(session) = capture.session.as_ref() {
-                                session.persist_with_result(None, true).await;
-                            }
-                            return Err(AppError::new(
+                            let err = AppError::new(
                                 StatusCode::BAD_GATEWAY,
                                 "upstream_usage_required",
                                 "upstream response did not include billable usage",
-                            ));
+                            );
+                            spawn_request_log_error(
+                                &state,
+                                &auth,
+                                &attempt,
+                                &logical_model,
+                                false,
+                                started_at,
+                                request_id.clone(),
+                                request_ip.clone(),
+                                &err,
+                                None,
+                                tried_providers,
+                            );
+                            if let Some(session) = capture.session.as_ref() {
+                                session.persist_with_result(None, true).await;
+                            }
+                            return Err(err);
                         }
                     };
                     spawn_request_log(

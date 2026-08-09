@@ -38,7 +38,7 @@ MB-D3. `unit_price_nano_usd` MUST be an integer string denominated in nano-USD p
 
 MB-D3a. `unit_price_nano_usd` MUST be non-negative and representable as `i128`. Create, update, sync, and metadata-mirror paths MUST reject a negative or malformed rate before persistence.
 
-MB-D4. `match_json` and `raw_json` MUST be JSON object strings. Invalid JSON MUST be treated as `{}` when reading legacy rows.
+MB-D4. `match_json` and `raw_json` MUST be JSON object strings. Decoding a persisted value that is malformed JSON or is not a JSON object MUST return a storage error that identifies the billing-rate row and column. A get, list, or matching-rate query MUST propagate that error; it MUST NOT replace the value with `{}`, omit the row, or treat the row as an unconditional rate. Create, update, and catalog-sync paths MUST reject an explicit non-object value before persistence. An omitted value MAY default to `{}` before persistence.
 
 MB-D5. `model_metadata_records` MUST continue to store model capabilities, limits, Models.dev raw data, and legacy token prices. Billing computation MUST read `billing_rate_records`. Metadata writes and Models.dev sync MAY mirror token prices into `billing_rate_records`.
 
@@ -69,6 +69,8 @@ MB-P1b. The profile name `default` denotes the fallback pricing profile for mode
 
 MB-P2. Pattern matching MUST use case-insensitive glob semantics with `*` matching zero or more characters and `?` matching exactly one character.
 
+MB-P2a. Pattern matching MUST compare ASCII bytes without recursion. It MUST use `O(1)` call-stack space and `O(1)` auxiliary space for every pattern and value length. Its worst-case comparison count MUST be `O(pattern_bytes * value_bytes)`. A pattern or value with at least `200000` bytes and a pattern containing multiple `*` operators MUST not cause call-stack growth proportional to input length.
+
 MB-P3. Pricing-profile selection MUST use the first pattern whose `pattern` matches the normalized pricing model key.
 
 MB-P4. If no pattern matches, the request has no billable pricing.
@@ -76,6 +78,18 @@ MB-P4. If no pattern matches, the request has no billable pricing.
 MB-P5. Migration `m20260619_000020_default_pricing_profile` MUST rename stored pricing profile value `legacy` to `default` in `billing_rate_records.pricing_profile` and in the `pricing_profile_model_patterns` system setting. Runtime pricing selection MUST NOT treat `legacy` as an alias for `default`.
 
 MB-P6. When the selected profile has no complete eligible rate matrix for a normalized pricing model, Monoize MAY try one additional fallback profile from `model_metadata_records.models_dev_provider` for the same normalized model. The fallback MUST be used only when it differs from the selected profile. The fallback MUST use the same `provider_type`, `model_pattern`, context-tier, meter-rate, and completeness rules as the selected profile. Monoize MUST persist the profile that actually matched in `billing_breakdown_json`.
+
+MB-P7. When MB-P6 yields more than one candidate profile, rate rows for all candidate profiles MUST be loaded in one set-based database query for that model and provider type.
+
+MB-P8. Provider-attempt preflight MUST attach the complete selected rate-matrix snapshot to the attempt. Settlement of that attempt MUST reuse the attached snapshot and MUST NOT repeat profile selection, metadata lookup, or rate-row lookup.
+
+MB-P9. One active-probe scheduler tick MUST read the reasoning-suffix map once and pricing-profile patterns once. It MUST bulk-read metadata pricing profiles at most once and candidate Billing Rate rows at most once for all probe candidate model and Provider-type pairs in that tick.
+
+MB-P10. Active-probe pricing resolution MUST preserve ordered profile precedence: Settings pattern first, model metadata second. Within one profile it MUST preserve Billing Rate priority order, Provider-type matching, model-pattern matching, and dimensionless token-rate selection.
+
+MB-P11. Each active-probe request-log task MUST receive its pricing resolution from the scheduler-tick snapshot. The task MUST NOT query Settings, model metadata, or Billing Rates.
+
+MB-P12. One forwarding request MUST clone the reasoning-suffix map and pricing-profile patterns once from the process runtime snapshot before pricing its eligible attempts. It MUST execute no `system_settings` query for those values. It MUST bulk-read metadata pricing profiles at most once and candidate Billing Rate rows at most once for all distinct normalized model and effective Provider-type pairs in that request. Pricing resolution for each attempt MUST then use only this request-local snapshot. The runtime MUST NOT execute pricing queries per attempt, Provider, or Channel.
 
 ## 3. Rate Selection
 
@@ -209,9 +223,15 @@ MB-A2. Admin endpoint `PUT /api/dashboard/billing-rates/{id}` MUST upsert one bi
 
 MB-A2a. If the request body omits `source`, the upserted row MUST use `source = "manual"`, even when a row with the same `id` already exists from `source = "catalog"` or `source = "models_dev"`.
 
+MB-A2b. A billing-rate partial upsert MUST preserve omitted fields at the database write boundary. Concurrent partial upserts to distinct fields MUST NOT restore omitted fields from a stale pre-update snapshot on SQLite or PostgreSQL.
+
 MB-A3. Admin endpoint `DELETE /api/dashboard/billing-rates/{id}` MUST delete one billing-rate row.
 
 MB-A4. Admin endpoint `POST /api/dashboard/billing-rates/sync/catalog` MUST sync the bundled catalog. Manual rows with the same `id` MUST take precedence over catalog rows.
+
+MB-A4a. Catalog sync MUST read the protected manual id set once and insert every non-protected catalog row through set-based statements split into fixed-size chunks. It MUST NOT issue one database round trip per catalog row. Every chunk MUST remain below the portable SQLite bound-parameter limit, and PostgreSQL MUST use the same chunking semantics.
+
+MB-A4b. Bulk pricing-profile, Provider-type, and model-metadata lookup methods MUST split dynamic input sets into portable fixed-size chunks when necessary. A caller-controlled or database-sized input set MUST NOT exceed a backend bind-variable limit. Results from all chunks MUST preserve the method's documented deterministic order.
 
 MB-A5. Admin endpoint `GET /api/dashboard/pricing-profile-patterns` MUST return the ordered profile-pattern setting.
 

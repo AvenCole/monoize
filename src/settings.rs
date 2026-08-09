@@ -4,7 +4,7 @@ use crate::monoize_routing::AffinityFailbackMode;
 use crate::transforms::{TransformRuleConfig, canonicalize_transform_rules};
 use crate::users::ModelRedirectRule;
 use chrono::{DateTime, Utc};
-use sea_orm::{EntityTrait, Set, sea_query::OnConflict};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, sea_query::OnConflict};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -12,6 +12,14 @@ use std::collections::{HashMap, HashSet};
 pub struct PricingProfilePattern {
     pub pattern: String,
     pub pricing_profile: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicSettings {
+    pub registration_enabled: bool,
+    pub site_name: String,
+    pub site_description: String,
+    pub api_base_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,7 +121,7 @@ fn default_true() -> bool {
     true
 }
 
-fn default_reasoning_suffix_map() -> HashMap<String, String> {
+pub(crate) fn default_reasoning_suffix_map() -> HashMap<String, String> {
     let mut m = HashMap::new();
     m.insert("-thinking".to_string(), "high".to_string());
     m.insert("-reasoning".to_string(), "high".to_string());
@@ -425,6 +433,57 @@ impl SettingsStore {
         Ok(row.map(|r| r.value))
     }
 
+    pub async fn get_session_ttl_days(&self) -> Result<i64, String> {
+        Ok(self
+            .get("session_ttl_days")
+            .await?
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(7))
+    }
+
+    pub async fn get_api_key_max_per_user(&self) -> Result<i64, String> {
+        Ok(self
+            .get("api_key_max_per_user")
+            .await?
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1000))
+    }
+
+    pub async fn get_public_settings(&self) -> Result<PublicSettings, String> {
+        const PUBLIC_KEYS: [&str; 4] = [
+            "registration_enabled",
+            "site_name",
+            "site_description",
+            "api_base_url",
+        ];
+        let rows = system_settings::Entity::find()
+            .filter(system_settings::Column::Key.is_in(PUBLIC_KEYS))
+            .all(self.db.read())
+            .await
+            .map_err(|error| error.to_string())?;
+        let defaults = SystemSettings::default();
+        let mut public = PublicSettings {
+            registration_enabled: defaults.registration_enabled,
+            site_name: defaults.site_name,
+            site_description: defaults.site_description,
+            api_base_url: defaults.api_base_url,
+        };
+        for row in rows {
+            match row.key.as_str() {
+                "registration_enabled" => {
+                    public.registration_enabled = decode_registration_enabled(&row.value)?;
+                }
+                "site_name" => public.site_name = row.value,
+                "site_description" => public.site_description = row.value,
+                "api_base_url" => public.api_base_url = row.value,
+                _ => {}
+            }
+        }
+        Ok(public)
+    }
+
     pub async fn set(&self, key: &str, value: &str) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
 
@@ -470,7 +529,7 @@ impl SettingsStore {
 
             match row.key.as_str() {
                 "registration_enabled" => {
-                    settings.registration_enabled = row.value.parse().unwrap_or(true);
+                    settings.registration_enabled = decode_registration_enabled(&row.value)?;
                 }
                 "default_user_role" => {
                     settings.default_user_role = row.value;
@@ -606,174 +665,176 @@ impl SettingsStore {
         Ok(settings)
     }
 
-    pub async fn update_all(&self, settings: &SystemSettings) -> Result<(), String> {
+    pub async fn update_all(&self, settings: &SystemSettings) -> Result<SystemSettings, String> {
         let mut settings = settings.clone();
         canonicalize_transform_rules(&mut settings.global_transforms);
         canonicalize_codex_model_ids(&mut settings.codex_model_ids);
-        self.set(
-            "registration_enabled",
-            &settings.registration_enabled.to_string(),
-        )
-        .await?;
-        self.set("default_user_role", &settings.default_user_role)
-            .await?;
-        self.set("session_ttl_days", &settings.session_ttl_days.to_string())
-            .await?;
-        self.set(
-            "api_key_max_per_user",
-            &settings.api_key_max_per_user.to_string(),
-        )
-        .await?;
-        self.set("site_name", &settings.site_name).await?;
-        self.set("site_description", &settings.site_description)
-            .await?;
-        self.set("api_base_url", &settings.api_base_url).await?;
-        self.set(
-            "global_transforms",
-            &serde_json::to_string(&settings.global_transforms)
-                .unwrap_or_else(|_| "[]".to_string()),
-        )
-        .await?;
-        self.set(
-            "global_model_redirects",
-            &serde_json::to_string(&settings.global_model_redirects)
-                .unwrap_or_else(|_| "[]".to_string()),
-        )
-        .await?;
-        self.set(
-            "reasoning_suffix_map",
-            &serde_json::to_string(&settings.reasoning_suffix_map)
-                .unwrap_or_else(|_| "{}".to_string()),
-        )
-        .await?;
-        self.set(
-            "codex_model_ids",
-            &serde_json::to_string(&settings.codex_model_ids).unwrap_or_else(|_| "[]".to_string()),
-        )
-        .await?;
-        self.set(
-            "pricing_profile_model_patterns",
-            &serde_json::to_string(&settings.pricing_profile_model_patterns)
-                .unwrap_or_else(|_| "[]".to_string()),
-        )
-        .await?;
-        self.set(
-            "monoize_active_probe_enabled",
-            &settings.monoize_active_probe_enabled.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_active_probe_interval_seconds",
-            &settings.monoize_active_probe_interval_seconds.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_active_probe_success_threshold",
-            &settings.monoize_active_probe_success_threshold.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_active_probe_model",
-            settings.monoize_active_probe_model.as_deref().unwrap_or(""),
-        )
-        .await?;
-        self.set(
-            "monoize_passive_failure_threshold",
-            &settings.monoize_passive_failure_threshold.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_passive_cooldown_seconds",
-            &settings.monoize_passive_cooldown_seconds.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_passive_window_seconds",
-            &settings.monoize_passive_window_seconds.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_passive_min_samples",
-            &settings.monoize_passive_min_samples.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_passive_failure_rate_threshold",
-            &settings.monoize_passive_failure_rate_threshold.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_passive_rate_limit_cooldown_seconds",
-            &settings
-                .monoize_passive_rate_limit_cooldown_seconds
-                .to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_request_timeout_ms",
-            &settings.monoize_request_timeout_ms.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_stream_idle_timeout_ms",
-            &settings.monoize_stream_idle_timeout_ms.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_enable_estimated_billing",
-            &settings.monoize_enable_estimated_billing.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_extra_fields_whitelist",
-            &serde_json::to_string(&settings.monoize_extra_fields_whitelist)
-                .unwrap_or_else(|_| "{}".to_string()),
-        )
-        .await?;
-        self.set(
-            "monoize_strip_cross_protocol_nested_extra",
-            &settings
-                .monoize_strip_cross_protocol_nested_extra
-                .to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_request_capture_enabled",
-            &settings.monoize_request_capture_enabled.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_request_capture_retention_days",
-            &settings
-                .monoize_request_capture_retention_days
-                .max(1)
-                .to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_affinity_enabled",
-            &settings.monoize_affinity_enabled.to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_affinity_idle_ttl_seconds",
-            &settings
-                .monoize_affinity_idle_ttl_seconds
-                .max(1)
-                .to_string(),
-        )
-        .await?;
-        self.set(
-            "monoize_affinity_failback_mode",
-            settings.monoize_affinity_failback_mode.as_str(),
-        )
-        .await?;
-        self.set(
-            "monoize_affinity_failback_delay_seconds",
-            &settings.monoize_affinity_failback_delay_seconds.to_string(),
-        )
-        .await?;
-        Ok(())
+        settings.monoize_request_capture_retention_days =
+            settings.monoize_request_capture_retention_days.max(1);
+        settings.monoize_affinity_idle_ttl_seconds =
+            settings.monoize_affinity_idle_ttl_seconds.max(1);
+        let values = vec![
+            (
+                "registration_enabled",
+                settings.registration_enabled.to_string(),
+            ),
+            ("default_user_role", settings.default_user_role.clone()),
+            ("session_ttl_days", settings.session_ttl_days.to_string()),
+            (
+                "api_key_max_per_user",
+                settings.api_key_max_per_user.to_string(),
+            ),
+            ("site_name", settings.site_name.clone()),
+            ("site_description", settings.site_description.clone()),
+            ("api_base_url", settings.api_base_url.clone()),
+            (
+                "global_transforms",
+                serde_json::to_string(&settings.global_transforms).map_err(|e| e.to_string())?,
+            ),
+            (
+                "global_model_redirects",
+                serde_json::to_string(&settings.global_model_redirects)
+                    .map_err(|e| e.to_string())?,
+            ),
+            (
+                "reasoning_suffix_map",
+                serde_json::to_string(&settings.reasoning_suffix_map).map_err(|e| e.to_string())?,
+            ),
+            (
+                "codex_model_ids",
+                serde_json::to_string(&settings.codex_model_ids).map_err(|e| e.to_string())?,
+            ),
+            (
+                "pricing_profile_model_patterns",
+                serde_json::to_string(&settings.pricing_profile_model_patterns)
+                    .map_err(|e| e.to_string())?,
+            ),
+            (
+                "monoize_active_probe_enabled",
+                settings.monoize_active_probe_enabled.to_string(),
+            ),
+            (
+                "monoize_active_probe_interval_seconds",
+                settings.monoize_active_probe_interval_seconds.to_string(),
+            ),
+            (
+                "monoize_active_probe_success_threshold",
+                settings.monoize_active_probe_success_threshold.to_string(),
+            ),
+            (
+                "monoize_active_probe_model",
+                settings
+                    .monoize_active_probe_model
+                    .clone()
+                    .unwrap_or_default(),
+            ),
+            (
+                "monoize_passive_failure_threshold",
+                settings.monoize_passive_failure_threshold.to_string(),
+            ),
+            (
+                "monoize_passive_cooldown_seconds",
+                settings.monoize_passive_cooldown_seconds.to_string(),
+            ),
+            (
+                "monoize_passive_window_seconds",
+                settings.monoize_passive_window_seconds.to_string(),
+            ),
+            (
+                "monoize_passive_min_samples",
+                settings.monoize_passive_min_samples.to_string(),
+            ),
+            (
+                "monoize_passive_failure_rate_threshold",
+                settings.monoize_passive_failure_rate_threshold.to_string(),
+            ),
+            (
+                "monoize_passive_rate_limit_cooldown_seconds",
+                settings
+                    .monoize_passive_rate_limit_cooldown_seconds
+                    .to_string(),
+            ),
+            (
+                "monoize_request_timeout_ms",
+                settings.monoize_request_timeout_ms.to_string(),
+            ),
+            (
+                "monoize_stream_idle_timeout_ms",
+                settings.monoize_stream_idle_timeout_ms.to_string(),
+            ),
+            (
+                "monoize_enable_estimated_billing",
+                settings.monoize_enable_estimated_billing.to_string(),
+            ),
+            (
+                "monoize_extra_fields_whitelist",
+                serde_json::to_string(&settings.monoize_extra_fields_whitelist)
+                    .map_err(|e| e.to_string())?,
+            ),
+            (
+                "monoize_strip_cross_protocol_nested_extra",
+                settings
+                    .monoize_strip_cross_protocol_nested_extra
+                    .to_string(),
+            ),
+            (
+                "monoize_request_capture_enabled",
+                settings.monoize_request_capture_enabled.to_string(),
+            ),
+            (
+                "monoize_request_capture_retention_days",
+                settings
+                    .monoize_request_capture_retention_days
+                    .max(1)
+                    .to_string(),
+            ),
+            (
+                "monoize_affinity_enabled",
+                settings.monoize_affinity_enabled.to_string(),
+            ),
+            (
+                "monoize_affinity_idle_ttl_seconds",
+                settings
+                    .monoize_affinity_idle_ttl_seconds
+                    .max(1)
+                    .to_string(),
+            ),
+            (
+                "monoize_affinity_failback_mode",
+                settings.monoize_affinity_failback_mode.as_str().to_string(),
+            ),
+            (
+                "monoize_affinity_failback_delay_seconds",
+                settings.monoize_affinity_failback_delay_seconds.to_string(),
+            ),
+        ];
+
+        let committed_at = Utc::now();
+        let updated_at = committed_at.to_rfc3339();
+        let models = values
+            .into_iter()
+            .map(|(key, value)| system_settings::ActiveModel {
+                key: Set(key.to_string()),
+                value: Set(value),
+                updated_at: Set(updated_at.clone()),
+            })
+            .collect::<Vec<_>>();
+        let transaction = self.db.begin_write().await.map_err(|e| e.to_string())?;
+        system_settings::Entity::insert_many(models)
+            .on_conflict(
+                OnConflict::column(system_settings::Column::Key)
+                    .update_columns([
+                        system_settings::Column::Value,
+                        system_settings::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&*transaction)
+            .await
+            .map_err(|e| e.to_string())?;
+        transaction.commit().await.map_err(|e| e.to_string())?;
+        settings.updated_at = committed_at;
+        Ok(settings)
     }
 
     async fn migrate_transform_rule_ids(&self) -> Result<(), String> {
@@ -795,9 +856,10 @@ impl SettingsStore {
     }
 
     pub async fn is_registration_enabled(&self) -> Result<bool, String> {
-        self.get("registration_enabled")
-            .await
-            .map(|v| v.map(|s| s.parse().unwrap_or(true)).unwrap_or(true))
+        match self.get("registration_enabled").await? {
+            Some(raw) => decode_registration_enabled(&raw),
+            None => Ok(true),
+        }
     }
 
     pub async fn get_reasoning_suffix_map(&self) -> Result<HashMap<String, String>, String> {
@@ -828,4 +890,9 @@ impl SettingsStore {
         )
         .await
     }
+}
+
+fn decode_registration_enabled(raw: &str) -> Result<bool, String> {
+    raw.parse::<bool>()
+        .map_err(|error| format!("invalid registration_enabled boolean: {error}"))
 }

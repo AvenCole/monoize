@@ -81,11 +81,13 @@ async fn models_list_includes_only_configured_available_codex_models() {
         "missing-model".to_string(),
         "gpt-5-mini".to_string(),
     ];
-    ctx.state
+    let updated = ctx
+        .state
         .settings_store
         .update_all(&settings)
         .await
         .expect("settings update");
+    ctx.state.monoize_runtime.write().await.codex_model_ids = updated.codex_model_ids;
 
     let (status, body) = json_get(&ctx, "/v1/models").await;
     assert_eq!(status, StatusCode::OK);
@@ -215,13 +217,9 @@ async fn channel_passive_override_threshold_takes_precedence_over_global_default
         "channel should become unhealthy after one transient failure when override threshold=1"
     );
     assert_eq!(
-        state
-            .passive_samples
-            .iter()
-            .filter(|sample| sample.failed)
-            .count(),
+        state.passive_failure_timestamps.len(),
         1,
-        "one failed sample should be recorded in the passive breaker window"
+        "one failure timestamp should be recorded in the passive breaker window"
     );
 }
 
@@ -445,11 +443,13 @@ async fn models_list_respects_api_key_model_limits() {
         "grok-4".to_string(),
         "gpt-5-mini".to_string(),
     ];
-    ctx.state
+    let updated = ctx
+        .state
         .settings_store
         .update_all(&settings)
         .await
         .expect("settings update");
+    ctx.state.monoize_runtime.write().await.codex_model_ids = updated.codex_model_ids;
 
     let (status, body) = json_get(&ctx, "/v1/models").await;
     assert_eq!(status, StatusCode::OK);

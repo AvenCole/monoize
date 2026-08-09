@@ -2,6 +2,7 @@ use sea_orm::{
     ConnectOptions, Database, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr, Statement,
     TransactionTrait, Value,
 };
+use sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,7 +69,7 @@ impl DbPool {
     /// For SQLite DSNs (starting with "sqlite://"):
     ///   - Creates a write pool with max 1 connection (single-writer)
     ///   - Creates a read pool with max 10 connections
-    ///   - Enables WAL journal mode and 5s busy timeout
+    ///   - Applies WAL mode and connection-local PRAGMAs, including a 15s busy timeout
     ///
     /// For PostgreSQL DSNs (starting with "postgres://" or "postgresql://"):
     ///   - Creates a single connection pool used for both reads and writes
@@ -90,14 +91,8 @@ impl DbPool {
         ensure_sqlite_file(dsn).map_err(DbErr::Custom)?;
 
         if is_sqlite_memory_dsn(dsn) {
-            let opts = ConnectOptions::new(dsn)
-                .max_connections(1)
-                .acquire_timeout(Duration::from_secs(10))
-                .connect_timeout(Duration::from_secs(5))
-                .sqlx_logging(false)
-                .to_owned();
+            let opts = Self::sqlite_connect_options(dsn, 1);
             let conn = Database::connect(opts).await?;
-            Self::sqlite_pragmas(&conn).await?;
             return Ok(Self {
                 read: conn.clone(),
                 write_conn: conn,
@@ -106,33 +101,17 @@ impl DbPool {
             });
         }
 
-        // SQLite: append WAL + busy_timeout query params if not present
-        let base_dsn = if dsn.contains('?') || is_sqlite_memory_dsn(dsn) {
+        let base_dsn = if dsn.contains('?') {
             dsn.to_string()
         } else {
             format!("{dsn}?mode=rwc")
         };
 
-        let write_opts = ConnectOptions::new(&base_dsn)
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(5))
-            .sqlx_logging(false)
-            .to_owned();
-
-        let read_opts = ConnectOptions::new(&base_dsn)
-            .max_connections(10)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(5))
-            .sqlx_logging(false)
-            .to_owned();
+        let write_opts = Self::sqlite_connect_options(&base_dsn, 1);
+        let read_opts = Self::sqlite_connect_options(&base_dsn, 10);
 
         let write = Database::connect(write_opts).await?;
         let read = Database::connect(read_opts).await?;
-
-        // Enable WAL mode and busy timeout via PRAGMA on both pools
-        Self::sqlite_pragmas(&write).await?;
-        Self::sqlite_pragmas(&read).await?;
 
         Ok(Self {
             read,
@@ -140,6 +119,23 @@ impl DbPool {
             write_lock: Arc::new(Mutex::new(())),
             backend: DbBackend::Sqlite,
         })
+    }
+
+    fn sqlite_connect_options(dsn: &str, max_connections: u32) -> ConnectOptions {
+        let mut opts = ConnectOptions::new(dsn);
+        opts.max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .sqlx_logging(false);
+        opts.map_sqlx_sqlite_opts(|opts| {
+            opts.journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Normal)
+                .busy_timeout(Duration::from_secs(15))
+                .foreign_keys(true)
+                .pragma("cache_size", "-65536")
+                .pragma("mmap_size", "268435456")
+        });
+        opts
     }
 
     async fn connect_postgres(dsn: &str) -> Result<Self, DbErr> {
@@ -158,18 +154,6 @@ impl DbPool {
             write_lock: Arc::new(Mutex::new(())),
             backend: DbBackend::Postgres,
         })
-    }
-
-    async fn sqlite_pragmas(conn: &DatabaseConnection) -> Result<(), DbErr> {
-        use sea_orm::ConnectionTrait;
-        conn.execute_unprepared("PRAGMA journal_mode=WAL").await?;
-        conn.execute_unprepared("PRAGMA busy_timeout=15000").await?;
-        conn.execute_unprepared("PRAGMA foreign_keys=ON").await?;
-        conn.execute_unprepared("PRAGMA synchronous=NORMAL").await?;
-        conn.execute_unprepared("PRAGMA cache_size=-65536").await?;
-        conn.execute_unprepared("PRAGMA mmap_size=268435456")
-            .await?;
-        Ok(())
     }
 
     /// Get the read connection (for SELECT queries).
@@ -226,17 +210,17 @@ impl DbPool {
 
     /// Create a Statement with automatic placeholder conversion.
     /// Write SQL with $1, $2, ... placeholders.
-    /// For SQLite, $N placeholders are auto-converted to ?.
+    /// For SQLite, $N placeholders are auto-converted to numbered ?N placeholders.
     pub fn stmt(&self, sql: &str, values: Vec<Value>) -> Statement {
         if self.backend == DbBackend::Sqlite {
             let mut result = String::with_capacity(sql.len());
             let mut chars = sql.chars().peekable();
             while let Some(ch) = chars.next() {
                 if ch == '$' && chars.peek().is_some_and(|c| c.is_ascii_digit()) {
-                    while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
-                        chars.next();
-                    }
                     result.push('?');
+                    while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                        result.push(chars.next().expect("peeked placeholder digit"));
+                    }
                 } else {
                     result.push(ch);
                 }
@@ -277,4 +261,126 @@ fn ensure_sqlite_file(dsn: &str) -> Result<(), String> {
         std::fs::File::create(&path).map_err(|err| format!("sqlite_file_create_failed: {err}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DbPool;
+    use sea_orm::{ConnectionTrait, TransactionTrait};
+
+    #[tokio::test]
+    async fn sqlite_numbered_placeholders_preserve_repeated_bind_semantics() {
+        let db = DbPool::connect("sqlite::memory:").await.unwrap();
+        let row = db
+            .read()
+            .query_one(db.stmt("SELECT $1 || ':' || $1 AS bound_value", vec!["same".into()]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<String>("", "bound_value").unwrap(),
+            "same:same"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_numbered_placeholders_preserve_out_of_order_bind_semantics() {
+        let db = DbPool::connect("sqlite::memory:").await.unwrap();
+        let row = db
+            .read()
+            .query_one(db.stmt(
+                "SELECT $2 || $1 || $2 AS bound_value",
+                vec!["A".into(), "B".into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<String>("", "bound_value").unwrap(), "BAB");
+    }
+
+    #[tokio::test]
+    async fn every_sqlite_read_pool_connection_receives_required_pragmas() {
+        let db_path = std::path::PathBuf::from("target/test-databases")
+            .join(format!("pragma-{}.sqlite", uuid::Uuid::new_v4()));
+        let dsn = format!("sqlite://{}", db_path.display());
+        let db = DbPool::connect(&dsn).await.unwrap();
+        let mut transactions = Vec::new();
+        let mut observed = Vec::new();
+
+        for _ in 0..10 {
+            let txn = db.read().begin().await.unwrap();
+            let journal: String = txn
+                .query_one(db.stmt("PRAGMA journal_mode", vec![]))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "journal_mode")
+                .unwrap();
+            let busy_timeout: i64 = txn
+                .query_one(db.stmt("PRAGMA busy_timeout", vec![]))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "timeout")
+                .unwrap();
+            let foreign_keys: i64 = txn
+                .query_one(db.stmt("PRAGMA foreign_keys", vec![]))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "foreign_keys")
+                .unwrap();
+            let synchronous: i64 = txn
+                .query_one(db.stmt("PRAGMA synchronous", vec![]))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "synchronous")
+                .unwrap();
+            let cache_size: i64 = txn
+                .query_one(db.stmt("PRAGMA cache_size", vec![]))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "cache_size")
+                .unwrap();
+            let mmap_size: i64 = txn
+                .query_one(db.stmt("PRAGMA mmap_size", vec![]))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "mmap_size")
+                .unwrap();
+            observed.push((
+                journal,
+                busy_timeout,
+                foreign_keys,
+                synchronous,
+                cache_size,
+                mmap_size,
+            ));
+            transactions.push(txn);
+        }
+
+        for (journal, busy_timeout, foreign_keys, synchronous, cache_size, mmap_size) in observed {
+            assert_eq!(journal, "wal");
+            assert_eq!(busy_timeout, 15_000);
+            assert_eq!(foreign_keys, 1);
+            assert_eq!(synchronous, 1);
+            assert_eq!(cache_size, -65_536);
+            assert_eq!(mmap_size, 268_435_456);
+        }
+        for txn in transactions {
+            txn.rollback().await.unwrap();
+        }
+
+        drop(db);
+        for path in [
+            db_path.clone(),
+            db_path.with_extension("sqlite-wal"),
+            db_path.with_extension("sqlite-shm"),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }

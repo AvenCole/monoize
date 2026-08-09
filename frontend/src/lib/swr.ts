@@ -139,6 +139,17 @@ export function useProviders(config?: SWRConfiguration) {
   });
 }
 
+export function useProviderDetail(
+  providerId: string | null | undefined,
+  config?: SWRConfiguration
+) {
+  return useSWR<Provider>(
+    providerId ? providerDetailSWRKey(providerId) : null,
+    () => api.getProvider(providerId!),
+    { ...defaultConfig, ...config }
+  );
+}
+
 export function useDashboardGroups(enabled = true, config?: SWRConfiguration) {
   return useSWR<string[]>(
     enabled ? SWR_KEYS.DASHBOARD_GROUPS : null,
@@ -245,6 +256,9 @@ export async function updateSettingsOptimistic(
     const updated = await api.updateSettings(newSettings);
     // Revalidate with server data
     mutate(SWR_KEYS.SETTINGS, updated, false);
+    mutate(SWR_KEYS.PUBLIC_SETTINGS);
+    mutate(SWR_KEYS.PRICING_PROFILE_PATTERNS);
+    mutate(SWR_KEYS.PROVIDERS);
     return updated;
   } catch (error) {
     // Rollback on error
@@ -284,6 +298,7 @@ export async function createUserOptimistic(
     // Revalidate to get the real user data
     mutate(SWR_KEYS.USERS);
     mutate(SWR_KEYS.DASHBOARD_GROUPS);
+    mutate(SWR_KEYS.STATS);
   } catch (error) {
     // Rollback on error
     mutate(SWR_KEYS.USERS, currentUsers, false);
@@ -311,6 +326,8 @@ export async function updateUserOptimistic(
     // Revalidate to get the real data
     mutate(SWR_KEYS.USERS);
     mutate(SWR_KEYS.DASHBOARD_GROUPS);
+    mutate(SWR_KEYS.ME);
+    mutate(SWR_KEYS.STATS);
   } catch (error) {
     // Rollback on error
     mutate(SWR_KEYS.USERS, currentUsers, false);
@@ -457,6 +474,7 @@ export async function createProviderOptimistic(
     mutate(SWR_KEYS.DASHBOARD_GROUPS);
     mutate(SWR_KEYS.STATS);
     mutate(SWR_KEYS.CONFIG);
+    mutate(SWR_KEYS.MARKETPLACE_MODELS);
     return result;
   } catch (error) {
     if (onError && error instanceof Error) {
@@ -483,6 +501,7 @@ export async function updateProviderOptimistic(
     mutate(SWR_KEYS.PROVIDERS);
     mutate(SWR_KEYS.DASHBOARD_GROUPS);
     mutate(SWR_KEYS.CONFIG);
+    mutate(SWR_KEYS.MARKETPLACE_MODELS);
     return result;
   } catch (error) {
     // Revalidate from server rather than rolling back to a potentially stale snapshot
@@ -510,6 +529,8 @@ export async function deleteProviderOptimistic(
     mutate(SWR_KEYS.DASHBOARD_GROUPS);
     mutate(SWR_KEYS.STATS);
     mutate(SWR_KEYS.CONFIG);
+    mutate(SWR_KEYS.MARKETPLACE_MODELS);
+    mutate(providerDetailSWRKey(id), undefined, false);
   } catch (error) {
     // Rollback on error
     mutate(SWR_KEYS.PROVIDERS, currentProviders, false);
@@ -567,6 +588,8 @@ export async function upsertModelMetadataOptimistic(
   try {
     const result = await api.upsertModelMetadata(modelId, input);
     mutate(SWR_KEYS.MODEL_METADATA);
+    mutate(SWR_KEYS.MARKETPLACE_MODELS);
+    mutate(SWR_KEYS.PROVIDERS);
     return result;
   } catch (error) {
     mutate(SWR_KEYS.MODEL_METADATA, currentRecords, false);
@@ -588,6 +611,8 @@ export async function deleteModelMetadataOptimistic(
   try {
     await api.deleteModelMetadata(modelId);
     mutate(SWR_KEYS.MODEL_METADATA);
+    mutate(SWR_KEYS.MARKETPLACE_MODELS);
+    mutate(SWR_KEYS.PROVIDERS);
   } catch (error) {
     mutate(SWR_KEYS.MODEL_METADATA, currentRecords, false);
     if (onError && error instanceof Error) {
@@ -604,6 +629,8 @@ export async function syncModelMetadata(
     const result = await api.syncModelMetadataFromModelsDev();
     mutate(SWR_KEYS.MODEL_METADATA);
     mutate(SWR_KEYS.BILLING_RATES);
+    mutate(SWR_KEYS.MARKETPLACE_MODELS);
+    mutate(SWR_KEYS.PROVIDERS);
     return result;
   } catch (error) {
     if (onError && error instanceof Error) {
@@ -648,6 +675,7 @@ export async function upsertBillingRateOptimistic(
   try {
     const result = await api.upsertBillingRate(id, input);
     mutate(SWR_KEYS.BILLING_RATES);
+    mutate(SWR_KEYS.PROVIDERS);
     return result;
   } catch (error) {
     mutate(SWR_KEYS.BILLING_RATES, currentRecords, false);
@@ -672,6 +700,7 @@ export async function deleteBillingRateOptimistic(
   try {
     await api.deleteBillingRate(id);
     mutate(SWR_KEYS.BILLING_RATES);
+    mutate(SWR_KEYS.PROVIDERS);
   } catch (error) {
     mutate(SWR_KEYS.BILLING_RATES, currentRecords, false);
     if (onError && error instanceof Error) {
@@ -687,6 +716,7 @@ export async function syncBillingRatesCatalog(
   try {
     const result = await api.syncBillingRatesCatalog();
     mutate(SWR_KEYS.BILLING_RATES);
+    mutate(SWR_KEYS.PROVIDERS);
     return result;
   } catch (error) {
     if (onError && error instanceof Error) {
@@ -707,6 +737,7 @@ export async function updatePricingProfilePatternsOptimistic(
     const result = await api.updatePricingProfilePatterns(patterns);
     mutate(SWR_KEYS.PRICING_PROFILE_PATTERNS, result.patterns, false);
     mutate(SWR_KEYS.SETTINGS);
+    mutate(SWR_KEYS.PROVIDERS);
     return result.patterns;
   } catch (error) {
     mutate(SWR_KEYS.PRICING_PROFILE_PATTERNS, currentPatterns, false);
@@ -719,29 +750,9 @@ export async function updatePricingProfilePatternsOptimistic(
 
 // Global revalidation helpers
 export function revalidateAll() {
-  mutate(SWR_KEYS.ME);
-  mutate(SWR_KEYS.USERS);
-  mutate(SWR_KEYS.API_KEYS);
-  mutate(SWR_KEYS.STATS);
-  mutate(SWR_KEYS.CONFIG);
-  mutate(SWR_KEYS.SETTINGS);
-  mutate(SWR_KEYS.DASHBOARD_GROUPS);
-  mutate(SWR_KEYS.TRANSFORM_REGISTRY);
-  mutate(SWR_KEYS.MODEL_METADATA);
-  mutate(SWR_KEYS.BILLING_RATES);
-  mutate(SWR_KEYS.PRICING_PROFILE_PATTERNS);
+  return mutate(() => true);
 }
 
 export function clearCache() {
-  mutate(SWR_KEYS.ME, undefined, false);
-  mutate(SWR_KEYS.USERS, undefined, false);
-  mutate(SWR_KEYS.API_KEYS, undefined, false);
-  mutate(SWR_KEYS.STATS, undefined, false);
-  mutate(SWR_KEYS.CONFIG, undefined, false);
-  mutate(SWR_KEYS.SETTINGS, undefined, false);
-  mutate(SWR_KEYS.DASHBOARD_GROUPS, undefined, false);
-  mutate(SWR_KEYS.TRANSFORM_REGISTRY, undefined, false);
-  mutate(SWR_KEYS.MODEL_METADATA, undefined, false);
-  mutate(SWR_KEYS.BILLING_RATES, undefined, false);
-  mutate(SWR_KEYS.PRICING_PROFILE_PATTERNS, undefined, false);
+  return mutate(() => true, undefined, { revalidate: false });
 }

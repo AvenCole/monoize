@@ -331,6 +331,8 @@ RE4. Suffixes are matched **longest-first** against the end of the model name.
 
 RE5. The setting is stored in `system_settings` table under key `reasoning_suffix_map` and exposed via the existing `GET/PUT /api/dashboard/settings` endpoints.
 
+RE5a. Startup and every successful settings mutation MUST publish `reasoning_suffix_map` into the process runtime snapshot. Forwarding suffix resolution MUST read that snapshot and MUST NOT query `system_settings` per request.
+
 RE6. The setting is editable in the dashboard Settings page.
 
 RE6a. The default provider-level suffix transform used for Anthropic/OpenRouter compatibility SHOULD map wildcard `*` to `-thinking` (not `-{effort}`), so suffix resolution keeps model IDs on supported aliases.

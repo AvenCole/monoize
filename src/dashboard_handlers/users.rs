@@ -4,7 +4,7 @@ use crate::dashboard_handlers::session_helpers::{
     is_reserved_internal_username, is_valid_username, require_admin,
 };
 use crate::error::{AppError, AppResult};
-use crate::users::{UserRole, canonicalize_groups, parse_usd_to_nano};
+use crate::users::{AdminUpdateUserInput, UserRole, canonicalize_groups, parse_usd_to_nano};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -140,10 +140,6 @@ pub async fn create_user(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
-    state
-        .name_caches
-        .users
-        .insert(user.id.clone(), user.username.clone());
     Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
 }
 
@@ -232,39 +228,30 @@ pub async fn update_user(
     };
 
     user_store
-        .update_user(
+        .admin_update_user_atomic(
             &user_id,
-            body.username.as_deref(),
-            body.password.as_deref(),
-            new_role,
-            body.enabled,
-            None,
-            None,
-            body.email.as_ref().map(|e| e.as_deref()),
-            body.allowed_groups.as_deref(),
+            AdminUpdateUserInput {
+                username: body.username,
+                password: body.password,
+                role: new_role,
+                enabled: body.enabled,
+                balance_nano_usd: balance_nano_override,
+                balance_unlimited: body.balance_unlimited,
+                email: body.email,
+                allowed_groups: body.allowed_groups,
+            },
+            &current_user.id,
         )
         .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    if balance_nano_override.is_some() || body.balance_unlimited.is_some() {
-        user_store
-            .admin_adjust_user_balance(
-                &user_id,
-                balance_nano_override,
-                body.balance_unlimited,
-                &current_user.id,
-            )
-            .await
-            .map_err(|e| {
-                if e.contains("not found") {
-                    AppError::new(StatusCode::NOT_FOUND, "not_found", e)
-                } else if e.contains("invalid") {
-                    AppError::new(StatusCode::BAD_REQUEST, "invalid_balance", e)
-                } else {
-                    AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e)
-                }
-            })?;
-    }
+        .map_err(|e| {
+            if e.contains("not found") {
+                AppError::new(StatusCode::NOT_FOUND, "not_found", e)
+            } else if e.contains("invalid") {
+                AppError::new(StatusCode::BAD_REQUEST, "invalid_balance", e)
+            } else {
+                AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e)
+            }
+        })?;
 
     let updated_user = user_store
         .get_user_by_id(&user_id)
@@ -272,10 +259,6 @@ pub async fn update_user(
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "not_found", "user not found"))?;
 
-    state
-        .name_caches
-        .users
-        .insert(updated_user.id.clone(), updated_user.username.clone());
     Ok(Json(UserResponse::from(updated_user)))
 }
 
@@ -310,14 +293,9 @@ pub async fn delete_user(
         ));
     }
 
-    let api_key_ids = user_store
+    user_store
         .delete_user(&user_id)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    state.name_caches.users.remove(&user_id);
-    for api_key_id in api_key_ids {
-        state.name_caches.api_keys.remove(&api_key_id);
-    }
     Ok(Json(json!({ "success": true })))
 }

@@ -43,17 +43,7 @@ pub(super) fn resolve_max_multiplier(
 }
 
 pub(super) fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().to_string())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim().to_string())
-        })
+    crate::client_ip::canonical_client_ip_from_headers(headers).map(|address| address.to_string())
 }
 
 /// Reject the request if the API key has an IP whitelist and the client IP is not in it.
@@ -65,13 +55,18 @@ pub(super) fn check_ip_whitelist(
     if auth.ip_whitelist.is_empty() {
         return Ok(());
     }
-    let client_ip = extract_client_ip(headers).unwrap_or_default();
-    if client_ip.is_empty()
-        || !auth
-            .ip_whitelist
-            .iter()
-            .any(|allowed| allowed == &client_ip)
-    {
+    let client_ip = crate::client_ip::canonical_client_ip_from_headers(headers);
+    let allowed = client_ip.is_some_and(|client_ip| {
+        auth.ip_whitelist.iter().any(|entry| {
+            entry
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|allowed| allowed == client_ip)
+                || entry
+                    .parse::<ipnet::IpNet>()
+                    .is_ok_and(|network| network.contains(&client_ip))
+        })
+    });
+    if !allowed {
         return Err(AppError::new(
             StatusCode::FORBIDDEN,
             "ip_not_allowed",

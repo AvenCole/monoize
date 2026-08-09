@@ -765,10 +765,9 @@ pub(crate) fn responses_text_delta_payload(
 mod tests {
     use super::{extract_chat_reasoning_content_block, extract_chat_reasoning_delta_chunks};
     use super::{responses_data_line_length, split_wrapped_responses_json_string_field};
-    use crate::request_capture::with_sse_capture;
+    use crate::request_capture::{SseFrameCapture, with_sse_capture};
     use serde_json::{Value, json};
-    use std::sync::Arc;
-    use tokio::sync::{Mutex, mpsc};
+    use tokio::sync::mpsc;
 
     #[test]
     fn extract_chat_reasoning_delta_chunks_read_legacy_reasoning_content() {
@@ -868,7 +867,7 @@ mod tests {
     #[tokio::test]
     async fn send_plain_sse_data_records_frame_inside_capture_scope() {
         let (tx, mut rx) = mpsc::channel(1);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
 
         with_sse_capture(frames.clone(), async {
             super::send_plain_sse_data(&tx, "[DONE]".to_string())
@@ -878,6 +877,9 @@ mod tests {
         .await;
 
         let _event = rx.recv().await.expect("receives sse event");
-        assert_eq!(frames.lock().await.as_slice(), ["data: [DONE]\n\n"]);
+        assert_eq!(
+            frames.captured_frames().await.as_slice(),
+            ["data: [DONE]\n\n"]
+        );
     }
 }

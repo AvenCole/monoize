@@ -1,17 +1,16 @@
 use crate::auth::AuthState;
 use crate::billing_rate_store::{BillingRateStore, DbBillingRateRecord};
+use crate::client_ip::TrustedProxyConfig;
 use crate::db::DbPool;
 use crate::error::{AppError, AppResult};
 use crate::exact_decimal::Multiplier;
 use crate::handlers::routing::health_key;
 use crate::image_transform_cache::ImageTransformCache;
-use crate::model_registry::ModelRegistry;
 use crate::model_registry_store::ModelRegistryStore;
 use crate::monoize_routing::{
     ChannelAffinityBinding, ChannelHealthState, MonoizeRoutingStore, MonoizeRuntimeConfig,
     probe_channel_completion,
 };
-use crate::name_cache::NameCaches;
 use crate::rate_limit::RateLimiter;
 use crate::request_capture::RequestCaptureStore;
 use crate::settings::{PricingProfilePattern, SettingsStore, normalize_pricing_model_key};
@@ -24,26 +23,158 @@ use dashmap::DashMap;
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Once, OnceLock};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
-use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::request_id::{
+    MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
+};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
+
+#[derive(Clone)]
+pub struct RequestLogTaskTracker {
+    inner: Arc<RequestLogTaskTrackerInner>,
+}
+
+struct RequestLogTaskTrackerInner {
+    active: std::sync::Mutex<usize>,
+    updates: tokio::sync::watch::Sender<usize>,
+}
+
+impl Default for RequestLogTaskTracker {
+    fn default() -> Self {
+        let (updates, _) = tokio::sync::watch::channel(0);
+        Self {
+            inner: Arc::new(RequestLogTaskTrackerInner {
+                active: std::sync::Mutex::new(0),
+                updates,
+            }),
+        }
+    }
+}
+
+impl RequestLogTaskTracker {
+    pub(crate) fn register(&self) {
+        let mut active = self
+            .inner
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *active = active.saturating_add(1);
+        self.inner.updates.send_replace(*active);
+    }
+
+    pub(crate) fn complete(&self) {
+        let mut active = self
+            .inner
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *active == 0 {
+            tracing::error!("request-log terminal task tracker underflow");
+            return;
+        }
+        *active -= 1;
+        self.inner.updates.send_replace(*active);
+    }
+
+    pub fn active_count(&self) -> usize {
+        *self
+            .inner
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub async fn wait_for_idle(&self) {
+        let mut updates = self.inner.updates.subscribe();
+        loop {
+            if *updates.borrow_and_update() == 0 {
+                return;
+            }
+            if updates.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+struct RequestLogTaskRegistration {
+    tracker: RequestLogTaskTracker,
+}
+
+impl RequestLogTaskRegistration {
+    fn new(tracker: RequestLogTaskTracker) -> Self {
+        tracker.register();
+        Self { tracker }
+    }
+}
+
+impl Drop for RequestLogTaskRegistration {
+    fn drop(&mut self) {
+        self.tracker.complete();
+    }
+}
+
+pub struct RequestLogLifecycle {
+    reservation: crate::db_cache::RequestLogReservation,
+    terminal_scheduled: AtomicBool,
+    tracker_completed: AtomicBool,
+    tracker: RequestLogTaskTracker,
+}
+
+impl RequestLogLifecycle {
+    pub(crate) fn new(
+        reservation: crate::db_cache::RequestLogReservation,
+        tracker: RequestLogTaskTracker,
+    ) -> Self {
+        tracker.register();
+        Self {
+            reservation,
+            terminal_scheduled: AtomicBool::new(false),
+            tracker_completed: AtomicBool::new(false),
+            tracker,
+        }
+    }
+
+    pub(crate) fn try_schedule_terminal(&self) -> Option<crate::db_cache::RequestLogReservation> {
+        self.terminal_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| self.reservation.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_scheduled(&self) -> bool {
+        self.terminal_scheduled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn complete_terminal_task(&self) {
+        if !self.tracker_completed.swap(true, Ordering::AcqRel) {
+            self.tracker.complete();
+        }
+    }
+}
+
+impl Drop for RequestLogLifecycle {
+    fn drop(&mut self) {
+        if !self.tracker_completed.swap(true, Ordering::AcqRel) {
+            self.tracker.complete();
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub runtime: Arc<RuntimeConfig>,
     pub auth: AuthState,
-    pub model_registry: ModelRegistry,
     pub http: reqwest::Client,
     pub metrics: PrometheusHandle,
-    pub group_counters: Arc<Mutex<HashMap<String, u64>>>,
     pub user_store: UserStore,
-    pub name_caches: NameCaches,
     pub settings_store: SettingsStore,
     pub monoize_store: MonoizeRoutingStore,
     pub monoize_runtime: Arc<tokio::sync::RwLock<MonoizeRuntimeConfig>>,
@@ -51,20 +182,24 @@ pub struct AppState {
     pub channel_affinity: Arc<Mutex<HashMap<String, ChannelAffinityBinding>>>,
     pub routing_config_revision: Arc<AtomicU64>,
     pub settings_update_lock: Arc<Mutex<()>>,
-    pub model_registry_update_lock: Arc<Mutex<()>>,
     pub model_registry_store: ModelRegistryStore,
     pub billing_rate_store: BillingRateStore,
     pub transform_registry: Arc<TransformRegistry>,
     pub auth_rate_limiter: RateLimiter,
     pub log_broadcast: tokio::sync::broadcast::Sender<Vec<InsertRequestLog>>,
     pub pending_request_logs: Arc<DashMap<String, InsertRequestLog>>,
-    pub sse_connections: Arc<DashMap<String, AtomicUsize>>,
+    pub request_log_admissions: Arc<DashMap<String, Arc<RequestLogLifecycle>>>,
+    pub request_log_tasks: RequestLogTaskTracker,
+    pub background_shutdown: Arc<AtomicBool>,
+    pub sse_connections: Arc<DashMap<String, Arc<AtomicUsize>>>,
     pub image_transform_cache: Arc<ImageTransformCache>,
     pub request_capture: RequestCaptureStore,
+    pub trusted_proxies: TrustedProxyConfig,
 }
 
 const ACTIVE_PROBE_CONNECTIVITY_KIND: &str = "active_probe_connectivity";
 const ACTIVE_PROBE_SYSTEM_USER: &str = "_monoize_active_probe";
+const DEFAULT_HTTP_BODY_MAX_BYTES: usize = 50 * 1024 * 1024;
 
 static METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 static METRICS_ERROR: OnceLock<AppError> = OnceLock::new();
@@ -75,6 +210,7 @@ pub struct RuntimeConfig {
     pub listen: String,
     pub metrics_path: String,
     pub database_dsn: String,
+    pub request_log_spool_dir: Option<std::path::PathBuf>,
 }
 
 impl RuntimeConfig {
@@ -92,8 +228,21 @@ impl RuntimeConfig {
             listen,
             metrics_path,
             database_dsn,
+            request_log_spool_dir: None,
         }
     }
+}
+
+fn http_body_max_bytes() -> usize {
+    http_body_max_bytes_from_raw(std::env::var("MONOIZE_HTTP_BODY_MAX_BYTES").ok().as_deref())
+}
+
+fn http_body_max_bytes_from_raw(raw: Option<&str>) -> usize {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_HTTP_BODY_MAX_BYTES)
 }
 
 pub async fn load_state() -> AppResult<AppState> {
@@ -103,6 +252,13 @@ pub async fn load_state() -> AppResult<AppState> {
 #[allow(clippy::field_reassign_with_default)]
 pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppState> {
     let auth = AuthState::new();
+    let trusted_proxies = TrustedProxyConfig::from_env().map_err(|error| {
+        AppError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "trusted_proxy_config_invalid",
+            error,
+        )
+    })?;
 
     let http = reqwest::Client::builder()
         .user_agent("monoize/0.1")
@@ -142,23 +298,17 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
     let (log_broadcast, _) = tokio::sync::broadcast::channel::<Vec<InsertRequestLog>>(64);
 
     let pending_request_logs = Arc::new(DashMap::new());
-    let user_store = UserStore::new_with_pending_request_logs(
+    let user_store = UserStore::new_with_pending_request_logs_and_spool_dir(
         db.clone(),
         log_broadcast.clone(),
         pending_request_logs.clone(),
+        runtime.request_log_spool_dir.clone(),
     )
     .await
     .map_err(|err| {
         AppError::new(
             axum::http::StatusCode::BAD_REQUEST,
             "user_store_init_failed",
-            err,
-        )
-    })?;
-    let name_caches = NameCaches::init(db.read()).await.map_err(|err| {
-        AppError::new(
-            axum::http::StatusCode::BAD_REQUEST,
-            "name_cache_init_failed",
             err,
         )
     })?;
@@ -193,19 +343,6 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
 
     let metrics = init_metrics()?;
 
-    let model_registry = ModelRegistry::new();
-    let db_records = model_registry_store
-        .list_enabled_models()
-        .await
-        .map_err(|err| {
-            AppError::new(
-                axum::http::StatusCode::BAD_REQUEST,
-                "model_registry_db_load_failed",
-                err,
-            )
-        })?;
-    model_registry.replace_db_records(db_records).await;
-
     let settings_snapshot = settings_store.get_all().await.map_err(|err| {
         AppError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -234,6 +371,10 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
     monoize_runtime.active_probe_model = settings_snapshot.monoize_active_probe_model.clone();
     monoize_runtime.global_transforms = settings_snapshot.global_transforms.clone();
     monoize_runtime.global_model_redirects = settings_snapshot.global_model_redirects.clone();
+    monoize_runtime.reasoning_suffix_map = settings_snapshot.reasoning_suffix_map.clone();
+    monoize_runtime.pricing_profile_model_patterns =
+        settings_snapshot.pricing_profile_model_patterns.clone();
+    monoize_runtime.codex_model_ids = settings_snapshot.codex_model_ids.clone();
     monoize_runtime.request_timeout_ms = settings_snapshot.monoize_request_timeout_ms.max(1);
     monoize_runtime.stream_idle_timeout_ms =
         settings_snapshot.monoize_stream_idle_timeout_ms.max(1);
@@ -256,7 +397,6 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
     let channel_affinity = Arc::new(Mutex::new(HashMap::new()));
     let routing_config_revision = Arc::new(AtomicU64::new(0));
     let settings_update_lock = Arc::new(Mutex::new(()));
-    let model_registry_update_lock = Arc::new(Mutex::new(()));
     let transform_registry = Arc::new(crate::transforms::registry());
     let image_transform_cache = Arc::new(ImageTransformCache::from_env().await.map_err(|err| {
         AppError::new(
@@ -269,7 +409,25 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         .as_ref()
         .clone()
         .spawn_cleanup_task(ImageTransformCache::default_cleanup_interval());
-    let _ = ensure_active_probe_system_user(&user_store).await;
+    let active_probe_user_id = ensure_active_probe_system_user(&user_store).await?;
+    let request_log_tasks = RequestLogTaskTracker::default();
+    let background_shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let affinity = channel_affinity.clone();
+        let shutdown = background_shutdown.clone();
+        tokio::spawn(async move {
+            let interval = crate::monoize_routing::channel_affinity_cleanup_interval();
+            loop {
+                sleep(interval).await;
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                let now = chrono::Utc::now().timestamp();
+                let mut guard = affinity.lock().await;
+                crate::monoize_routing::cleanup_channel_affinity(&mut guard, now);
+            }
+        });
+    }
 
     let probe_store = monoize_store.clone();
     let probe_http = http.clone();
@@ -282,22 +440,51 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
     let probe_user_store = user_store.clone();
     let probe_model_registry_store = model_registry_store.clone();
     let probe_billing_rate_store = billing_rate_store.clone();
-    let probe_settings_store = settings_store.clone();
+    let probe_user_id = active_probe_user_id;
+    let probe_shutdown = background_shutdown.clone();
+    let probe_task_registration = RequestLogTaskRegistration::new(request_log_tasks.clone());
     tokio::spawn(async move {
-        loop {
+        let _probe_task_registration = probe_task_registration;
+        'scheduler: loop {
+            if probe_shutdown.load(Ordering::Acquire) {
+                break;
+            }
             sleep(std::time::Duration::from_secs(1)).await;
+            if probe_shutdown.load(Ordering::Acquire) {
+                break;
+            }
             let routing_config_revision = probe_routing_config_revision.load(Ordering::Acquire);
-            let providers = match probe_store.list_providers().await {
+            let providers = match probe_store.list_active_probe_candidates().await {
                 Ok(v) => v,
                 Err(_) => continue,
             };
             let now = chrono::Utc::now().timestamp();
             let rt_snap = probe_runtime.read().await.clone();
+            let pricing_snapshot = match build_active_probe_pricing_snapshot(
+                &probe_billing_rate_store,
+                &probe_model_registry_store,
+                &providers,
+                &rt_snap,
+            )
+            .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    tracing::warn!(error = %err, "active probe pricing snapshot failed");
+                    ActiveProbePricingSnapshot::default()
+                }
+            };
             for provider in providers {
+                if probe_shutdown.load(Ordering::Acquire) {
+                    break 'scheduler;
+                }
                 if !provider.circuit_breaker_enabled {
                     continue;
                 }
                 for channel in provider.channels {
+                    if probe_shutdown.load(Ordering::Acquire) {
+                        break 'scheduler;
+                    }
                     if channel.provider_type
                         == crate::monoize_routing::MonoizeProviderType::Replicate
                     {
@@ -323,7 +510,7 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                     let probe_due = {
                         let guard = probe_health.lock().await;
                         let states = if provider.per_model_circuit_break {
-                            channel_health_keys(&guard, &channel.id)
+                            channel_model_health_keys(&channel.id, channel.models.keys())
                                 .into_iter()
                                 .filter_map(|key| guard.get(&key).cloned())
                                 .collect::<Vec<_>>()
@@ -380,8 +567,67 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                         .filter(|value| !value.is_empty())
                         .unwrap_or(model_name)
                         .to_string();
-                    let active_probe_user_id =
-                        ensure_active_probe_system_user(&probe_user_store).await;
+                    if probe_shutdown.load(Ordering::Acquire) {
+                        break 'scheduler;
+                    }
+                    let request_log_reservation = match probe_user_store
+                        .reserve_terminal_request_log()
+                    {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            tracing::warn!(
+                                channel_id = %channel.id,
+                                channel_name = %channel.name,
+                                provider = %provider.name,
+                                probe_model = %model_name,
+                                "active probe skipped because request-log spool admission failed: {error}"
+                            );
+                            continue;
+                        }
+                    };
+                    let probe_request_id = uuid::Uuid::new_v4().to_string();
+                    let probe_created_at = chrono::Utc::now();
+                    let probe_fallback = build_active_probe_interrupted_log(
+                        &probe_request_id,
+                        &probe_user_id,
+                        &provider.id,
+                        &provider.name,
+                        channel.provider_type,
+                        channel.models.get(model_name).map(|entry| entry.multiplier),
+                        &channel.id,
+                        &channel.name,
+                        model_name,
+                        &upstream_model,
+                        probe_created_at,
+                    );
+                    if let Err(error) = probe_user_store
+                        .arm_terminal_request_log(probe_fallback, &request_log_reservation)
+                        .await
+                    {
+                        tracing::warn!(
+                            channel_id = %channel.id,
+                            channel_name = %channel.name,
+                            provider = %provider.name,
+                            probe_model = %model_name,
+                            "active probe skipped because request-log fallback could not be armed: {error}"
+                        );
+                        continue;
+                    }
+                    if probe_shutdown.load(Ordering::Acquire) {
+                        if let Err(error) = probe_user_store
+                            .cancel_terminal_request_log(&request_log_reservation)
+                            .await
+                        {
+                            tracing::error!(
+                                channel_id = %channel.id,
+                                channel_name = %channel.name,
+                                provider = %provider.name,
+                                probe_model = %model_name,
+                                "active probe request-log reservation cancellation failed: {error}"
+                            );
+                        }
+                        break 'scheduler;
+                    }
                     let probe_started_at = std::time::Instant::now();
                     let (ok, usage_snapshot) = probe_channel_completion(
                         &probe_http,
@@ -392,23 +638,55 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                         &provider.api_type_overrides,
                     )
                     .await;
-                    spawn_active_probe_request_log(
-                        probe_user_store.clone(),
-                        probe_model_registry_store.clone(),
-                        probe_billing_rate_store.clone(),
-                        probe_settings_store.clone(),
-                        active_probe_user_id.clone(),
-                        provider.id.clone(),
-                        channel.provider_type,
-                        channel.models.get(model_name).map(|entry| entry.multiplier),
-                        channel.id.clone(),
-                        channel.name.clone(),
-                        model_name.to_string(),
-                        upstream_model,
-                        usage_snapshot,
-                        probe_started_at.elapsed().as_millis() as u64,
-                        ok,
-                    );
+                    if !ok {
+                        if let Err(error) = probe_user_store
+                            .cancel_terminal_request_log(&request_log_reservation)
+                            .await
+                        {
+                            tracing::error!(
+                                channel_id = %channel.id,
+                                channel_name = %channel.name,
+                                provider = %provider.name,
+                                probe_model = %model_name,
+                                "failed active probe request-log reservation cancellation failed: {error}"
+                            );
+                            continue;
+                        }
+                    }
+                    if ok
+                        && let Err(error) = persist_active_probe_request_log(
+                            &probe_user_store,
+                            &probe_user_id,
+                            provider.id.clone(),
+                            provider.name.clone(),
+                            channel.provider_type,
+                            channel.models.get(model_name).map(|entry| entry.multiplier),
+                            channel.id.clone(),
+                            channel.name.clone(),
+                            model_name.to_string(),
+                            upstream_model.clone(),
+                            pricing_snapshot.resolve(
+                                &upstream_model,
+                                model_name,
+                                channel.provider_type.as_str(),
+                            ),
+                            usage_snapshot,
+                            probe_started_at.elapsed().as_millis() as u64,
+                            probe_request_id,
+                            probe_created_at,
+                            request_log_reservation,
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            channel_id = %channel.id,
+                            channel_name = %channel.name,
+                            provider = %provider.name,
+                            probe_model = %model_name,
+                            "active probe request log could not be durably enqueued: {error}"
+                        );
+                        continue;
+                    }
                     tracing::debug!(
                         channel_id = %channel.id,
                         channel_name = %channel.name,
@@ -428,7 +706,8 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                     }
                     if ok {
                         if provider.per_model_circuit_break {
-                            let keys = channel_health_keys(&guard, &channel.id);
+                            let keys =
+                                channel_model_health_keys(&channel.id, channel.models.keys());
                             let mut reached_threshold = false;
                             for key in &keys {
                                 if let Some(state) = guard.get_mut(key) {
@@ -447,9 +726,13 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                                 }
                             }
                         } else {
-                            let state = guard
-                                .entry(health_key(&channel.id, None))
-                                .or_insert_with(ChannelHealthState::new);
+                            let key = health_key(&channel.id, None);
+                            if !crate::monoize_routing::prepare_channel_health_insert(
+                                &mut guard, &key,
+                            ) {
+                                continue;
+                            }
+                            let state = guard.entry(key).or_insert_with(ChannelHealthState::new);
                             state.last_probe_at = Some(now);
                             state.probe_success_count = state.probe_success_count.saturating_add(1);
                             if state.probe_success_count >= probe_success_threshold {
@@ -462,7 +745,8 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                             .unwrap_or(rt_snap.passive_cooldown_seconds)
                             .max(1);
                         if provider.per_model_circuit_break {
-                            for key in channel_health_keys(&guard, &channel.id) {
+                            for key in channel_model_health_keys(&channel.id, channel.models.keys())
+                            {
                                 if let Some(state) = guard.get_mut(&key) {
                                     state.healthy = false;
                                     state.probe_success_count = 0;
@@ -471,9 +755,13 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                                 }
                             }
                         } else {
-                            let state = guard
-                                .entry(health_key(&channel.id, None))
-                                .or_insert_with(ChannelHealthState::new);
+                            let key = health_key(&channel.id, None);
+                            if !crate::monoize_routing::prepare_channel_health_insert(
+                                &mut guard, &key,
+                            ) {
+                                continue;
+                            }
+                            let state = guard.entry(key).or_insert_with(ChannelHealthState::new);
                             state.healthy = false;
                             state.probe_success_count = 0;
                             state.last_probe_at = Some(now);
@@ -488,12 +776,9 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
     Ok(AppState {
         runtime: Arc::new(runtime),
         auth,
-        model_registry,
         http,
         metrics,
-        group_counters: Arc::new(Mutex::new(HashMap::new())),
         user_store,
-        name_caches,
         settings_store,
         monoize_store,
         monoize_runtime,
@@ -501,16 +786,19 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         channel_affinity,
         routing_config_revision,
         settings_update_lock,
-        model_registry_update_lock,
         model_registry_store,
         billing_rate_store,
         transform_registry,
         auth_rate_limiter: RateLimiter::new(10, std::time::Duration::from_secs(60)),
         log_broadcast,
         pending_request_logs,
+        request_log_admissions: Arc::new(DashMap::new()),
+        request_log_tasks,
+        background_shutdown,
         sse_connections: Arc::new(DashMap::new()),
         image_transform_cache,
         request_capture,
+        trusted_proxies,
     })
 }
 
@@ -543,20 +831,14 @@ fn init_metrics() -> AppResult<PrometheusHandle> {
     })
 }
 
-async fn ensure_active_probe_system_user(user_store: &UserStore) -> Option<String> {
-    let existing = match user_store
+async fn ensure_active_probe_system_user(user_store: &UserStore) -> AppResult<String> {
+    let existing = user_store
         .get_user_by_username(ACTIVE_PROBE_SYSTEM_USER)
         .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::warn!("failed to query active probe system user: {err}");
-            return None;
-        }
-    };
+        .map_err(active_probe_user_init_error)?;
     if let Some(user) = existing {
         if !user.balance_unlimited {
-            if let Err(err) = user_store
+            user_store
                 .update_user(
                     &user.id,
                     None,
@@ -569,13 +851,11 @@ async fn ensure_active_probe_system_user(user_store: &UserStore) -> Option<Strin
                     None,
                 )
                 .await
-            {
-                tracing::warn!("failed to set active probe system user unlimited balance: {err}");
-            }
+                .map_err(active_probe_user_init_error)?;
         }
-        return Some(user.id);
+        return Ok(user.id);
     }
-    match user_store
+    let user = user_store
         .create_user(
             ACTIVE_PROBE_SYSTEM_USER,
             &uuid::Uuid::new_v4().to_string(),
@@ -583,31 +863,30 @@ async fn ensure_active_probe_system_user(user_store: &UserStore) -> Option<Strin
             &[],
         )
         .await
-    {
-        Ok(user) => {
-            if let Err(err) = user_store
-                .update_user(
-                    &user.id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(true),
-                    None,
-                    None,
-                )
-                .await
-            {
-                tracing::warn!("failed to set active probe system user unlimited balance: {err}");
-            }
-            Some(user.id)
-        }
-        Err(err) => {
-            tracing::warn!("failed to create active probe system user: {err}");
-            None
-        }
-    }
+        .map_err(active_probe_user_init_error)?;
+    user_store
+        .update_user(
+            &user.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+        )
+        .await
+        .map_err(active_probe_user_init_error)?;
+    Ok(user.id)
+}
+
+fn active_probe_user_init_error(error: String) -> AppError {
+    AppError::new(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "active_probe_user_init_failed",
+        error,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -662,10 +941,10 @@ fn first_dimensionless_probe_rate(
     Ok(Some(price))
 }
 
-async fn resolve_active_probe_rates_for_model(
-    billing_rate_store: &BillingRateStore,
-    model_registry_store: &ModelRegistryStore,
+fn resolve_active_probe_rates_for_model(
     patterns: &[PricingProfilePattern],
+    metadata_profiles: &HashMap<String, String>,
+    candidate_rates: &[DbBillingRateRecord],
     pricing_model: &str,
     provider_type: &str,
 ) -> Result<Option<ActiveProbeRateResolution>, String> {
@@ -675,21 +954,27 @@ async fn resolve_active_probe_rates_for_model(
     {
         candidate_profiles.push(profile.to_string());
     }
-    if let Some(metadata_profile) = model_registry_store
-        .get_model_metadata(pricing_model)
-        .await?
-        .and_then(|record| record.models_dev_provider)
-        .map(|profile| profile.trim().to_string())
-        .filter(|profile| !profile.is_empty())
-        && !candidate_profiles.contains(&metadata_profile)
+    if let Some(metadata_profile) = metadata_profiles.get(pricing_model)
+        && !candidate_profiles.contains(metadata_profile)
     {
-        candidate_profiles.push(metadata_profile);
+        candidate_profiles.push(metadata_profile.clone());
     }
 
     for pricing_profile in candidate_profiles {
-        let rates = billing_rate_store
-            .list_matching_rates(&pricing_profile, Some(provider_type), pricing_model)
-            .await?;
+        let rates = candidate_rates
+            .iter()
+            .filter(|rate| {
+                rate.pricing_profile == pricing_profile
+                    && rate
+                        .provider_type
+                        .as_deref()
+                        .is_none_or(|value| value == provider_type)
+                    && rate.model_pattern.as_deref().is_none_or(|pattern| {
+                        crate::billing_rate_store::glob_matches(pattern, pricing_model)
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let input_rate_nano = first_dimensionless_probe_rate(&rates, "input_uncached")?;
         let output_rate_nano = first_dimensionless_probe_rate(&rates, "output")?;
         if let (Some(input_rate_nano), Some(output_rate_nano)) = (input_rate_nano, output_rate_nano)
@@ -705,46 +990,132 @@ async fn resolve_active_probe_rates_for_model(
     Ok(None)
 }
 
-async fn resolve_active_probe_rates(
+#[derive(Debug, Clone, Default)]
+struct ActiveProbePricingSnapshot {
+    reasoning_suffix_map: HashMap<String, String>,
+    resolutions: HashMap<(String, String), Result<Option<ActiveProbeRateResolution>, String>>,
+}
+
+impl ActiveProbePricingSnapshot {
+    fn resolve(
+        &self,
+        upstream_model: &str,
+        logical_model: &str,
+        provider_type: &str,
+    ) -> Result<Option<ActiveProbeRateResolution>, String> {
+        let normalized_upstream_model =
+            normalize_pricing_model_key(upstream_model, &self.reasoning_suffix_map);
+        let upstream = self
+            .resolutions
+            .get(&(normalized_upstream_model.clone(), provider_type.to_string()))
+            .cloned()
+            .unwrap_or(Ok(None))?;
+        if upstream.is_some() {
+            return Ok(upstream);
+        }
+        let normalized_logical_model =
+            normalize_pricing_model_key(logical_model, &self.reasoning_suffix_map);
+        if normalized_logical_model == normalized_upstream_model {
+            return Ok(None);
+        }
+        self.resolutions
+            .get(&(normalized_logical_model, provider_type.to_string()))
+            .cloned()
+            .unwrap_or(Ok(None))
+    }
+}
+
+async fn build_active_probe_pricing_snapshot(
     billing_rate_store: &BillingRateStore,
     model_registry_store: &ModelRegistryStore,
-    settings_store: &SettingsStore,
-    upstream_model: &str,
-    logical_model: &str,
-    provider_type: &str,
-) -> Result<Option<ActiveProbeRateResolution>, String> {
-    let reasoning_suffix_map = settings_store
-        .get_reasoning_suffix_map()
-        .await
-        .unwrap_or_default();
-    let patterns = settings_store.get_pricing_profile_model_patterns().await?;
-    let normalized_upstream_model =
-        normalize_pricing_model_key(upstream_model, &reasoning_suffix_map);
-    if let Some(resolution) = resolve_active_probe_rates_for_model(
-        billing_rate_store,
-        model_registry_store,
-        &patterns,
-        &normalized_upstream_model,
-        provider_type,
-    )
-    .await?
-    {
-        return Ok(Some(resolution));
+    providers: &[crate::monoize_routing::MonoizeProvider],
+    runtime: &MonoizeRuntimeConfig,
+) -> Result<ActiveProbePricingSnapshot, String> {
+    let reasoning_suffix_map = runtime.reasoning_suffix_map.clone();
+    let patterns = runtime.pricing_profile_model_patterns.clone();
+    let mut pairs = std::collections::HashSet::new();
+    for provider in providers {
+        for channel in &provider.channels {
+            if channel.provider_type == crate::monoize_routing::MonoizeProviderType::Replicate {
+                continue;
+            }
+            let configured_model = channel
+                .active_probe_model_override
+                .as_ref()
+                .or(provider.active_probe_model_override.as_ref())
+                .or(runtime.active_probe_model.as_ref())
+                .cloned();
+            let logical_model = configured_model.or_else(|| channel.models.keys().min().cloned());
+            let Some(logical_model) = logical_model else {
+                continue;
+            };
+            if !channel.models.contains_key(&logical_model) {
+                continue;
+            }
+            let upstream_model = channel
+                .models
+                .get(&logical_model)
+                .and_then(|entry| entry.redirect.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&logical_model);
+            let provider_type = channel.provider_type.as_str().to_string();
+            pairs.insert((
+                normalize_pricing_model_key(upstream_model, &reasoning_suffix_map),
+                provider_type.clone(),
+            ));
+            pairs.insert((
+                normalize_pricing_model_key(&logical_model, &reasoning_suffix_map),
+                provider_type,
+            ));
+        }
     }
-
-    let normalized_logical_model =
-        normalize_pricing_model_key(logical_model, &reasoning_suffix_map);
-    if normalized_logical_model == normalized_upstream_model {
-        return Ok(None);
+    let mut models = pairs
+        .iter()
+        .map(|(model, _)| model.clone())
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    let metadata_profiles = model_registry_store
+        .list_model_metadata_pricing_profiles(&models)
+        .await?;
+    let mut profiles = Vec::new();
+    for model in &models {
+        if let Some(profile) = crate::billing_rate_store::select_pricing_profile(&patterns, model) {
+            profiles.push(profile.to_string());
+        }
+        if let Some(profile) = metadata_profiles.get(model) {
+            profiles.push(profile.clone());
+        }
     }
-    resolve_active_probe_rates_for_model(
-        billing_rate_store,
-        model_registry_store,
-        &patterns,
-        &normalized_logical_model,
-        provider_type,
-    )
-    .await
+    profiles.sort();
+    profiles.dedup();
+    let mut provider_types = pairs
+        .iter()
+        .map(|(_, provider_type)| provider_type.clone())
+        .collect::<Vec<_>>();
+    provider_types.sort();
+    provider_types.dedup();
+    let candidate_rates = billing_rate_store
+        .list_candidate_rates_for_profiles_and_provider_types(&profiles, &provider_types)
+        .await?;
+    let resolutions = pairs
+        .into_iter()
+        .map(|(model, provider_type)| {
+            let resolution = resolve_active_probe_rates_for_model(
+                &patterns,
+                &metadata_profiles,
+                &candidate_rates,
+                &model,
+                &provider_type,
+            );
+            ((model, provider_type), resolution)
+        })
+        .collect();
+    Ok(ActiveProbePricingSnapshot {
+        reasoning_suffix_map,
+        resolutions,
+    })
 }
 
 fn calculate_active_probe_charge(
@@ -846,152 +1217,256 @@ fn build_probe_billing_breakdown(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_active_probe_request_log(
-    user_store: UserStore,
-    model_registry_store: ModelRegistryStore,
-    billing_rate_store: BillingRateStore,
-    settings_store: SettingsStore,
-    user_id: Option<String>,
+fn build_active_probe_interrupted_log(
+    request_id: &str,
+    user_id: &str,
+    provider_id: &str,
+    provider_name: &str,
+    provider_type: crate::monoize_routing::MonoizeProviderType,
+    provider_multiplier: Option<Multiplier>,
+    channel_id: &str,
+    channel_name: &str,
+    logical_model: &str,
+    upstream_model: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> InsertRequestLog {
+    InsertRequestLog {
+        request_id: Some(request_id.to_string()),
+        user_id: user_id.to_string(),
+        api_key_id: None,
+        model: logical_model.to_string(),
+        provider_id: Some(provider_id.to_string()),
+        upstream_model: Some(upstream_model.to_string()),
+        channel_id: Some(channel_id.to_string()),
+        names: crate::users::RequestLogNameSnapshots {
+            username: Some(ACTIVE_PROBE_SYSTEM_USER.to_string()),
+            api_key_name: None,
+            provider_name: Some(provider_name.to_string()),
+            channel_name: Some(channel_name.to_string()),
+        },
+        is_stream: false,
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
+        tool_prompt_tokens: None,
+        reasoning_tokens: None,
+        accepted_prediction_tokens: None,
+        rejected_prediction_tokens: None,
+        provider_multiplier: Some(provider_multiplier.unwrap_or(Multiplier::ONE)),
+        charge_nano_usd: None,
+        status: crate::users::REQUEST_LOG_STATUS_ERROR.to_string(),
+        usage_breakdown_json: None,
+        billing_breakdown_json: None,
+        error_code: Some("active_probe_interrupted".to_string()),
+        error_message: Some(
+            "active probe ended before terminal request-log persistence".to_string(),
+        ),
+        error_http_status: Some(axum::http::StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
+        duration_ms: None,
+        ttfb_ms: None,
+        first_visible_output_ms: None,
+        last_visible_output_ms: None,
+        visible_generation_ms: None,
+        visible_output_tokens: None,
+        tps_mode: None,
+        request_ip: None,
+        reasoning_effort: None,
+        tried_providers_json: None,
+        request_kind: Some(ACTIVE_PROBE_CONNECTIVITY_KIND.to_string()),
+        effective_provider_type: Some(provider_type.as_str().to_string()),
+        affinity_hit: None,
+        affinity_key_hash: None,
+        affinity_target: None,
+        created_at,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_active_probe_request_log(
+    user_store: &UserStore,
+    user_id: &str,
     provider_id: String,
+    provider_name: String,
     provider_type: crate::monoize_routing::MonoizeProviderType,
     provider_multiplier: Option<Multiplier>,
     channel_id: String,
-    _channel_name: String,
+    channel_name: String,
     logical_model: String,
     upstream_model: String,
+    pricing_resolution: Result<Option<ActiveProbeRateResolution>, String>,
     usage_snapshot: Option<Value>,
     duration_ms: u64,
-    status_ok: bool,
-) {
-    let Some(user_id) = user_id else {
-        return;
-    };
-    if !status_ok {
-        return;
-    }
+    request_id: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    reservation: crate::db_cache::RequestLogReservation,
+) -> Result<(), String> {
     let provider_multiplier = provider_multiplier.unwrap_or(Multiplier::ONE);
-    tokio::spawn(async move {
-        let parsed_prompt_tokens = usage_snapshot
-            .as_ref()
-            .and_then(|v| v.get("prompt_tokens"))
-            .and_then(|v| v.as_u64());
-        let parsed_completion_tokens = usage_snapshot
-            .as_ref()
-            .and_then(|v| v.get("completion_tokens"))
-            .and_then(|v| v.as_u64());
-        let usage_tokens = parsed_prompt_tokens.zip(parsed_completion_tokens);
-        let (charge_nano_usd, billing_breakdown_json) =
-            if let Some((prompt_tokens, completion_tokens)) = usage_tokens {
-                match resolve_active_probe_rates(
-                    &billing_rate_store,
-                    &model_registry_store,
-                    &settings_store,
-                    &upstream_model,
-                    &logical_model,
-                    provider_type.as_str(),
-                )
-                .await
-                {
-                    Ok(Some(pricing)) => match calculate_active_probe_charge(
-                        prompt_tokens,
-                        completion_tokens,
-                        &pricing,
-                        provider_multiplier,
-                    ) {
-                        Ok(charge) => (
-                            Some(charge.final_charge_nano),
-                            Some(build_probe_billing_breakdown(
-                                &provider_id,
-                                &logical_model,
-                                &upstream_model,
-                                provider_multiplier,
-                                prompt_tokens,
-                                completion_tokens,
-                                &pricing,
-                                charge,
-                            )),
-                        ),
-                        Err(err) => {
-                            tracing::warn!(
-                                logical_model,
-                                upstream_model,
-                                error = %err,
-                                "active probe charge calculation failed"
-                            );
-                            (None, None)
-                        }
-                    },
-                    Ok(None) => (None, None),
+    let parsed_prompt_tokens = usage_snapshot
+        .as_ref()
+        .and_then(|v| v.get("prompt_tokens"))
+        .and_then(|v| v.as_u64());
+    let parsed_completion_tokens = usage_snapshot
+        .as_ref()
+        .and_then(|v| v.get("completion_tokens"))
+        .and_then(|v| v.as_u64());
+    let usage_tokens = parsed_prompt_tokens.zip(parsed_completion_tokens);
+    let (charge_nano_usd, billing_breakdown_json) =
+        if let Some((prompt_tokens, completion_tokens)) = usage_tokens {
+            match pricing_resolution {
+                Ok(Some(pricing)) => match calculate_active_probe_charge(
+                    prompt_tokens,
+                    completion_tokens,
+                    &pricing,
+                    provider_multiplier,
+                ) {
+                    Ok(charge) => (
+                        Some(charge.final_charge_nano),
+                        Some(build_probe_billing_breakdown(
+                            &provider_id,
+                            &logical_model,
+                            &upstream_model,
+                            provider_multiplier,
+                            prompt_tokens,
+                            completion_tokens,
+                            &pricing,
+                            charge,
+                        )),
+                    ),
                     Err(err) => {
                         tracing::warn!(
                             logical_model,
                             upstream_model,
                             error = %err,
-                            "active probe pricing resolution failed"
+                            "active probe charge calculation failed"
                         );
                         (None, None)
                     }
+                },
+                Ok(None) => (None, None),
+                Err(err) => {
+                    tracing::warn!(
+                        logical_model,
+                        upstream_model,
+                        error = %err,
+                        "active probe pricing resolution failed"
+                    );
+                    (None, None)
                 }
-            } else {
-                (None, None)
-            };
-
-        let usage_breakdown_json = usage_tokens.map(|(prompt_tokens, completion_tokens)| {
-            build_probe_usage_breakdown(prompt_tokens, completion_tokens)
-        });
-
-        let log = InsertRequestLog {
-            request_id: None,
-            user_id,
-            api_key_id: None,
-            model: logical_model,
-            provider_id: Some(provider_id),
-            upstream_model: Some(upstream_model),
-            channel_id: Some(channel_id),
-            is_stream: false,
-            input_tokens: usage_tokens.map(|(prompt_tokens, _)| prompt_tokens),
-            output_tokens: usage_tokens.map(|(_, completion_tokens)| completion_tokens),
-            cache_read_tokens: usage_tokens.map(|_| 0),
-            cache_creation_tokens: None,
-            tool_prompt_tokens: None,
-            reasoning_tokens: None,
-            accepted_prediction_tokens: None,
-            rejected_prediction_tokens: None,
-            provider_multiplier: Some(provider_multiplier),
-            charge_nano_usd,
-            status: "success".to_string(),
-            usage_breakdown_json,
-            billing_breakdown_json,
-            error_code: None,
-            error_message: None,
-            error_http_status: None,
-            duration_ms: Some(duration_ms),
-            ttfb_ms: None,
-            first_visible_output_ms: None,
-            last_visible_output_ms: None,
-            visible_generation_ms: None,
-            visible_output_tokens: None,
-            tps_mode: None,
-            request_ip: None,
-            reasoning_effort: None,
-            tried_providers_json: None,
-            request_kind: Some(ACTIVE_PROBE_CONNECTIVITY_KIND.to_string()),
-            effective_provider_type: Some(provider_type.as_str().to_string()),
-            affinity_hit: None,
-            affinity_key_hash: None,
-            affinity_target: None,
-            created_at: chrono::Utc::now(),
+            }
+        } else {
+            (None, None)
         };
 
-        if let Err(err) = user_store.insert_request_log(log).await {
-            tracing::warn!("failed to insert active probe request log: {err}");
-        }
+    let usage_breakdown_json = usage_tokens.map(|(prompt_tokens, completion_tokens)| {
+        build_probe_usage_breakdown(prompt_tokens, completion_tokens)
     });
+
+    let log = InsertRequestLog {
+        request_id: Some(request_id),
+        user_id: user_id.to_string(),
+        api_key_id: None,
+        model: logical_model,
+        provider_id: Some(provider_id),
+        upstream_model: Some(upstream_model),
+        channel_id: Some(channel_id),
+        names: crate::users::RequestLogNameSnapshots {
+            username: Some(ACTIVE_PROBE_SYSTEM_USER.to_string()),
+            api_key_name: None,
+            provider_name: Some(provider_name),
+            channel_name: Some(channel_name),
+        },
+        is_stream: false,
+        input_tokens: usage_tokens.map(|(prompt_tokens, _)| prompt_tokens),
+        output_tokens: usage_tokens.map(|(_, completion_tokens)| completion_tokens),
+        cache_read_tokens: usage_tokens.map(|_| 0),
+        cache_creation_tokens: None,
+        tool_prompt_tokens: None,
+        reasoning_tokens: None,
+        accepted_prediction_tokens: None,
+        rejected_prediction_tokens: None,
+        provider_multiplier: Some(provider_multiplier),
+        charge_nano_usd,
+        status: "success".to_string(),
+        usage_breakdown_json,
+        billing_breakdown_json,
+        error_code: None,
+        error_message: None,
+        error_http_status: None,
+        duration_ms: Some(duration_ms),
+        ttfb_ms: None,
+        first_visible_output_ms: None,
+        last_visible_output_ms: None,
+        visible_generation_ms: None,
+        visible_output_tokens: None,
+        tps_mode: None,
+        request_ip: None,
+        reasoning_effort: None,
+        tried_providers_json: None,
+        request_kind: Some(ACTIVE_PROBE_CONNECTIVITY_KIND.to_string()),
+        effective_provider_type: Some(provider_type.as_str().to_string()),
+        affinity_hit: None,
+        affinity_key_hash: None,
+        affinity_target: None,
+        created_at,
+    };
+
+    user_store
+        .finalize_reserved_request_log(log, reservation)
+        .await
 }
 
 #[cfg(test)]
 mod active_probe_billing_tests {
     use super::*;
+
+    #[test]
+    fn active_probe_fallback_is_a_complete_terminal_error_snapshot() {
+        let created_at = chrono::Utc::now();
+        let log = build_active_probe_interrupted_log(
+            "d0925a9e-5384-4f1e-b9b1-d96464644700",
+            "user-probe",
+            "provider-1",
+            "OpenAI",
+            crate::monoize_routing::MonoizeProviderType::Responses,
+            Some(Multiplier::parse("1.25").expect("valid multiplier")),
+            "channel-1",
+            "primary",
+            "gpt-5",
+            "gpt-5-2026-08-07",
+            created_at,
+        );
+
+        assert_eq!(
+            log.request_id.as_deref(),
+            Some("d0925a9e-5384-4f1e-b9b1-d96464644700")
+        );
+        assert_eq!(log.status, crate::users::REQUEST_LOG_STATUS_ERROR);
+        assert_eq!(log.error_code.as_deref(), Some("active_probe_interrupted"));
+        assert_eq!(
+            log.request_kind.as_deref(),
+            Some(ACTIVE_PROBE_CONNECTIVITY_KIND)
+        );
+        assert_eq!(log.provider_id.as_deref(), Some("provider-1"));
+        assert_eq!(log.channel_id.as_deref(), Some("channel-1"));
+        assert_eq!(log.created_at, created_at);
+    }
+
+    #[test]
+    fn http_body_limit_accepts_only_positive_usize_values() {
+        assert_eq!(http_body_max_bytes_from_raw(Some(" 1234 ")), 1234);
+        for raw in [None, Some(""), Some("0"), Some("-1"), Some("invalid")] {
+            assert_eq!(
+                http_body_max_bytes_from_raw(raw),
+                DEFAULT_HTTP_BODY_MAX_BYTES
+            );
+        }
+        let overflow = format!("{}0", usize::MAX);
+        assert_eq!(
+            http_body_max_bytes_from_raw(Some(&overflow)),
+            DEFAULT_HTTP_BODY_MAX_BYTES
+        );
+    }
 
     fn rate(
         id: &str,
@@ -1032,6 +1507,44 @@ mod active_probe_billing_tests {
             first_dimensionless_probe_rate(&rates, "input_uncached").unwrap(),
             Some(1001)
         );
+    }
+
+    #[test]
+    fn probe_bulk_snapshot_preserves_profile_and_model_fallback_order() {
+        let patterns = vec![PricingProfilePattern {
+            pattern: "upstream-*".to_string(),
+            pricing_profile: "settings-profile".to_string(),
+        }];
+        let metadata =
+            HashMap::from([("logical-model".to_string(), "metadata-profile".to_string())]);
+        let mut input = rate("input", "input_uncached", "11", None);
+        input.pricing_profile = "metadata-profile".to_string();
+        input.model_pattern = Some("logical-*".to_string());
+        input.provider_type = Some("responses".to_string());
+        let mut output = input.clone();
+        output.id = "output".to_string();
+        output.usage_class = "output".to_string();
+        let candidate_rates = vec![input, output];
+        let upstream = resolve_active_probe_rates_for_model(
+            &patterns,
+            &metadata,
+            &candidate_rates,
+            "upstream-model",
+            "responses",
+        )
+        .unwrap();
+        assert!(upstream.is_none());
+        let logical = resolve_active_probe_rates_for_model(
+            &patterns,
+            &metadata,
+            &candidate_rates,
+            "logical-model",
+            "responses",
+        )
+        .unwrap()
+        .expect("metadata profile resolves");
+        assert_eq!(logical.pricing_profile, "metadata-profile");
+        assert_eq!(logical.input_rate_nano, 11);
     }
 
     #[test]
@@ -1076,20 +1589,42 @@ fn clear_channel_health_state(state: &mut ChannelHealthState, now: i64) {
     state.last_probe_at = None;
 }
 
-fn channel_health_keys(
-    health: &HashMap<String, ChannelHealthState>,
+fn channel_model_health_keys<'a>(
     channel_id: &str,
+    models: impl Iterator<Item = &'a String>,
 ) -> Vec<String> {
-    let prefix = format!("{channel_id}::");
-    health
-        .keys()
-        .filter(|key| key.as_str() == channel_id || key.starts_with(&prefix))
-        .cloned()
+    models
+        .map(|model| crate::handlers::routing::health_key(channel_id, Some(model)))
         .collect()
+}
+
+async fn canonical_request_id_middleware(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let canonical = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| axum::http::HeaderValue::from_str(value).ok())
+        .unwrap_or_else(|| {
+            axum::http::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
+                .expect("UUID request id is a valid header value")
+        });
+    request.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-request-id"),
+        canonical.clone(),
+    );
+    request.extensions_mut().insert(RequestId::new(canonical));
+    next.run(request).await
 }
 
 pub fn build_app(state: AppState) -> Router {
     let metrics_path = state.runtime.metrics_path.clone();
+    let trusted_proxies = state.trusted_proxies.clone();
+    let http_body_max_bytes = http_body_max_bytes();
     let root_api_router = build_root_api_router(&metrics_path);
     let dashboard_api_router = build_dashboard_api_router();
     let api_router = root_api_router.clone().merge(dashboard_api_router);
@@ -1098,17 +1633,23 @@ pub fn build_app(state: AppState) -> Router {
         .nest("/api", api_router)
         .fallback(crate::frontend::frontend_fallback)
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            trusted_proxies,
+            crate::client_ip::canonical_client_ip_middleware,
+        ))
         .layer(DefaultBodyLimit::disable())
+        .layer(PropagateRequestIdLayer::new(
+            axum::http::header::HeaderName::from_static("x-request-id"),
+        ))
+        .layer(axum::middleware::from_fn(
+            canonical_request_id_middleware,
+        ))
         .layer(SetRequestIdLayer::new(
             axum::http::header::HeaderName::from_static("x-request-id"),
             MakeRequestUuid,
         ))
-        .layer(PropagateRequestIdLayer::new(
-            axum::http::header::HeaderName::from_static("x-request-id"),
-        ))
         .layer(TraceLayer::new_for_http())
-        // 50 MiB body size limit
-        .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024))
+        .layer(RequestBodyLimitLayer::new(http_body_max_bytes))
         // Security headers
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::header::HeaderName::from_static("x-content-type-options"),

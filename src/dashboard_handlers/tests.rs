@@ -3,7 +3,8 @@ use super::api_keys::{
     canonicalize_dashboard_api_key_allowed_groups,
 };
 use super::providers::{
-    build_models_list_url, provider_dashboard_rate_matrix_is_complete, provider_pricing_model,
+    build_dashboard_rate_matrix_cache, build_models_list_url,
+    provider_dashboard_rate_matrix_is_complete, provider_pricing_model,
 };
 use super::users::{
     CreateUserRequest, UpdateUserRequest, canonicalize_dashboard_user_allowed_groups,
@@ -16,7 +17,7 @@ use crate::monoize_routing::{
     AffinityFailbackMode, CreateMonoizeProviderInput, MonoizeChannel, MonoizeModelEntry,
     MonoizeProvider, MonoizeProviderType, MonoizeRoutingStore, UpdateMonoizeProviderInput,
 };
-use crate::settings::SettingsStore;
+use crate::settings::{PricingProfilePattern, SettingsStore};
 use crate::transforms::{Phase, TransformRuleConfig};
 use crate::users::{
     CreateApiKeyInput, ModelRedirectRule, RequestLogAffinity, RequestLogApiKey, RequestLogBilling,
@@ -26,7 +27,7 @@ use crate::users::{
 use sea_orm::ConnectionTrait;
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[test]
 fn build_models_list_url_adds_v1_when_missing() {
@@ -118,6 +119,49 @@ fn provider_dashboard_rate_matrix_requires_complete_tiered_billing_rates() {
 }
 
 #[test]
+fn provider_dashboard_rate_matrix_cache_filters_bulk_candidates_in_memory() {
+    let pairs = HashSet::from([
+        ("gpt-test".to_string(), "responses".to_string()),
+        ("gpt-test".to_string(), "messages".to_string()),
+        ("metadata-model".to_string(), "messages".to_string()),
+    ]);
+    let patterns = vec![PricingProfilePattern {
+        pattern: "gpt-*".to_string(),
+        pricing_profile: "openai".to_string(),
+    }];
+    let metadata = HashMap::from([("metadata-model".to_string(), "anthropic".to_string())]);
+    let mut rates = vec![
+        dashboard_rate("openai-input", "input_uncached", None),
+        dashboard_rate("openai-output", "output", None),
+    ];
+    for rate in &mut rates {
+        rate.provider_type = Some("responses".to_string());
+    }
+    let mut metadata_input = dashboard_rate("metadata-input", "input_uncached", None);
+    metadata_input.pricing_profile = "anthropic".to_string();
+    metadata_input.model_pattern = Some("metadata-*".to_string());
+    metadata_input.provider_type = Some("messages".to_string());
+    let mut metadata_output = metadata_input.clone();
+    metadata_output.id = "metadata-output".to_string();
+    metadata_output.usage_class = "output".to_string();
+    rates.extend([metadata_input, metadata_output]);
+
+    let cache = build_dashboard_rate_matrix_cache(&pairs, &patterns, &metadata, &rates);
+    assert_eq!(
+        cache.get(&("gpt-test".to_string(), "responses".to_string())),
+        Some(&true)
+    );
+    assert_eq!(
+        cache.get(&("gpt-test".to_string(), "messages".to_string())),
+        Some(&false)
+    );
+    assert_eq!(
+        cache.get(&("metadata-model".to_string(), "messages".to_string())),
+        Some(&true)
+    );
+}
+
+#[test]
 fn dashboard_create_provider_groups_default_to_public() {
     let body: CreateMonoizeProviderInput = serde_json::from_value(json!({
         "name": "OpenAI",
@@ -127,14 +171,14 @@ fn dashboard_create_provider_groups_default_to_public() {
                 "provider_type": "responses",
                 "base_url": "https://example.com/public",
                 "api_key": "secret",
-                "models": { "gpt-5": { "redirect": null, "multiplier": 1.0 } }
+                "models": { "gpt-5": { "redirect": null, "multiplier": "1" } }
             },
             {
                 "name": "restricted",
                 "provider_type": "responses",
                 "base_url": "https://example.com/restricted",
                 "api_key": "secret",
-                "models": { "gpt-5": { "redirect": null, "multiplier": 1.0 } }
+                "models": { "gpt-5": { "redirect": null, "multiplier": "1" } }
             }
         ]
     }))
@@ -147,13 +191,13 @@ fn dashboard_create_provider_groups_default_to_public() {
 fn dashboard_create_provider_rejects_obsolete_provider_models_field() {
     let result = serde_json::from_value::<CreateMonoizeProviderInput>(json!({
         "name": "OpenAI",
-        "models": { "gpt-5": { "redirect": null, "multiplier": 1.0 } },
+        "models": { "gpt-5": { "redirect": null, "multiplier": "1" } },
         "channels": [{
             "name": "primary",
             "provider_type": "responses",
             "base_url": "https://example.com",
             "api_key": "secret",
-            "models": { "gpt-5": { "redirect": null, "multiplier": 1.0 } }
+            "models": { "gpt-5": { "redirect": null, "multiplier": "1" } }
         }]
     }));
 
@@ -277,7 +321,7 @@ async fn dashboard_provider_groups_round_trip_through_store_and_update_preserves
                 "affinity_idle_ttl_seconds_override": 90,
                 "affinity_failback_mode_override": "prefer_higher_priority",
                 "affinity_failback_delay_seconds_override": 15,
-                "models": { "gpt-5": { "redirect": null, "multiplier": 1.0 } }
+                "models": { "gpt-5": { "redirect": null, "multiplier": "1" } }
             }
         ]
     }))
@@ -320,7 +364,7 @@ async fn dashboard_provider_groups_round_trip_through_store_and_update_preserves
                 "affinity_idle_ttl_seconds_override": 120,
                 "affinity_failback_mode_override": "sticky",
                 "affinity_failback_delay_seconds_override": 0,
-                "models": { "gpt-5": { "redirect": null, "multiplier": 1.0 } }
+                "models": { "gpt-5": { "redirect": null, "multiplier": "1" } }
             }
         ]
     }))
@@ -1337,4 +1381,45 @@ async fn settings_store_round_trips_global_transforms_and_model_redirects() {
         AffinityFailbackMode::PreferHigherPriority
     );
     assert_eq!(updated.monoize_affinity_failback_delay_seconds, 0);
+
+    store
+        .set("session_ttl_days", "21")
+        .await
+        .expect("session TTL updates");
+    store
+        .set("api_key_max_per_user", "37")
+        .await
+        .expect("API-key limit updates");
+    store
+        .set("registration_enabled", "false")
+        .await
+        .expect("registration flag updates");
+    store
+        .set("site_name", "Public Monoize")
+        .await
+        .expect("site name updates");
+    store
+        .set("site_description", "Public description")
+        .await
+        .expect("site description updates");
+    store
+        .set("api_base_url", "https://api.example.test")
+        .await
+        .expect("API URL updates");
+
+    assert_eq!(store.get_session_ttl_days().await.unwrap(), 21);
+    assert_eq!(store.get_api_key_max_per_user().await.unwrap(), 37);
+    let public = store.get_public_settings().await.unwrap();
+    assert!(!public.registration_enabled);
+    assert_eq!(public.site_name, "Public Monoize");
+    assert_eq!(public.site_description, "Public description");
+    assert_eq!(public.api_base_url, "https://api.example.test");
+
+    store
+        .set("registration_enabled", "not-a-boolean")
+        .await
+        .expect("malformed registration flag persists for decode test");
+    assert!(store.is_registration_enabled().await.is_err());
+    assert!(store.get_public_settings().await.is_err());
+    assert!(store.get_all().await.is_err());
 }

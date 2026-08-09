@@ -1427,11 +1427,10 @@ async fn emit_reasoning_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request_capture::with_sse_capture;
+    use crate::request_capture::{SseFrameCapture, with_sse_capture};
     use crate::urp::decode::openai_chat::decode_response;
     use serde_json::json;
-    use std::sync::Arc;
-    use tokio::sync::{Mutex, mpsc};
+    use tokio::sync::mpsc;
 
     fn captured_chat_json_frames(frames: &[String]) -> Vec<Value> {
         frames
@@ -1498,7 +1497,7 @@ mod tests {
     #[tokio::test]
     async fn chat_stream_provider_item_filters_nested_internal_metadata() {
         let (sse_tx, mut sse_rx) = mpsc::channel(4);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
         let native_body = json!({
             "type": "vendor_part",
             "payload": {
@@ -1527,7 +1526,7 @@ mod tests {
         drop(sse_tx);
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         let json_frames = captured_chat_json_frames(&frames);
         assert_eq!(
             json_frames[0]["choices"][0]["delta"]["content"][0],
@@ -1602,7 +1601,7 @@ mod tests {
     async fn chat_stream_emits_choice_level_logprobs_on_token_frame() {
         let (event_tx, event_rx) = mpsc::channel(8);
         let (sse_tx, mut sse_rx) = mpsc::channel(8);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
 
         event_tx
             .send(UrpStreamEvent::ResponseStart {
@@ -1645,7 +1644,7 @@ mod tests {
         .await;
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         let json_frames = captured_chat_json_frames(&frames);
         let logprobs_frame = json_frames
             .iter()
@@ -1705,7 +1704,7 @@ mod tests {
     #[tokio::test]
     async fn synthetic_chat_stream_emits_finish_then_empty_choices_usage_then_done() {
         let (sse_tx, mut sse_rx) = mpsc::channel(8);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
         let response = urp::UrpResponse {
             id: "resp_usage".to_string(),
             model: "gpt-5.4".to_string(),
@@ -1730,7 +1729,7 @@ mod tests {
         .await;
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         assert_eq!(frames.len(), 3);
         let finish: Value = serde_json::from_str(
             frames[0]
@@ -1763,7 +1762,7 @@ mod tests {
     async fn chat_stream_terminal_usage_preserves_nested_unknown_details_and_typed_counters_win() {
         let (event_tx, event_rx) = mpsc::channel(4);
         let (sse_tx, mut sse_rx) = mpsc::channel(8);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
 
         event_tx
             .send(UrpStreamEvent::ResponseStart {
@@ -1820,7 +1819,7 @@ mod tests {
         .await;
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         let json_frames = captured_chat_json_frames(&frames);
         let usage = json_frames
             .iter()
@@ -1909,7 +1908,7 @@ mod tests {
     async fn response_done_fallback_deduplicates_parallel_tools_by_node_index() {
         let (event_tx, event_rx) = mpsc::channel(16);
         let (sse_tx, mut sse_rx) = mpsc::channel(32);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
 
         event_tx
             .send(UrpStreamEvent::ResponseStart {
@@ -1979,7 +1978,7 @@ mod tests {
         .await;
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         let wire = frames.join("");
         assert_eq!(wire.matches("call_a").count(), 1, "{wire}");
         assert_eq!(wire.matches("call_b").count(), 1, "{wire}");
@@ -1998,7 +1997,7 @@ mod tests {
     async fn legacy_function_call_stream_replays_deprecated_shape_and_finish_reason() {
         let (event_tx, event_rx) = mpsc::channel(16);
         let (sse_tx, mut sse_rx) = mpsc::channel(32);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
         let legacy_extra = HashMap::from([(
             urp::CHAT_LEGACY_FUNCTION_CALL_EXTRA_KEY.to_string(),
             Value::Bool(true),
@@ -2074,7 +2073,7 @@ mod tests {
         .await;
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         let json_frames = captured_chat_json_frames(&frames);
         assert!(
             json_frames
@@ -2114,7 +2113,7 @@ mod tests {
     async fn response_done_fallback_emits_later_terminal_only_reasoning_nodes() {
         let (event_tx, event_rx) = mpsc::channel(16);
         let (sse_tx, mut sse_rx) = mpsc::channel(32);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
         let server_detail = json!({
             "type": "reasoning.server_tool_call",
             "tool_name": "openrouter:fusion",
@@ -2192,7 +2191,7 @@ mod tests {
         .await;
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         let json_frames = captured_chat_json_frames(&frames);
         let wire = frames.join("");
         assert_eq!(wire.matches("first reasoning").count(), 1, "{wire}");

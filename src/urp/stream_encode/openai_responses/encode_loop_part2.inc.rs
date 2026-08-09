@@ -1,10 +1,8 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request_capture::with_sse_capture;
+    use crate::request_capture::{SseFrameCapture, with_sse_capture};
     use crate::urp::{FinishReason, Node, NodeDelta, NodeHeader, OrdinaryRole, UrpResponse};
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     fn empty_map() -> HashMap<String, Value> {
         HashMap::new()
@@ -94,7 +92,7 @@ mod tests {
     async fn responses_provider_control_filters_nested_internal_metadata_without_mutation() {
         let (event_tx, event_rx) = mpsc::channel(2);
         let (sse_tx, mut sse_rx) = mpsc::channel(8);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
         let canonical = json!({
             "type": "response.vendor_control",
             "vendor": {
@@ -133,7 +131,7 @@ mod tests {
         .await;
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         let json_frames = captured_responses_json_frames(&frames);
         let replay = json_frames
             .iter()
@@ -210,7 +208,7 @@ mod tests {
     {
         let (event_tx, event_rx) = mpsc::channel(4);
         let (sse_tx, mut sse_rx) = mpsc::channel(8);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
 
         event_tx
             .send(UrpStreamEvent::ResponseStart {
@@ -282,7 +280,7 @@ mod tests {
         .await;
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         let json_frames = captured_responses_json_frames(&frames);
         let usage = json_frames
             .iter()
@@ -595,7 +593,7 @@ mod tests {
     async fn custom_tool_call_input_delta_and_done_encode() {
         let (event_tx, event_rx) = mpsc::channel(16);
         let (sse_tx, mut sse_rx) = mpsc::channel(64);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
         let node = Node::ToolCall {
             id: Some("ctc_1".to_string()),
             tool_type: urp::ToolCallType::Custom,
@@ -671,7 +669,7 @@ mod tests {
         .await;
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         let json_frames = captured_responses_json_frames(&frames);
         let added = json_frames
             .iter()
@@ -790,7 +788,7 @@ mod tests {
 
         let (event_tx, event_rx) = mpsc::channel(32);
         let (sse_tx, mut sse_rx) = mpsc::channel(256);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
         event_tx
             .send(UrpStreamEvent::ResponseStart {
                 id: "resp_file_origin".to_string(),
@@ -857,7 +855,7 @@ mod tests {
         .await;
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         let raw = frames.join("");
         for secret in [
             "anthropic_img_secret",
@@ -894,7 +892,7 @@ mod tests {
     {
         let (event_tx, event_rx) = mpsc::channel(16);
         let (sse_tx, mut sse_rx) = mpsc::channel(64);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
 
         event_tx
             .send(UrpStreamEvent::ResponseStart {
@@ -945,7 +943,7 @@ mod tests {
         .await;
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         let json_frames = captured_responses_json_frames(&frames);
         let completed = json_frames
             .iter()
@@ -1024,7 +1022,7 @@ mod tests {
     {
         let (event_tx, event_rx) = mpsc::channel(16);
         let (sse_tx, mut sse_rx) = mpsc::channel(64);
-        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = SseFrameCapture::new();
 
         event_tx
             .send(UrpStreamEvent::ResponseStart {
@@ -1094,7 +1092,7 @@ mod tests {
         .await;
         while sse_rx.recv().await.is_some() {}
 
-        let frames = frames.lock().await;
+        let frames = frames.captured_frames().await;
         let json_frames = captured_responses_json_frames(&frames);
         let completed = json_frames
             .iter()

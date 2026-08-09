@@ -82,7 +82,7 @@ WS5. Monoize MUST accept `response.create`. Its fields have the same semantics a
 
 WS6. A `response.create` event with `generate=false` is a v2 warmup request. Monoize MUST NOT call an upstream, create a request log, or charge the tenant. Monoize MUST send a `response.created` event followed by a `response.completed` event. Both events MUST identify one synthetic response whose id begins with `resp_`, whose output is empty, and whose model equals the request model. Monoize MUST retain the normalized warmup request as the connection's most recent request state.
 
-WS7. After a successful `response.completed` event, Monoize MUST retain, for that connection only:
+WS7. After a successful `response.completed` event, Monoize MUST retain, for that connection only and only within WS14 history limits:
 
 - the full normalized request input used for that generation;
 - the terminal response id;
@@ -106,7 +106,15 @@ WS11. Before sending a generated request through the existing handler, Monoize M
 
 WS12. A valid client Ping MUST receive the WebSocket protocol Pong behavior supplied by the WebSocket implementation. A Close message MUST close the connection. A binary data message or a JSON value that is not an object MUST produce a WebSocket error event with status `400` and code `invalid_websocket_event`.
 
-WS13. The WebSocket message limit MUST be 50 MiB, equal to the forwarding HTTP body limit in C5.
+WS13. The WebSocket message and frame limit MUST default to 50 MiB, equal to the forwarding HTTP body limit in C5, and MUST be configurable with `MONOIZE_RESPONSES_WS_MESSAGE_MAX_BYTES`.
+
+WS14. Per-connection limits MUST default to 128 accepted turns, 104857600 cumulative inbound text bytes, 4096 retained continuation items, and 33554432 retained continuation JSON bytes. The corresponding environment variables are `MONOIZE_RESPONSES_WS_MAX_TURNS`, `MONOIZE_RESPONSES_WS_CONNECTION_MAX_BYTES`, `MONOIZE_RESPONSES_WS_HISTORY_MAX_ITEMS`, and `MONOIZE_RESPONSES_WS_HISTORY_MAX_BYTES`.
+
+WS15. A connection that exceeds its turn or cumulative inbound-byte limit MUST receive an error event with code `websocket_connection_limit_exceeded` and then close. A continuation request whose assembled input exceeds a history limit MUST receive an error with code `websocket_history_limit_exceeded`, MUST NOT call upstream, and MUST keep the prior bounded continuation state unchanged.
+
+WS16. The downstream HTTP-SSE parser used by the WebSocket bridge MUST bound both one pending frame and the undecoded buffer. The default for each is 52428800 bytes, configurable with `MONOIZE_RESPONSES_WS_SSE_FRAME_MAX_BYTES` and `MONOIZE_RESPONSES_WS_SSE_BUFFER_MAX_BYTES`. Exceeding either bound MUST terminate that generated turn with an error and MUST NOT retain partial continuation state.
+
+WS17. If a successful terminal response output exceeds the configured retained item or byte limit, Monoize MUST forward the response normally but MUST clear connection-local continuation state. A later append/continuation MUST receive `previous_response_not_found`.
 
 ### 2.3 Dashboard API
 
@@ -152,7 +160,20 @@ C3. Monoize MUST resolve listen address from `MONOIZE_LISTEN`, default `0.0.0.0:
 
 C4. Monoize MUST resolve metrics endpoint path from `MONOIZE_METRICS_PATH`, default `/metrics`.
 
-C5. Monoize MUST accept downstream request bodies up to 50 MiB on forwarding endpoints (`/v1/responses`, `/v1/responses/compact`, `/v1/chat/completions`, `/v1/messages`, `/v1/embeddings`). Any framework-default extractor limit smaller than 50 MiB MUST be disabled so that the effective limit remains 50 MiB.
+C5. Monoize MUST accept downstream request bodies up to the configured HTTP body limit on forwarding endpoints (`/v1/responses`, `/v1/responses/compact`, `/v1/chat/completions`, `/v1/messages`, `/v1/embeddings`). `MONOIZE_HTTP_BODY_MAX_BYTES` MUST select this limit when its trimmed value is a positive base-10 integer that fits `usize`; an unset, empty, zero, negative, malformed, or overflowing value MUST select the default `52428800` bytes. Any framework-default extractor limit smaller than the selected value MUST be disabled so that the selected value is the effective limit.
+
+C6. Monoize runs as one application process with concurrent worker tasks. The application process is the only supported writer for Monoize business tables. Direct SQL writes and concurrent Monoize writer processes are outside the cache-coherence contract.
+
+C7. `MONOIZE_TRUSTED_PROXY_CIDRS` MUST be an optional comma-separated list of IPv4 or IPv6 CIDR networks. The default is the empty list. An invalid non-empty entry MUST make startup fail.
+
+C8. Monoize MUST derive one canonical client IP for each request:
+
+1. If the socket peer IP is not contained in `MONOIZE_TRUSTED_PROXY_CIDRS`, the canonical client IP is the socket peer IP and Monoize MUST ignore `Forwarded`, `X-Forwarded-For`, and `X-Real-IP`.
+2. If the socket peer IP is trusted, Monoize MUST parse the forwarding chain as IP addresses, append the socket peer, remove trusted proxy addresses from the right, and select the nearest remaining untrusted address.
+3. If no valid forwarded address remains, the canonical client IP is the socket peer IP.
+4. A client-supplied internal canonical-IP header MUST be removed before the server publishes its canonical value.
+
+C9. Authentication rate limiting, API-key IP allowlists, and request-log `request_ip` MUST use the canonical client IP from C8. They MUST NOT independently parse forwarding headers.
 
 ## 5. Forwarding pipeline (normative)
 
@@ -193,6 +214,8 @@ FP4e. If a downstream request has `stream=true` and an upstream attempt returns 
 - `/v1/messages`: one `event: error` frame whose JSON payload has `type = "error"` and an `error` object, with `error.type` equal to the upstream error code when present. Monoize MUST NOT append a `[DONE]` frame on `/v1/messages`.
 
 FP4f. The synthetic stream error in FP4e MUST finalize the request log with `status = "error"`, `error_code` equal to the upstream error code when present, `error_http_status` equal to the upstream HTTP status when present, no token usage, and no billing charge.
+
+FP4g. After request-log admission succeeds, every local request-transform, upstream-encode, upstream-decode, response-transform, stream-task, and billing error MUST schedule exactly one terminal request-log row before the forwarding handler returns or its response-stream task exits. A `?` propagation or task-join error MUST NOT bypass terminal scheduling.
 
 FP5. **Decode upstream response:**
 
@@ -255,6 +278,22 @@ FP6f. The decode task and encode task in FP6e MUST be joined before request-fina
 FP6g. The streaming pipeline MUST use `ResponseDone.output` as the authoritative final streamed response state. Monoize MUST NOT require or depend on any helper named `merged_output_items()` in the streaming path.
 
 FP6h. Decoder responsibilities are split-and-forward only. Decoder output MUST be flat nodes or canonical node lifecycle events. Downstream envelope reconstruction belongs only to the encoder.
+
+FP6i. A pass-through stream whose decoder, retained-output stage, response-transform stage, downstream encoder, or stage task fails MUST finalize with `status = "error"` using that failure's code and status. It MUST NOT execute billing settlement and MUST NOT finalize as success. A downstream receiver closure is not a stage failure because SSE send helpers continue draining the upstream stream for terminal usage.
+
+FP6j. Buffered synthetic streaming MUST not finalize success or execute billing settlement until synthetic downstream encoding returns success. If synthetic encoding fails, Monoize MUST skip billing and finalize the admitted request as error. If encoding succeeds and billing settlement then fails, Monoize MUST finalize the request as `billing_settlement_failed`.
+
+FP6k. A forwarding request becomes admitted when `insert_pending_request_log` returns `Ok(Some(PendingRequestLogGuard))`. From that point until the handler returns, exactly one terminal request log MUST be scheduled for that admitted request. `Ok(None)` does not create a request-log lifecycle.
+
+FP6k.1. A handler MUST schedule the terminal success log only after every required request transform, upstream-request encoding step, upstream-response collection and decode step, response transform, downstream typed conversion, usage validation, and billing operation has succeeded.
+
+FP6k.2. If any step in FP6k.1 fails after admission, including an asynchronous task join failure, the handler MUST schedule one terminal error log before it returns the error. The terminal log `error_code`, `error_http_status`, and error message MUST describe the same `AppError` returned by the handler. The terminal error log MUST contain no token usage and no billing charge.
+
+FP6k.3. If an error occurs after an upstream attempt has been selected, the terminal error log MUST identify that attempt. If no upstream attempt was selected, the terminal error log MUST omit provider and channel identity.
+
+FP6k.4. A retryable upstream-attempt failure MUST NOT schedule a terminal log while another retry is permitted. The handler MUST schedule one terminal error log only when retry processing terminates. A successful retry MUST schedule one terminal success log and no terminal error log.
+
+FP6k.5. Each admitted image fan-out subrequest is an independent request-log lifecycle. A task panic, task cancellation, streamed-response collection failure, typed image-conversion failure, missing usage error, or billing error in one subrequest MUST schedule exactly one terminal error log for that subrequest request identifier.
 
 ## 6. Routing rules
 
@@ -1490,6 +1529,8 @@ DMO3. The response body MUST be JSON with the shape:
 DMO3a. System setting `codex_model_ids` MUST be an ordered array of logical model IDs. A missing or invalid stored value MUST resolve to `[]`. Before persistence, Monoize MUST trim every value, remove empty values, and remove duplicate values while preserving the first occurrence.
 
 DMO3b. `models` MUST contain one Codex model descriptor for every `codex_model_ids` value that is also present in the response's post-authentication `data` array. Descriptor order MUST equal setting order. A configured ID that is absent from `data` MUST be omitted. An empty setting MUST produce `"models": []`.
+
+DMO3c. Startup and every successful settings mutation MUST publish `codex_model_ids` into the process runtime snapshot. `GET /v1/models` MUST read that snapshot and MUST NOT load the complete settings table.
 
 DMO3c. Each Codex model descriptor MUST use the following values:
 

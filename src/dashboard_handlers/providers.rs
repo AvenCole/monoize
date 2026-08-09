@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::billing_rate_store::DbBillingRateRecord;
+use crate::billing_rate_store::{DbBillingRateRecord, glob_matches, select_pricing_profile};
 use crate::dashboard_handlers::session_helpers::require_admin;
 use crate::error::{AppError, AppResult};
 use crate::handlers::routing::health_key;
@@ -16,6 +16,79 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+
+fn discovery_body_error(error: crate::bounded_response::BoundedResponseError) -> AppError {
+    let code = if error.is_limit_exceeded() {
+        "upstream_discovery_response_too_large"
+    } else {
+        "upstream_fetch_failed"
+    };
+    AppError::new(StatusCode::BAD_GATEWAY, code, error.to_string())
+}
+
+async fn parse_discovery_json_response(response: reqwest::Response) -> AppResult<Value> {
+    let status = response.status();
+    let body = crate::bounded_response::read_upstream_discovery_body(response)
+        .await
+        .map_err(discovery_body_error)?;
+    if !status.is_success() {
+        return Err(AppError::new(
+            StatusCode::BAD_GATEWAY,
+            "upstream_fetch_failed",
+            format!(
+                "upstream returned {status}: {}",
+                String::from_utf8_lossy(&body)
+            ),
+        ));
+    }
+
+    serde_json::from_slice(&body).map_err(|error| {
+        AppError::new(
+            StatusCode::BAD_GATEWAY,
+            "upstream_fetch_failed",
+            format!("failed to parse response: {error}"),
+        )
+    })
+}
+
+fn reset_channel_health_after_successful_test<'a>(
+    health: &mut HashMap<String, ChannelHealthState>,
+    channel_id: &str,
+    per_model_circuit_break: bool,
+    model_ids: impl IntoIterator<Item = &'a str>,
+    now: i64,
+    max_entries: usize,
+) {
+    fn reset(entry: &mut ChannelHealthState, now: i64) {
+        entry.healthy = true;
+        entry.cooldown_until = None;
+        entry.last_success_at = Some(now);
+        entry.probe_success_count = 0;
+        entry.last_probe_at = None;
+    }
+
+    let base_key = health_key(channel_id, None);
+    let mut found_candidate = false;
+    if let Some(entry) = health.get_mut(&base_key) {
+        reset(entry, now);
+        found_candidate = true;
+    }
+    if per_model_circuit_break {
+        for model_id in model_ids {
+            if let Some(entry) = health.get_mut(&health_key(channel_id, Some(model_id))) {
+                reset(entry, now);
+                found_candidate = true;
+            }
+        }
+    }
+
+    if !found_candidate && health.len() < max_entries {
+        let entry = health
+            .entry(base_key)
+            .or_insert_with(ChannelHealthState::new);
+        reset(entry, now);
+    }
+}
 
 fn apply_channel_runtime(channel: &mut MonoizeChannel, health: &ChannelHealthState) {
     let now = chrono::Utc::now().timestamp();
@@ -75,10 +148,11 @@ async fn prune_provider_channel_health(state: &AppState, channel_ids: &[String])
     let ids: std::collections::HashSet<&str> = channel_ids.iter().map(String::as_str).collect();
     let mut health = state.channel_health.lock().await;
     health.retain(|channel_key, _| {
-        !ids.iter().any(|channel_id| {
-            channel_key.as_str() == *channel_id
-                || channel_key.starts_with(&format!("{channel_id}::"))
-        })
+        let channel_id = channel_key
+            .split_once("::")
+            .map(|(channel_id, _)| channel_id)
+            .unwrap_or(channel_key.as_str());
+        !ids.contains(channel_id)
     });
 }
 
@@ -156,69 +230,66 @@ pub(super) fn provider_dashboard_rate_matrix_is_complete(rates: &[DbBillingRateR
     })
 }
 
-async fn dashboard_billing_matrix_available_for_model(
-    state: &AppState,
+fn dashboard_candidate_profiles(
     pricing_patterns: &[crate::settings::PricingProfilePattern],
-    cache: &mut HashMap<(String, String), bool>,
+    metadata_profiles: &HashMap<String, String>,
     model: &str,
-    provider_type: &str,
-) -> Result<bool, String> {
-    let key = (model.to_string(), provider_type.to_string());
-    if let Some(cached) = cache.get(&key) {
-        return Ok(*cached);
-    }
+) -> Vec<String> {
     let mut candidate_profiles = Vec::new();
-    if let Some(pricing_profile) =
-        crate::billing_rate_store::select_pricing_profile(pricing_patterns, model)
-    {
+    if let Some(pricing_profile) = select_pricing_profile(pricing_patterns, model) {
         candidate_profiles.push(pricing_profile.to_string());
     }
-    if let Some(metadata_profile) =
-        dashboard_metadata_pricing_profile_for_model(state, model).await?
+    if let Some(metadata_profile) = metadata_profiles.get(model)
         && !candidate_profiles
             .iter()
-            .any(|candidate| candidate == &metadata_profile)
+            .any(|candidate| candidate == metadata_profile)
     {
-        candidate_profiles.push(metadata_profile);
+        candidate_profiles.push(metadata_profile.clone());
     }
-
-    for pricing_profile in candidate_profiles {
-        let rates = state
-            .billing_rate_store
-            .list_matching_rates(&pricing_profile, Some(provider_type), model)
-            .await?;
-        if provider_dashboard_rate_matrix_is_complete(&rates) {
-            cache.insert(key, true);
-            return Ok(true);
-        }
-    }
-    cache.insert(key, false);
-    Ok(false)
+    candidate_profiles
 }
 
-async fn dashboard_metadata_pricing_profile_for_model(
-    state: &AppState,
-    model: &str,
-) -> Result<Option<String>, String> {
-    Ok(state
-        .model_registry_store
-        .get_model_metadata(model)
-        .await?
-        .and_then(|record| record.models_dev_provider)
-        .map(|profile| profile.trim().to_string())
-        .filter(|profile| !profile.is_empty()))
-}
-
-async fn channel_model_has_billable_rate_matrix(
-    state: &AppState,
+pub(super) fn build_dashboard_rate_matrix_cache(
+    pairs: &HashSet<(String, String)>,
     pricing_patterns: &[crate::settings::PricingProfilePattern],
-    cache: &mut HashMap<(String, String), bool>,
+    metadata_profiles: &HashMap<String, String>,
+    candidate_rates: &[DbBillingRateRecord],
+) -> HashMap<(String, String), bool> {
+    let mut cache = HashMap::with_capacity(pairs.len());
+    for (model, provider_type) in pairs {
+        let available = dashboard_candidate_profiles(pricing_patterns, metadata_profiles, model)
+            .into_iter()
+            .any(|profile| {
+                let rates = candidate_rates
+                    .iter()
+                    .filter(|rate| {
+                        rate.pricing_profile == profile
+                            && rate
+                                .provider_type
+                                .as_deref()
+                                .is_none_or(|value| value == provider_type)
+                            && rate
+                                .model_pattern
+                                .as_deref()
+                                .is_none_or(|pattern| glob_matches(pattern, model))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                provider_dashboard_rate_matrix_is_complete(&rates)
+            });
+        cache.insert((model.clone(), provider_type.clone()), available);
+    }
+    cache
+}
+
+fn channel_model_has_billable_rate_matrix(
+    cache: &HashMap<(String, String), bool>,
     provider: &MonoizeProvider,
     channel: &MonoizeChannel,
     logical_model: &str,
     model_entry: &crate::monoize_routing::MonoizeModelEntry,
     reasoning_suffix_map: &HashMap<String, String>,
-) -> Result<bool, String> {
+) -> bool {
     let upstream_model = provider_pricing_model(logical_model, model_entry);
     let normalized_upstream_model =
         normalize_pricing_model_key(upstream_model, reasoning_suffix_map);
@@ -228,33 +299,19 @@ async fn channel_model_has_billable_rate_matrix(
         channel.provider_type,
         logical_model,
     );
-    for provider_type in [effective_type.as_str()] {
-        if dashboard_billing_matrix_available_for_model(
-            state,
-            pricing_patterns,
-            cache,
-            &normalized_upstream_model,
-            provider_type,
-        )
-        .await?
-        {
-            return Ok(true);
-        }
-        if normalized_upstream_model != normalized_logical_model
-            && dashboard_billing_matrix_available_for_model(
-                state,
-                pricing_patterns,
-                cache,
-                &normalized_logical_model,
-                provider_type,
-            )
-            .await?
-        {
-            return Ok(true);
-        }
+    let provider_type = effective_type.as_str().to_string();
+    if cache
+        .get(&(normalized_upstream_model.clone(), provider_type.clone()))
+        .copied()
+        .unwrap_or(false)
+    {
+        return true;
     }
-
-    Ok(false)
+    normalized_upstream_model != normalized_logical_model
+        && cache
+            .get(&(normalized_logical_model, provider_type))
+            .copied()
+            .unwrap_or(false)
 }
 
 pub async fn list_providers(
@@ -269,17 +326,73 @@ pub async fn list_providers(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
-    let reasoning_suffix_map = state
-        .settings_store
-        .get_reasoning_suffix_map()
-        .await
-        .unwrap_or_default();
-    let pricing_patterns = state
-        .settings_store
-        .get_pricing_profile_model_patterns()
+    let (reasoning_suffix_map, pricing_patterns) = {
+        let runtime = state.monoize_runtime.read().await;
+        (
+            runtime.reasoning_suffix_map.clone(),
+            runtime.pricing_profile_model_patterns.clone(),
+        )
+    };
+    let mut pricing_pairs = HashSet::new();
+    for provider in &providers {
+        for channel in &provider.channels {
+            for (logical_model, model_entry) in &channel.models {
+                let normalized_upstream_model = normalize_pricing_model_key(
+                    provider_pricing_model(logical_model, model_entry),
+                    &reasoning_suffix_map,
+                );
+                let normalized_logical_model =
+                    normalize_pricing_model_key(logical_model, &reasoning_suffix_map);
+                let provider_type = crate::monoize_routing::resolve_effective_api_type(
+                    &provider.api_type_overrides,
+                    channel.provider_type,
+                    logical_model,
+                )
+                .as_str()
+                .to_string();
+                pricing_pairs.insert((normalized_upstream_model.clone(), provider_type.clone()));
+                if normalized_upstream_model != normalized_logical_model {
+                    pricing_pairs.insert((normalized_logical_model, provider_type));
+                }
+            }
+        }
+    }
+    let mut pricing_models = pricing_pairs
+        .iter()
+        .map(|(model, _)| model.clone())
+        .collect::<Vec<_>>();
+    pricing_models.sort();
+    pricing_models.dedup();
+    let metadata_profiles = state
+        .model_registry_store
+        .list_model_metadata_pricing_profiles(&pricing_models)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-    let mut rate_matrix_cache: HashMap<(String, String), bool> = HashMap::new();
+    let mut candidate_profiles = pricing_models
+        .iter()
+        .flat_map(|model| {
+            dashboard_candidate_profiles(&pricing_patterns, &metadata_profiles, model)
+        })
+        .collect::<Vec<_>>();
+    candidate_profiles.sort();
+    candidate_profiles.dedup();
+    let mut provider_types = pricing_pairs
+        .iter()
+        .map(|(_, provider_type)| provider_type.clone())
+        .collect::<Vec<_>>();
+    provider_types.sort();
+    provider_types.dedup();
+    let candidate_rates = state
+        .billing_rate_store
+        .list_candidate_rates_for_profiles_and_provider_types(&candidate_profiles, &provider_types)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    let rate_matrix_cache = build_dashboard_rate_matrix_cache(
+        &pricing_pairs,
+        &pricing_patterns,
+        &metadata_profiles,
+        &candidate_rates,
+    );
 
     let mut out = Vec::with_capacity(providers.len());
     for provider in providers {
@@ -287,19 +400,13 @@ pub async fn list_providers(
         for channel in &provider.channels {
             for (logical_model, model_entry) in &channel.models {
                 let has_pricing = channel_model_has_billable_rate_matrix(
-                    &state,
-                    &pricing_patterns,
-                    &mut rate_matrix_cache,
+                    &rate_matrix_cache,
                     &provider,
                     channel,
                     logical_model,
                     model_entry,
                     &reasoning_suffix_map,
-                )
-                .await
-                .map_err(|e| {
-                    AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e)
-                })?;
+                );
                 if !has_pricing {
                     unpriced_model_ids.push(logical_model.clone());
                 }
@@ -359,16 +466,6 @@ pub async fn create_provider(
         .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
 
     advance_routing_config_revision(&state);
-    state
-        .name_caches
-        .providers
-        .insert(provider.id.clone(), provider.name.clone());
-    for ch in &provider.channels {
-        state
-            .name_caches
-            .channels
-            .insert(ch.id.clone(), ch.name.clone());
-    }
 
     Ok((
         StatusCode::CREATED,
@@ -403,25 +500,6 @@ pub async fn update_provider(
             }
         })?;
 
-    state
-        .name_caches
-        .providers
-        .insert(provider.id.clone(), provider.name.clone());
-    for ch in &provider.channels {
-        state
-            .name_caches
-            .channels
-            .insert(ch.id.clone(), ch.name.clone());
-    }
-
-    let next_channel_ids: std::collections::HashSet<&str> =
-        provider.channels.iter().map(|ch| ch.id.as_str()).collect();
-    let removed_channel_ids: Vec<String> = prev_provider
-        .channels
-        .iter()
-        .filter(|ch| !next_channel_ids.contains(ch.id.as_str()))
-        .map(|ch| ch.id.clone())
-        .collect();
     let affected_channel_ids: Vec<String> = prev_provider
         .channels
         .iter()
@@ -433,9 +511,6 @@ pub async fn update_provider(
     advance_routing_config_revision(&state);
     prune_provider_channel_health(&state, &affected_channel_ids).await;
     prune_provider_channel_affinity(&state, &affected_channel_ids).await;
-    for id in &removed_channel_ids {
-        state.name_caches.channels.remove(id);
-    }
 
     Ok(Json(provider_with_runtime(&state, provider).await))
 }
@@ -466,8 +541,6 @@ pub async fn delete_provider(
             }
         })?;
 
-    state.name_caches.providers.remove(&provider_id);
-
     let removed_channel_ids: Vec<String> = existing_provider
         .channels
         .iter()
@@ -476,9 +549,6 @@ pub async fn delete_provider(
     advance_routing_config_revision(&state);
     prune_provider_channel_health(&state, &removed_channel_ids).await;
     prune_provider_channel_affinity(&state, &removed_channel_ids).await;
-    for id in &removed_channel_ids {
-        state.name_caches.channels.remove(id);
-    }
 
     Ok(Json(json!({ "success": true })))
 }
@@ -545,23 +615,7 @@ pub async fn fetch_provider_models(
             )
         })?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(AppError::new(
-            StatusCode::BAD_GATEWAY,
-            "upstream_fetch_failed",
-            format!("upstream returned {status}: {body}"),
-        ));
-    }
-
-    let body: Value = resp.json().await.map_err(|e| {
-        AppError::new(
-            StatusCode::BAD_GATEWAY,
-            "upstream_fetch_failed",
-            format!("failed to parse response: {e}"),
-        )
-    })?;
+    let body = parse_discovery_json_response(resp).await?;
 
     let models: Vec<String> = body
         .get("data")
@@ -707,23 +761,7 @@ pub async fn fetch_channel_models(
         )
     })?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(AppError::new(
-            StatusCode::BAD_GATEWAY,
-            "upstream_fetch_failed",
-            format!("upstream returned {status}: {body}"),
-        ));
-    }
-
-    let resp_body: Value = resp.json().await.map_err(|e| {
-        AppError::new(
-            StatusCode::BAD_GATEWAY,
-            "upstream_fetch_failed",
-            format!("failed to parse response: {e}"),
-        )
-    })?;
+    let resp_body = parse_discovery_json_response(resp).await?;
 
     let models: Vec<String> = extract_model_ids(body.provider_type, &resp_body);
 
@@ -759,12 +797,6 @@ pub async fn test_channel(
 
     let requested_model = body.and_then(|b| b.model.clone());
 
-    let settings = state
-        .settings_store
-        .get_all()
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
     if let Some(model) = requested_model.as_ref()
         && !channel.models.contains_key(model)
     {
@@ -783,12 +815,20 @@ pub async fn test_channel(
         ));
     }
 
+    let (global_probe_model, request_timeout_ms) = {
+        let runtime = state.monoize_runtime.read().await;
+        (
+            runtime.active_probe_model.clone(),
+            runtime.request_timeout_ms,
+        )
+    };
+
     let first_supported_model = channel.models.keys().min().cloned();
 
     let probe_model = requested_model
         .or_else(|| channel.active_probe_model_override.clone())
         .or_else(|| provider.active_probe_model_override.clone())
-        .or_else(|| settings.monoize_active_probe_model.clone())
+        .or(global_probe_model)
         .or(first_supported_model);
 
     let Some(model_name) = probe_model else {
@@ -816,7 +856,7 @@ pub async fn test_channel(
     let (ok, _usage) = crate::monoize_routing::probe_channel_completion(
         &state.http,
         channel,
-        state.monoize_runtime.read().await.request_timeout_ms,
+        request_timeout_ms,
         &upstream_model,
         channel.provider_type,
         &provider.api_type_overrides,
@@ -828,32 +868,14 @@ pub async fn test_channel(
         let now = chrono::Utc::now().timestamp();
         let mut health = state.channel_health.lock().await;
         if state.routing_config_revision.load(Ordering::Acquire) == routing_config_revision {
-            let prefix = format!("{channel_id}::");
-            let keys: Vec<String> = health
-                .keys()
-                .filter(|key| key.as_str() == channel_id || key.starts_with(&prefix))
-                .cloned()
-                .collect();
-            if keys.is_empty() {
-                let entry = health
-                    .entry(health_key(&channel_id, None))
-                    .or_insert_with(ChannelHealthState::new);
-                entry.healthy = true;
-                entry.cooldown_until = None;
-                entry.last_success_at = Some(now);
-                entry.probe_success_count = 0;
-                entry.last_probe_at = None;
-            } else {
-                for key in keys {
-                    if let Some(entry) = health.get_mut(&key) {
-                        entry.healthy = true;
-                        entry.cooldown_until = None;
-                        entry.last_success_at = Some(now);
-                        entry.probe_success_count = 0;
-                        entry.last_probe_at = None;
-                    }
-                }
-            }
+            reset_channel_health_after_successful_test(
+                &mut health,
+                &channel_id,
+                provider.per_model_circuit_break,
+                channel.models.keys().map(String::as_str),
+                now,
+                crate::monoize_routing::channel_health_max_entries(),
+            );
         }
     }
 
@@ -1065,6 +1087,142 @@ mod tests {
         }
     }
 
+    fn unhealthy_state(last_success_at: i64) -> ChannelHealthState {
+        ChannelHealthState {
+            healthy: false,
+            last_success_at: Some(last_success_at),
+            cooldown_until: Some(last_success_at + 100),
+            probe_success_count: 4,
+            last_probe_at: Some(last_success_at + 1),
+            ..ChannelHealthState::new()
+        }
+    }
+
+    #[test]
+    fn discovery_limit_error_maps_to_stable_dashboard_error_code() {
+        let error = discovery_body_error(
+            crate::bounded_response::BoundedResponseError::DeclaredLengthExceeded {
+                content_length: 9,
+                max_bytes: 8,
+            },
+        );
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.code, "upstream_discovery_response_too_large");
+        assert!(error.message.contains("8-byte limit"));
+    }
+
+    #[test]
+    fn successful_test_resets_only_current_channel_candidate_health_keys() {
+        let mut health = HashMap::from([
+            ("channel-a".to_string(), unhealthy_state(1)),
+            ("channel-a::alpha".to_string(), unhealthy_state(2)),
+            ("channel-a::beta".to_string(), unhealthy_state(3)),
+            ("channel-a::removed".to_string(), unhealthy_state(4)),
+            ("unrelated::alpha".to_string(), unhealthy_state(5)),
+        ]);
+
+        reset_channel_health_after_successful_test(
+            &mut health,
+            "channel-a",
+            true,
+            ["alpha", "beta"],
+            100,
+            100,
+        );
+
+        for key in ["channel-a", "channel-a::alpha", "channel-a::beta"] {
+            let state = health.get(key).expect("candidate remains present");
+            assert!(state.healthy);
+            assert_eq!(state.last_success_at, Some(100));
+            assert_eq!(state.cooldown_until, None);
+            assert_eq!(state.probe_success_count, 0);
+            assert_eq!(state.last_probe_at, None);
+        }
+        assert!(!health["channel-a::removed"].healthy);
+        assert_eq!(health["channel-a::removed"].last_success_at, Some(4));
+        assert!(!health["unrelated::alpha"].healthy);
+        assert_eq!(health["unrelated::alpha"].last_success_at, Some(5));
+    }
+
+    #[test]
+    fn successful_test_does_not_insert_base_when_a_model_candidate_exists() {
+        let mut health = HashMap::from([("channel-a::alpha".to_string(), unhealthy_state(1))]);
+
+        reset_channel_health_after_successful_test(
+            &mut health,
+            "channel-a",
+            true,
+            ["alpha", "beta"],
+            100,
+            100,
+        );
+
+        assert!(!health.contains_key("channel-a"));
+        assert!(health["channel-a::alpha"].healthy);
+        assert!(!health.contains_key("channel-a::beta"));
+    }
+
+    #[test]
+    fn successful_test_without_per_model_breaker_resets_only_base_key() {
+        let mut health = HashMap::from([
+            ("channel-a".to_string(), unhealthy_state(1)),
+            ("channel-a::alpha".to_string(), unhealthy_state(2)),
+        ]);
+
+        reset_channel_health_after_successful_test(
+            &mut health,
+            "channel-a",
+            false,
+            ["alpha"],
+            100,
+            100,
+        );
+
+        assert!(health["channel-a"].healthy);
+        assert_eq!(health["channel-a"].last_success_at, Some(100));
+        assert!(!health["channel-a::alpha"].healthy);
+        assert_eq!(health["channel-a::alpha"].last_success_at, Some(2));
+    }
+
+    #[test]
+    fn successful_test_inserts_only_base_when_no_candidate_exists_and_capacity_remains() {
+        let mut health = HashMap::from([("unrelated".to_string(), unhealthy_state(1))]);
+
+        reset_channel_health_after_successful_test(
+            &mut health,
+            "channel-a",
+            true,
+            ["alpha", "beta"],
+            100,
+            2,
+        );
+
+        assert_eq!(health.len(), 2);
+        assert!(health["channel-a"].healthy);
+        assert_eq!(health["channel-a"].last_success_at, Some(100));
+        assert!(!health.contains_key("channel-a::alpha"));
+        assert!(!health.contains_key("channel-a::beta"));
+    }
+
+    #[test]
+    fn successful_test_does_not_insert_when_health_capacity_is_full() {
+        let mut health = HashMap::from([("unrelated".to_string(), unhealthy_state(1))]);
+
+        reset_channel_health_after_successful_test(
+            &mut health,
+            "channel-a",
+            true,
+            ["alpha"],
+            100,
+            1,
+        );
+
+        assert_eq!(health.len(), 1);
+        assert!(!health.contains_key("channel-a"));
+        assert!(!health["unrelated"].healthy);
+    }
+
     #[tokio::test]
     async fn fetch_channel_models_uses_stored_key_for_existing_channel() {
         let (base_url, captured_auth) = start_models_list_server().await;
@@ -1072,6 +1230,7 @@ mod tests {
             listen: "127.0.0.1:0".to_string(),
             metrics_path: "/metrics".to_string(),
             database_dsn: "sqlite::memory:".to_string(),
+            request_log_spool_dir: None,
         })
         .await
         .expect("state loads");

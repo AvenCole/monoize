@@ -1,6 +1,8 @@
 pub mod app;
 pub mod auth;
 pub mod billing_rate_store;
+pub(crate) mod bounded_response;
+pub mod client_ip;
 pub mod config;
 pub mod dashboard_handlers;
 pub mod db;
@@ -15,7 +17,6 @@ pub mod migration;
 pub mod model_registry;
 pub mod model_registry_store;
 pub mod monoize_routing;
-pub mod name_cache;
 pub mod presets;
 pub mod rate_limit;
 pub mod request_capture;

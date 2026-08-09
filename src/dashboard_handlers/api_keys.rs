@@ -4,8 +4,8 @@ use crate::error::{AppError, AppResult};
 use crate::exact_decimal::Multiplier;
 use crate::transforms::TransformRuleConfig;
 use crate::users::{
-    CreateApiKeyInput, ModelRedirectRule, RequestCaptureMode, UpdateApiKeyInput,
-    canonicalize_groups, format_nano_to_usd, parse_nano_usd,
+    CreateApiKeyInput, CreateApiKeyWithLimitError, ModelRedirectRule, RequestCaptureMode,
+    UpdateApiKeyInput, canonicalize_groups, format_nano_to_usd, parse_nano_usd,
 };
 use axum::Json;
 use axum::extract::{Path, State};
@@ -182,26 +182,10 @@ pub async fn create_api_key(
 
     canonicalize_dashboard_api_key_allowed_groups(&mut body.allowed_groups);
 
-    let settings = settings_store
-        .get_all()
+    let max_per_user = settings_store
+        .get_api_key_max_per_user()
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    let existing_keys = user_store
-        .list_user_api_keys(&user.id)
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    if existing_keys.len() >= settings.api_key_max_per_user as usize {
-        return Err(AppError::new(
-            StatusCode::FORBIDDEN,
-            "max_api_keys_reached",
-            format!(
-                "maximum of {} API keys allowed per user",
-                settings.api_key_max_per_user
-            ),
-        ));
-    }
 
     let input = CreateApiKeyInput {
         name: body.name,
@@ -222,14 +206,19 @@ pub async fn create_api_key(
     let is_admin = user.role.can_manage_system();
 
     let (api_key, key) = user_store
-        .create_api_key_extended(&user.id, input, is_admin)
+        .create_api_key_extended_with_limit(&user.id, input, is_admin, max_per_user)
         .await
-        .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
+        .map_err(|error| match error {
+            CreateApiKeyWithLimitError::LimitReached { limit } => AppError::new(
+                StatusCode::FORBIDDEN,
+                "max_api_keys_reached",
+                format!("maximum of {limit} API keys allowed per user"),
+            ),
+            CreateApiKeyWithLimitError::InvalidRequest(error) => {
+                AppError::new(StatusCode::BAD_REQUEST, "invalid_request", error)
+            }
+        })?;
 
-    state
-        .name_caches
-        .api_keys
-        .insert(api_key.id.clone(), api_key.name.clone());
     let (nano, usd) = nano_balance_fields(&api_key.sub_account_balance_nano)
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
     Ok((
@@ -266,12 +255,12 @@ pub async fn delete_api_key(
 
     let user_store = &state.user_store;
 
-    let keys = user_store
-        .list_user_api_keys(&user.id)
+    let api_key = user_store
+        .get_api_key_for_user(&key_id, &user.id)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
-    if !keys.iter().any(|k| k.id == key_id) {
+    if api_key.is_none() {
         return Err(AppError::new(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -284,7 +273,6 @@ pub async fn delete_api_key(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
-    state.name_caches.api_keys.remove(&key_id);
     Ok(Json(json!({ "success": true })))
 }
 
@@ -298,20 +286,12 @@ pub async fn get_api_key(
     let user_store = &state.user_store;
 
     let api_key = user_store
-        .get_api_key_by_id(&key_id)
+        .get_api_key_for_user(&key_id, &user.id)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
     let api_key = api_key
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "not_found", "API key not found"))?;
-
-    if api_key.user_id != user.id {
-        return Err(AppError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "API key not found",
-        ));
-    }
 
     Ok(Json({
         let (nano, usd) = nano_balance_fields(&api_key.sub_account_balance_nano)
@@ -355,12 +335,12 @@ pub async fn update_api_key(
         canonicalize_dashboard_api_key_allowed_groups(groups);
     }
 
-    let keys = user_store
-        .list_user_api_keys(&user.id)
+    let api_key = user_store
+        .get_api_key_for_user(&key_id, &user.id)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
-    if !keys.iter().any(|k| k.id == key_id) {
+    if api_key.is_none() {
         return Err(AppError::new(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -392,10 +372,6 @@ pub async fn update_api_key(
         .await
         .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
 
-    state
-        .name_caches
-        .api_keys
-        .insert(updated_key.id.clone(), updated_key.name.clone());
     let (nano, usd) = nano_balance_fields(&updated_key.sub_account_balance_nano)
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
     Ok(Json(ApiKeyResponse {
@@ -429,29 +405,29 @@ pub async fn batch_delete_api_keys(
 ) -> AppResult<impl IntoResponse> {
     let user = get_current_user(&headers, &state).await?;
 
+    if body.ids.len() > crate::users::UserStore::api_key_batch_delete_max_ids() {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!(
+                "batch delete accepts at most {} ids",
+                crate::users::UserStore::api_key_batch_delete_max_ids()
+            ),
+        ));
+    }
+
     let user_store = &state.user_store;
 
-    let keys = user_store
-        .list_user_api_keys(&user.id)
+    let ids_to_delete = user_store
+        .filter_user_api_key_ids(&user.id, &body.ids)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    let user_key_ids: std::collections::HashSet<String> =
-        keys.iter().map(|k| k.id.clone()).collect();
-    let ids_to_delete: Vec<String> = body
-        .ids
-        .into_iter()
-        .filter(|id| user_key_ids.contains(id))
-        .collect();
 
     let deleted_count = user_store
         .batch_delete_api_keys(&ids_to_delete)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
-    for id in &ids_to_delete {
-        state.name_caches.api_keys.remove(id);
-    }
     Ok(Json(
         json!({ "success": true, "deleted_count": deleted_count }),
     ))

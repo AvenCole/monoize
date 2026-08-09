@@ -97,6 +97,7 @@ fn build_test_auth_with_role(
         username: None,
         user_role,
         api_key_id: None,
+        api_key_name: None,
         max_multiplier: None,
         transforms: Vec::new(),
         model_redirects: Vec::new(),
@@ -426,6 +427,7 @@ async fn routing_uses_channel_model_multiplier_and_redirect_per_attempt() {
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
     seed_model_pricing(&state, "channel-owned-model").await;
@@ -1405,6 +1407,7 @@ async fn resolve_model_suffix_preserves_reasoning_effort_on_attempt_base_request
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -1462,7 +1465,7 @@ async fn resolve_model_suffix_preserves_reasoning_effort_on_attempt_base_request
         .expect("provider created");
 
     let mut req = build_test_urp_request("gpt-5-mini-thinking");
-    resolve_model_suffix(&state, &mut req).await;
+    resolve_model_suffix(&state, &mut req).await.unwrap();
     let original_req = req.clone();
 
     assert_eq!(original_req.model, "gpt-5-mini");
@@ -1472,6 +1475,24 @@ async fn resolve_model_suffix_preserves_reasoning_effort_on_attempt_base_request
             .as_ref()
             .and_then(|reasoning| reasoning.effort.as_deref()),
         Some("high")
+    );
+
+    let mut explicitly_configured_req = build_test_urp_request("gpt-5-mini-thinking");
+    explicitly_configured_req.reasoning = Some(urp::ReasoningConfig {
+        effort: Some("low".to_string()),
+        extra_body: std::collections::HashMap::new(),
+    });
+    resolve_model_suffix(&state, &mut explicitly_configured_req)
+        .await
+        .unwrap();
+
+    assert_eq!(explicitly_configured_req.model, "gpt-5-mini");
+    assert_eq!(
+        explicitly_configured_req
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_deref()),
+        Some("low")
     );
 }
 
@@ -1505,6 +1526,7 @@ async fn build_monoize_attempts_rejects_unpriced_models_before_forwarding() {
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -1578,6 +1600,7 @@ async fn build_monoize_attempts_rejects_admin_unpriced_models_without_pricing() 
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -1650,6 +1673,7 @@ async fn build_monoize_attempts_rejects_admin_missing_server_tool_meter_rate() {
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -1725,6 +1749,7 @@ async fn build_monoize_attempts_accepts_redirected_model_when_logical_fallback_i
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -1848,6 +1873,7 @@ async fn build_monoize_attempts_uses_metadata_pricing_profile_fallback() {
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -1940,6 +1966,7 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -2082,6 +2109,7 @@ async fn execute_nonstream_typed_keeps_bad_gateway_when_groups_filter_every_chan
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -2204,8 +2232,10 @@ fn affinity_test_attempt(
 ) -> MonoizeAttempt {
     MonoizeAttempt {
         provider_id: provider_id.to_string(),
+        provider_name: provider_id.to_string(),
         provider_type: ProviderType::Responses,
         channel_id: channel_id.to_string(),
+        channel_name: channel_id.to_string(),
         base_url: "https://example.com".to_string(),
         api_key: "secret".to_string(),
         logical_model: "gpt-affinity".to_string(),
@@ -2226,6 +2256,7 @@ fn affinity_test_attempt(
         extra_fields_whitelist: None,
         strip_cross_protocol_nested_extra: true,
         billable_pricing_available: true,
+        billing_rate_resolution: None,
         affinity_key: None,
         affinity_key_hash: None,
         affinity_hit: None,
@@ -2238,10 +2269,183 @@ fn affinity_test_attempt(
     }
 }
 
+#[test]
+fn passive_failure_window_prunes_only_timestamps_before_cutoff() {
+    let mut timestamps = std::collections::VecDeque::from([69, 70, 100]);
+    routing::prune_passive_failure_timestamps(&mut timestamps, 100, 30);
+    assert_eq!(timestamps.into_iter().collect::<Vec<_>>(), vec![70, 100]);
+}
+
+#[tokio::test]
+async fn disabled_breaker_success_and_failure_do_not_insert_health_state() {
+    let runtime = RuntimeConfig {
+        listen: "127.0.0.1:0".to_string(),
+        metrics_path: "/metrics".to_string(),
+        database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
+    };
+    let state = load_state_with_runtime(runtime).await.expect("state loads");
+    let mut attempt = affinity_test_attempt(
+        "provider",
+        "disabled-breaker-channel",
+        crate::monoize_routing::AffinityFailbackMode::Sticky,
+        30,
+    );
+    attempt.circuit_breaker_enabled = false;
+    attempt.routing_config_revision = state
+        .routing_config_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+
+    routing::mark_channel_success(&state, &attempt).await;
+    routing::mark_channel_retryable_failure(
+        &state,
+        &attempt,
+        routing::RetryableFailureClass::Transient,
+    )
+    .await;
+
+    assert!(state.channel_health.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn passive_failure_queue_stops_at_threshold_and_success_adds_no_sample() {
+    let runtime = RuntimeConfig {
+        listen: "127.0.0.1:0".to_string(),
+        metrics_path: "/metrics".to_string(),
+        database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
+    };
+    let state = load_state_with_runtime(runtime).await.expect("state loads");
+    let mut attempt = affinity_test_attempt(
+        "provider",
+        "bounded-passive-channel",
+        crate::monoize_routing::AffinityFailbackMode::Sticky,
+        30,
+    );
+    attempt.passive_failure_count_threshold = 2;
+    attempt.routing_config_revision = state
+        .routing_config_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+
+    for _ in 0..3 {
+        routing::mark_channel_retryable_failure(
+            &state,
+            &attempt,
+            routing::RetryableFailureClass::Transient,
+        )
+        .await;
+    }
+    {
+        let health = state.channel_health.lock().await;
+        let entry = health
+            .get("bounded-passive-channel")
+            .expect("health entry exists");
+        assert!(!entry.healthy);
+        assert_eq!(entry.passive_failure_timestamps.len(), 2);
+    }
+
+    routing::mark_channel_success(&state, &attempt).await;
+    let health = state.channel_health.lock().await;
+    let entry = health
+        .get("bounded-passive-channel")
+        .expect("health entry exists");
+    assert!(entry.healthy);
+    assert_eq!(entry.passive_failure_timestamps.len(), 2);
+}
+
 fn affinity_test_auth() -> AuthResult {
     let mut auth = build_test_auth(None);
     auth.user_id = Some("affinity-user".to_string());
     auth
+}
+
+#[test]
+fn affinity_capacity_refreshes_existing_key_and_rejects_new_key() {
+    let binding =
+        |channel_id: &str, last_used_at: i64| crate::monoize_routing::ChannelAffinityBinding {
+            provider_id: "provider".to_string(),
+            channel_id: channel_id.to_string(),
+            bound_at: 1,
+            last_used_at,
+            expires_at: last_used_at + 100,
+        };
+    let mut cache = HashMap::from([("existing".to_string(), binding("old", 1))]);
+    routing::insert_channel_affinity_with_limit(
+        &mut cache,
+        "new".to_string(),
+        binding("new", 2),
+        1,
+    );
+    assert_eq!(cache.len(), 1);
+    assert!(!cache.contains_key("new"));
+
+    routing::insert_channel_affinity_with_limit(
+        &mut cache,
+        "existing".to_string(),
+        binding("refreshed", 3),
+        1,
+    );
+    assert_eq!(cache["existing"].channel_id, "refreshed");
+    assert_eq!(cache["existing"].last_used_at, 3);
+
+    assert_eq!(
+        crate::monoize_routing::cleanup_channel_affinity(&mut cache, 103),
+        1
+    );
+    routing::insert_channel_affinity_with_limit(
+        &mut cache,
+        "new".to_string(),
+        binding("new", 104),
+        1,
+    );
+    assert!(cache.contains_key("new"));
+}
+
+#[tokio::test]
+async fn affinity_lookup_removes_only_the_requested_expired_binding() {
+    let runtime = RuntimeConfig {
+        listen: "127.0.0.1:0".to_string(),
+        metrics_path: "/metrics".to_string(),
+        database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
+    };
+    let state = load_state_with_runtime(runtime).await.expect("state loads");
+    let request = build_test_routing_request("gpt-affinity");
+    let auth = affinity_test_auth();
+    let (key, _) = affinity_key_for_request(&request, &auth).expect("affinity key");
+    let now = now_ts();
+    let live_key = "unrelated-live".to_string();
+    let binding =
+        |channel_id: &str, expires_at: i64| crate::monoize_routing::ChannelAffinityBinding {
+            provider_id: "provider-b".to_string(),
+            channel_id: channel_id.to_string(),
+            bound_at: now - 60,
+            last_used_at: now - 30,
+            expires_at,
+        };
+    state.channel_affinity.lock().await.extend([
+        (key.clone(), binding("channel-b1", now)),
+        (live_key.clone(), binding("channel-live", now + 60)),
+    ]);
+
+    let attempts = apply_channel_affinity(
+        &state,
+        &request,
+        &auth,
+        vec![affinity_test_attempt(
+            "provider-b",
+            "channel-b1",
+            crate::monoize_routing::AffinityFailbackMode::Sticky,
+            30,
+        )],
+    )
+    .await
+    .expect("affinity applies");
+
+    assert_eq!(attempts[0].affinity_hit, Some(false));
+    let cache = state.channel_affinity.lock().await;
+    assert!(!cache.contains_key(&key));
+    assert!(cache.contains_key(&live_key));
 }
 
 #[tokio::test]
@@ -2250,6 +2454,7 @@ async fn affinity_failback_mode_controls_recovered_provider_order() {
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
     let request = build_test_routing_request("gpt-affinity");
@@ -2262,7 +2467,8 @@ async fn affinity_failback_mode_controls_recovered_provider_order() {
             provider_id: "provider-b".to_string(),
             channel_id: "channel-b1".to_string(),
             bound_at: now - 60,
-            updated_at: now,
+            last_used_at: now,
+            expires_at: now + 1800,
         },
     );
 
@@ -2325,6 +2531,7 @@ async fn affinity_disabled_override_removes_existing_binding() {
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
     let request = build_test_routing_request("gpt-affinity");
@@ -2337,7 +2544,8 @@ async fn affinity_disabled_override_removes_existing_binding() {
             provider_id: "provider-b".to_string(),
             channel_id: "channel-b1".to_string(),
             bound_at: now,
-            updated_at: now,
+            last_used_at: now,
+            expires_at: now + 1800,
         },
     );
     let mut disabled = affinity_test_attempt(
@@ -2362,6 +2570,7 @@ async fn response_id_affinity_inherits_source_binding_age_on_hit() {
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
     let request = build_test_routing_request("gpt-affinity");
@@ -2375,7 +2584,8 @@ async fn response_id_affinity_inherits_source_binding_age_on_hit() {
             provider_id: "provider-b".to_string(),
             channel_id: "channel-b1".to_string(),
             bound_at: original_bound_at,
-            updated_at: now,
+            last_used_at: now,
+            expires_at: now + 1800,
         },
     );
     let mut attempt = affinity_test_attempt(
@@ -2400,6 +2610,10 @@ async fn response_id_affinity_inherits_source_binding_age_on_hit() {
         .cloned()
         .expect("response binding");
     assert_eq!(response_binding.bound_at, original_bound_at);
+    assert_eq!(
+        response_binding.expires_at - response_binding.last_used_at,
+        attempt.affinity_idle_ttl_seconds as i64
+    );
 }
 
 #[test]

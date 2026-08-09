@@ -32,7 +32,7 @@ Runtime-only state MUST be maintained in memory:
 
 - `_healthy: boolean` default `true`
 - `_last_success_at: timestamp | null`
-- `_passive_samples: sequence<{at_ts: timestamp, failed: boolean}>` (bounded by time-window pruning)
+- `_passive_failure_timestamps: sequence<timestamp>`
 
 Channel-level passive breaker override fields MAY be present:
 
@@ -105,7 +105,7 @@ The router subsystem MUST support:
   - `passive_cooldown_seconds` default `60`
   - `passive_rate_limit_cooldown_seconds` default `15`
 
-CFG-1. Provider configuration decoding MUST be fail-fast: invalid serialized provider fields (including `transforms`, `created_at`, `updated_at`) MUST return an explicit error and MUST NOT be silently coerced to defaults.
+CFG-1. Provider configuration decoding MUST be fail-fast: invalid serialized provider fields (including `transforms`, `created_at`, `updated_at`) MUST return an explicit error and MUST NOT be silently coerced to defaults. Every persisted Provider or Channel integer-backed boolean MUST be exactly `0` or `1`; any other integer MUST fail decoding.
 
 CFG-2. Each provider MAY define probe override fields:
 
@@ -126,6 +126,10 @@ CFG-5. Passive breaker effective parameters MUST be resolved per channel with pr
 2. global passive breaker setting
 
 The resolved parameters are: `passive_failure_count_threshold`, `passive_window_seconds`, `passive_cooldown_seconds`, `passive_rate_limit_cooldown_seconds`.
+
+CFG-5a. `MONOIZE_CHANNEL_PASSIVE_FAILURE_SAMPLE_MAX_ENTRIES` MUST configure the positive process-local maximum passive-failure threshold per health-state entry. An unset, empty, zero, negative, invalid, or overflowing value MUST use `1024`.
+
+CFG-5b. The effective passive-failure threshold MUST equal `min(resolved passive_failure_count_threshold, MONOIZE_CHANNEL_PASSIVE_FAILURE_SAMPLE_MAX_ENTRIES)`. The effective threshold MUST be at least `1`.
 
 CFG-6. Each provider MAY define a timeout override field:
 
@@ -225,7 +229,7 @@ AFF-1b. Each Channel MAY define these nullable override fields:
 
 For each field, a non-null Channel value MUST replace the matching global value for that Channel. A null Channel value MUST inherit the global value. Therefore `affinity_enabled_override = true` MAY enable affinity for one Channel when `monoize_affinity_enabled = false`, and `affinity_enabled_override = false` MUST disable affinity for one Channel when `monoize_affinity_enabled = true`.
 
-AFF-2. An affinity binding MUST expire when its last successful use is older than the effective `affinity_idle_ttl_seconds` of the bound Channel.
+AFF-2. On every successful binding write or refresh, `last_used_at` MUST equal `now` and `expires_at` MUST equal the saturating sum `now + effective affinity_idle_ttl_seconds`. A binding MUST be expired when `now >= expires_at`.
 
 AFF-3. The affinity cache key MUST include:
 
@@ -238,7 +242,7 @@ AFF-4. Explicit stable metadata fields are Responses `previous_response_id`, ses
 
 AFF-5. The fallback input-prefix hash MUST hash normalized request input only. It MUST consider at most the first 8 input nodes and at most 16384 bytes of normalized JSON/text material. Raw affinity material MUST NOT be persisted.
 
-AFF-6. The affinity value MUST contain `(provider_id, channel_id, bound_at, last_used_at)`.
+AFF-6. The affinity value MUST contain `(provider_id, channel_id, bound_at, last_used_at, expires_at)`.
 
 AFF-7. If an affinity hit points to a Provider+Channel that is still eligible for the request, routing MAY jump directly to that attempt before normal provider-order attempts. This jump consumes the normal provider/channel attempt budget.
 
@@ -263,9 +267,13 @@ AFF-10. A successful non-stream request MUST write or refresh affinity after suc
 
 AFF-11. After a successful `type=responses` attempt on an affinity-enabled Channel, Monoize MUST write an additional affinity binding keyed by authenticated tenant, logical model, and the non-empty upstream response id. A subsequent Responses request that sends that id as `previous_response_id` MUST resolve the additional binding under AFF-7 through AFF-9. A successful Responses stream MUST write this binding only after successful terminal completion. If the successful attempt was an affinity hit and retained the same target, the response-id binding MUST inherit the source binding's `bound_at`; otherwise the response-id binding MUST set `bound_at` to the success time.
 
-AFF-12. The process-local affinity map MUST contain at most 4096 bindings. Inserting a new key at capacity MUST evict one existing binding before insertion.
+AFF-12. `MONOIZE_CHANNEL_AFFINITY_MAX_ENTRIES` MUST configure the positive process-local affinity-map limit. An unset, empty, zero, negative, or invalid value MUST use `4096`. At capacity, an existing key MUST remain refreshable and a new key MUST be rejected without eviction. Capacity checks MUST be constant-time and MUST NOT scan the map.
 
 AFF-13. Lookup MUST inspect only the requested binding. It MUST remove that binding when expired and MUST NOT scan the complete affinity map on each request.
+
+AFF-13a. `MONOIZE_CHANNEL_AFFINITY_CLEANUP_INTERVAL_SECONDS` MUST configure the positive background cleanup interval in seconds. An unset, empty, zero, negative, invalid, or overflowing value MUST use `60`.
+
+AFF-13b. One background cleanup tick MUST retain only bindings whose `expires_at` is greater than the tick timestamp. Its work MUST be `O(current binding count)`, which is bounded by AFF-12. Request lookup, insertion, and refresh MUST NOT invoke this complete-map cleanup.
 
 AFF-14. A provider update or delete MUST remove affinity bindings for every channel in the affected provider. An upstream attempt created before the completed provider mutation MUST NOT write or refresh affinity afterward.
 
@@ -287,6 +295,10 @@ HSK-4. A provider update MUST remove runtime health state for every channel in b
 
 HSK-5. Each upstream attempt and active probe MUST capture the routing-configuration revision used to create it. After a provider create, update, delete, or reorder increments that revision, an attempt or probe with an older revision MUST NOT create or update channel health state.
 
+HSK-6. `MONOIZE_CHANNEL_HEALTH_MAX_ENTRIES` MUST configure the positive process-local health-map limit. An unset, empty, zero, negative, or invalid value MUST use `10000`.
+
+HSK-7. A health update MUST NOT increase the map beyond HSK-6. At capacity, a new key MUST NOT be inserted or evict an existing key. Every missing health key MUST be treated as ineligible until an entry slot becomes available. Capacity checks MUST be constant-time and MUST NOT scan the health map.
+
 ### 6.2 Passive
 
 - `failure_count_threshold` default `3`
@@ -294,11 +306,11 @@ HSK-5. Each upstream attempt and active probe MUST capture the routing-configura
 - `cooldown_seconds` default `60`
 - `rate_limit_cooldown_seconds` default `15`
 
-PHS-1. On each retryable failure (transient or rate-limited), the health state entry MUST append one sample `{at_ts: now, failed: true}` and MUST prune samples older than `window_seconds`.
+PHS-1. On each retryable failure (transient or rate-limited), the health state entry MUST prune failure timestamps older than `window_seconds` from the front of its queue. It MUST append `now` only when the queue length is below the effective threshold from CFG-5b.
 
-PHS-2. On each successful attempt, the health state entry MUST append one sample `{at_ts: now, failed: false}` and MUST prune samples older than `window_seconds`.
+PHS-2. A successful attempt MUST NOT append a passive sample. If `provider.circuit_breaker_enabled == false`, success and failure handling MUST return without inserting or modifying a Channel health entry.
 
-PHS-3. The health state entry MUST become unhealthy when the count of failed samples within the current window reaches `failure_count_threshold`.
+PHS-3. The health state entry MUST become unhealthy when its failure-timestamp queue length reaches the effective threshold. Failure-count evaluation MUST read the queue length in constant time and MUST NOT scan the queue. The queue length MUST NOT exceed the effective threshold.
 
 PHS-4. When unhealthy is triggered by a retryable `429` failure, cooldown MUST use `rate_limit_cooldown_seconds`. Otherwise cooldown MUST use `cooldown_seconds`.
 
@@ -317,6 +329,8 @@ PHS-6. On successful attempts, the health state entry MUST be restored to health
 AHS-1. Active probing MUST target unhealthy channels whose cooldown has elapsed.
 
 AHS-1a. If `provider.circuit_breaker_enabled == false`, active probing MUST be skipped for that provider.
+
+AHS-1b. Active-probe candidate loading MUST exclude a disabled Provider, a disabled Channel, and a Channel whose weight is zero. A Provider with no enabled positive-weight Channel MUST be excluded.
 
 AHS-2. Channel MUST return to healthy only after reaching success threshold.
 

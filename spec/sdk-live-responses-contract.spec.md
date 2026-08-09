@@ -53,13 +53,13 @@ SDK18. The token-creation response in SDK17 MUST contain `key: string`.
 SDK19. Each runner MUST create exactly one provider by sending `POST /api/dashboard/providers` with:
 
 - `name = "sdk-mock-provider"`
-- one Channel model entry for `gpt-4o-mini` with multiplier `1.0`
+- one Channel model entry for `gpt-4o-mini` with multiplier `"1"`
 - one channel entry with:
   - `name = "sdk-mock-channel"`
   - `provider_type` set by SDK19a or SDK19b
   - `base_url = http://127.0.0.1:{MOCK_PORT}`
   - `api_key = MOCK_API_KEY`
-  - `models = { "gpt-4o-mini": { "redirect": null, "multiplier": 1.0 } }`
+  - `models = { "gpt-4o-mini": { "redirect": null, "multiplier": "1" } }`
 
 SDK19a. `sdk-tests/openai-smoke.ts` MUST set the channel `provider_type = "responses"` in the provider request from SDK19.
 

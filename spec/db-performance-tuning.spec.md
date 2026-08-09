@@ -10,11 +10,13 @@
 
 DPT1. All performance-tuning constructs MUST reside in `src/db_cache.rs`, exported as `pub mod db_cache` from the crate root.
 
-DPT2. The module MUST expose exactly four public types:
+DPT2. The module MUST expose these public runtime types:
 - `LastUsedBatcher`
 - `RequestLogBatcher`
 - `ApiKeyCache`
 - `BalanceCache`
+
+The module MUST also expose `RequestLogAdmissionError` so forwarding preflight and terminal finalization can distinguish spool quota exhaustion from spool unavailability.
 
 ## 2. LastUsedBatcher
 
@@ -22,13 +24,15 @@ DPT2. The module MUST expose exactly four public types:
 
 DPT-LU1. `LastUsedBatcher` MUST hold a `DashMap<String, DateTime<Utc>>` keyed by `api_key_id`.
 
-DPT-LU2. When `record(api_key_id, timestamp)` is called, the entry for `api_key_id` MUST be unconditionally overwritten with the new timestamp. If the key already exists, the previous value is replaced. No deduplication or ordering guarantee is required beyond last-write-wins.
+DPT-LU2. When `record(api_key_id, timestamp)` is called for an existing entry, the buffer MUST retain the later of the existing and supplied timestamps. A failed flush MUST reinsert the failed timestamp without replacing a newer concurrently recorded timestamp.
+
+DPT-LU2a. The distinct-key capacity MUST be configurable. The default is `10000`, selected by `MONOIZE_LAST_USED_BUFFER_ENTRIES`. When the buffer is full, an update to an existing key remains accepted and a previously unseen key MAY be omitted with a warning because `last_used_at` is non-billing metadata.
 
 ### 2.2 Flush
 
-DPT-LU3. `flush(db)` MUST atomically drain all buffered entries (via `retain(|_,_| false)`) and execute one `UPDATE api_keys SET last_used_at = $1 WHERE id = $2` per drained entry within a single write-lock acquisition.
+DPT-LU3. `flush(db)` MUST atomically drain all buffered entries (via `retain(|_,_| false)`) and update them through bounded bulk `UPDATE ... CASE` statements within a single write-lock acquisition. The default chunk size is `256`, selected by `MONOIZE_LAST_USED_FLUSH_CHUNK_ENTRIES` and clamped to `[1, 400]` so each portable statement uses at most 800 bound values. Flush MUST execute at most one database round trip per non-empty chunk, not one round trip per key.
 
-DPT-LU4. If an individual UPDATE fails, the error MUST be logged at `warn` level. The flush MUST continue processing remaining entries (no short-circuit on partial failure).
+DPT-LU4. If one bulk UPDATE fails, the error MUST be logged at `warn` level and every entry in that chunk MUST be returned to the buffer for a later flush. The flush MUST continue processing remaining chunks.
 
 DPT-LU5. If the buffer is empty at flush time, the method MUST return immediately without acquiring a write lock.
 
@@ -42,23 +46,41 @@ DPT-LU7. The default flush interval (as configured in `UserStore::spawn_backgrou
 
 ### 3.1 State
 
-DPT-RL1. `RequestLogBatcher` MUST hold a `Mutex<Vec<InsertRequestLog>>` with a configurable initial capacity hint.
+DPT-RL1. `RequestLogBatcher` MUST hold at most a configurable number of in-memory spool references. The default is `128`, selected by `MONOIZE_REQUEST_LOG_BUFFER_ENTRIES`.
 
-DPT-RL2. The default capacity hint (as configured in `UserStore::new`) MUST be 128.
+DPT-RL2. Each accepted entry MUST be serialized to a unique file in the request-log spool before `push` reports success. `RuntimeConfig.request_log_spool_dir: Option<PathBuf>` MUST select the spool directory when it is `Some(path)`. When it is `None`, `RequestLogBatcher` MUST preserve the existing resolution order: use `MONOIZE_REQUEST_LOG_SPOOL_DIR` when that variable exists, otherwise use `./data/request-log-spool`. `RuntimeConfig::from_env()` MUST set this field to `None`; production therefore keeps the existing environment/default behavior. Two `AppState` instances with distinct explicit paths MUST not discover, flush, or account for each other's spool files.
 
 ### 3.2 Push
 
-DPT-RL3. `push(log)` MUST append the `InsertRequestLog` to the internal buffer under the mutex.
+DPT-RL3. `push(log)` MUST assign the stable database row UUID, durably publish one spool file by temporary-file write followed by same-directory atomic rename, and then MAY append an in-memory reference under the mutex. It MUST return `Result` so the caller can fail closed when persistence is unavailable.
+
+DPT-RL3a. The spool byte quota MUST be configurable. The default is `536870912`, selected by `MONOIZE_REQUEST_LOG_SPOOL_MAX_BYTES`. One serialized entry MUST be no larger than `8388608` bytes by default, selected by `MONOIZE_REQUEST_LOG_SPOOL_ENTRY_MAX_BYTES`. Terminal-log preflight MUST reject `MONOIZE_REQUEST_LOG_SPOOL_ENTRY_MAX_BYTES` values below `1024` with `RequestLogAdmissionError::EntryQuotaTooSmall`; no reservation or admission marker may be created for that configuration.
+
+DPT-RL3b. If accepting an entry would exceed either quota, or its one durable spool write attempt fails, unreserved `push` MUST return an error. It MUST NOT broadcast the log or remove its pending snapshot. `push` is for bounded internal producers, MUST NOT degrade an oversized entry, and MUST NOT retry indefinitely.
+
+DPT-RL3c. `reserve_terminal_log()` MUST atomically reserve one `MONOIZE_REQUEST_LOG_SPOOL_ENTRY_MAX_BYTES` unit against the sum of durable spool bytes and outstanding reservations. Concurrent reservations MUST NOT oversubscribe the spool quota. The reservation MUST preassign one stable spool-row UUID and one stable final `.json` path. Before returning success it MUST create, sync, and atomically publish a unique unarmed write-probe marker in the spool directory and sync that directory. Dropping the final clone of an unarmed reservation MUST remove the probe and release the reservation.
+
+DPT-RL3c-1. Before upstream dispatch, `arm_reserved(fallback_log, reservation)` MUST atomically replace the unarmed marker with a valid, durably synced `SpoolRequestLog` fallback that uses the reservation's stable UUID. The fallback MUST have terminal `status = "error"`, identify the admitted request, and state that terminal finalization was interrupted. Arming MUST fail unless the reservation belongs to that batcher, is unclaimed, and is unarmed. `push_reserved` MUST fail unless arming completed.
+
+DPT-RL3c-2. Exactly one `push_reserved(log, reservation)` call MAY claim an armed reservation. It MUST encode the terminal log with the reservation's stable UUID and durably rename it to the reservation's stable final path. After claim, a filesystem write, sync, or rename failure MUST leave the armed fallback and reservation active and MUST retry the same stable UUID and final path until durable rename succeeds. Retry delay MUST start at `10 ms`, double after each failed attempt, and stop increasing at `1000 ms`. `push_reserved` MUST release `flush_lock` before each retry sleep. After durable rename, the reservation MUST remove the armed marker, convert the full reservation to the serialized terminal entry's actual byte count, and release unused reserved bytes.
+
+DPT-RL3c-3. Dropping the final clone of an armed or claimed reservation before terminal completion MUST preserve the fallback by atomically promoting its marker to the stable final `.json` path. If promotion succeeds, quota accounting MUST convert the reservation to the fallback file's actual byte count. If promotion fails, the marker MUST remain on disk and the process MUST retain the conservative full reservation.
+
+DPT-RL3c-4. `cancel_reserved(reservation)` MAY cancel an armed but unclaimed reservation for a producer whose completed outcome is specified not to generate a row. Cancellation MUST exclusively transition the reservation out of the claimable state, then retry until the marker is absent and the spool directory sync succeeds. Retry delay MUST start at `10 ms`, double after each failed attempt, and stop increasing at `1000 ms`. It MUST mark the reservation consumed and release its full quota only after durable cancellation. An unarmed, claimed, consumed, or foreign reservation MUST be rejected. The caller MUST await cancellation before discarding the lifecycle.
+
+DPT-RL3d. `push(log)` without a preflight reservation is reserved for internal producers such as active probes and tests. It MUST atomically reserve the serialized entry's actual byte count before writing and MUST obey the same combined quota.
+
+DPT-RL3e. `push_reserved` MUST serialize the complete entry when it fits the reservation. If it does not fit, it MUST serialize a deterministic compact terminal entry with the same stable spool UUID, exact system-issued `user_id` and `api_key_id`, bounded `request_id`, `model`, and `status`, `is_stream`, captured creation time, and `error_code = "request_log_payload_truncated"`. The bounded text encoding MUST retain ASCII alphanumeric characters and `-`, `_`, `.`, `:`, and `/`, replace each other Unicode scalar with `_`, and stop at `128`, `64`, and `32` output bytes respectively. All other optional payload fields MUST be absent and MUST deserialize as null. A valid compact entry MUST fit the `1024`-byte minimum. Oversize degradation MUST occur before reservation claim, and a successfully admitted terminal log MUST NOT be discarded solely because its complete encoding exceeds the entry quota.
 
 ### 3.3 Flush
 
-DPT-RL4. `flush(db)` MUST atomically drain the buffer (via `std::mem::replace` with a fresh `Vec` of the same capacity hint), open a single database transaction, execute one `INSERT INTO request_logs (...) VALUES (...)` per drained entry inside that transaction, and commit at the end.
+DPT-RL4. `flush(db)` MUST select a bounded batch of durable spool files and open one database transaction. It MUST partition the selected entries into consecutive chunks of at most `20` rows. Each non-empty chunk MUST execute exactly one multi-row `INSERT INTO request_logs (...) VALUES (...), (...) ON CONFLICT(id) DO NOTHING` statement. Each row MUST bind exactly the `42` request-log columns, so one statement binds at most `840` values and remains below the portable SQLite `999`-variable ceiling. Placeholder numbering MUST be contiguous across every row in one statement and MUST restart at `$1` for each chunk. The transaction MUST commit only after every chunk succeeds.
 
-DPT-RL5. Each INSERT MUST generate a new UUID `id` and use the log entry's captured `created_at` value (request terminalization time) instead of flush time.
+DPT-RL5. Each INSERT MUST use the stable UUID stored in the spool entry and the log entry's captured `created_at` value instead of flush time.
 
-DPT-RL6. If any INSERT fails, the transaction MUST be rolled back and the flush failure MUST be logged at `warn` level.
+DPT-RL6. If transaction begin, any INSERT, or commit fails, the selected spool files MUST remain available for a later retry and the failure MUST be logged at `warn` level.
 
-DPT-RL7. If the buffer is empty at flush time, the method MUST return immediately without acquiring a write lock.
+DPT-RL7. After a successful commit, the selected spool files MUST be deleted. An ambiguous commit outcome is safe because retries use `ON CONFLICT(id) DO NOTHING` with the stable UUID.
 
 ### 3.4 Background Task
 
@@ -66,9 +88,9 @@ DPT-RL8. `spawn_flush_task(db, interval)` MUST spawn a tokio task that calls `fl
 
 DPT-RL9. The default flush interval (as configured in `UserStore::spawn_background_tasks`) MUST be 2 seconds.
 
-### 3.5 Data Loss Window
+### 3.5 Crash recovery
 
-DPT-RL10. Between `push` and the next `flush`, request log entries exist only in memory. If the process crashes before flush, those entries are lost. The maximum data loss window equals the flush interval (2 seconds by default).
+DPT-RL10. Spool files left by an abrupt process exit MUST be discovered and retried by a later process using the same spool directory. Memory-buffer capacity MUST NOT limit recovery of on-disk entries. Startup MUST delete legacy constant-content and unarmed write-probe admission markers. Startup MUST parse every armed admission marker as a bounded `SpoolRequestLog`; if its stable final path is absent, startup MUST atomically promote the marker to that path and sync the directory. If the final path already exists, startup MUST retain the final file and remove the duplicate marker. Startup MUST fail without deleting a non-legacy admission marker that is neither a valid fallback nor an already-published final row.
 
 ## 4. ApiKeyCache
 
@@ -83,6 +105,8 @@ DPT-AK2. Each `CachedApiKeyEntry` MUST contain:
 - `generation: u64` (the cache invalidation generation observed before the database read)
 
 DPT-AK3. The TTL (as configured in `UserStore::new`) MUST be 60 seconds.
+
+DPT-AK3a. Entry capacity MUST be configurable. The default is `10000`, selected by `MONOIZE_API_KEY_CACHE_CAPACITY`. Insertion at capacity MUST evict an existing entry before publishing the new entry.
 
 ### 4.2 Lookup
 
@@ -106,10 +130,10 @@ DPT-AK8a. After insertion, the cache MUST read the generation again. If it chang
 
 ### 4.5 Invalidation
 
-DPT-AK9. The following invalidation methods MUST exist:
-- `invalidate_by_key_id(key_id)`: Remove all entries where `entry.api_key.id == key_id`.
-- `invalidate_by_user_id(user_id)`: Remove all entries where `entry.api_key.user_id == user_id`.
-- `invalidate_by_key_ids(key_ids)`: Remove all entries where `entry.api_key.id` is in `key_ids`.
+DPT-AK9. The cache MUST maintain reverse indexes from API-key ID and user ID to complete-token cache keys. The following invalidation methods MUST exist:
+- `invalidate_by_key_id(key_id)`: Remove entries named by the API-key-ID reverse index.
+- `invalidate_by_user_id(user_id)`: Remove entries named by the user-ID reverse index.
+- `invalidate_by_key_ids(key_ids)`: Remove entries named by the API-key-ID reverse indexes.
 - `invalidate(key)`: Remove the entry for the complete API key.
 - `invalidate_all()`: Clear the entire cache.
 
@@ -124,6 +148,7 @@ DPT-AK10. Invalidation MUST be called on the following mutation paths:
 | `batch_delete_api_keys(ids)` | `invalidate_by_key_ids(ids)` |
 | `delete_user(id)` | `invalidate_by_user_id(id)` |
 | `update_user(id, ..., any persisted field changed, ...)` | `invalidate_by_user_id(id)` |
+| `update_last_login(id)` | `invalidate_by_user_id(id)` after the database write succeeds |
 | `decrement_api_key_quota(api_key_id)` | `invalidate_by_key_id(api_key_id)` |
 
 DPT-AK11. `update_user` MUST invalidate the API key cache whenever the update modifies any persisted user field.
@@ -131,6 +156,10 @@ DPT-AK11. `update_user` MUST invalidate the API key cache whenever the update mo
 DPT-AK12. `decrement_api_key_quota(api_key_id)` MUST invalidate API key cache entries for that key via `invalidate_by_key_id(api_key_id)` after the quota update executes.
 
 DPT-AK13. `ApiKeyCache` MUST provide a background eviction task that periodically removes expired entries using `retain`.
+
+DPT-AK14. Explicit ID/user invalidation MUST NOT scan the complete-token cache. Eviction and every removal path MUST remove corresponding reverse-index membership. Stale empty reverse-index sets MUST be removed.
+
+DPT-AK15. `delete_user(id)` MUST execute the following operations in one write transaction: lock the matching user row, reject a missing user, delete that user, verify that exactly one user row was deleted, and commit. It MUST NOT query or materialize the deleted user's API-key IDs. After commit it MUST call `ApiKeyCache::invalidate_by_user_id(id)` and `BalanceCache::invalidate(id)` and return `Result<(), String>`.
 
 ## 5. BalanceCache
 
@@ -144,6 +173,8 @@ DPT-BC2. Each `CachedBalanceEntry` MUST contain:
 - `generation: u64`
 
 DPT-BC3. The TTL (as configured in `UserStore::new`) MUST be 30 seconds.
+
+DPT-BC3a. Entry capacity MUST be configurable. The default is `10000`, selected by `MONOIZE_BALANCE_CACHE_CAPACITY`. Insertion at capacity MUST evict an existing entry before publishing the new entry.
 
 ### 5.2 Lookup
 
@@ -201,7 +232,8 @@ DPT-US2. `spawn_background_tasks()` MUST be called after `UserStore` constructio
 - flush task for `LastUsedBatcher` (30s interval),
 - flush task for `RequestLogBatcher` (2s interval),
 - eviction task for `ApiKeyCache` (30s interval),
-- eviction task for `BalanceCache` (30s interval).
+- eviction task for `BalanceCache` (30s interval),
+- expired-session cleanup task using the DPT-US10 interval.
 
 DPT-US3. `flush_all_batchers()` MUST be called during application shutdown. It MUST flush both `LastUsedBatcher` and `RequestLogBatcher` to ensure buffered data is persisted.
 
@@ -225,6 +257,12 @@ DPT-US6. `insert_request_log_pending()`, `update_pending_request_log_channel()`,
 DPT-US7. `finalize_request_log(log)` and `insert_request_log(log)` MUST push the `InsertRequestLog` to `RequestLogBatcher` instead of performing direct DB writes.
 
 DPT-US8. `cleanup_pending_request_logs()` MUST remain functional and continue to transition any `status = "pending"` rows to `status = "error"`. This handles the edge case where the process crashes after a previous version created pending rows, or during the data-loss window between `push` and `flush`.
+
+### 6.5 Session Retention
+
+DPT-US9. `cleanup_expired_sessions()` MUST execute one set-based `DELETE FROM sessions WHERE expires_at <= threshold` statement and return the number of deleted rows. The threshold MUST be the current UTC time encoded with the same RFC3339 representation used by `create_session`. The cleanup MUST NOT first query or materialize session rows.
+
+DPT-US10. `UserStore` construction MUST complete one DPT-US9 cleanup before returning. `spawn_background_tasks()` MUST repeat DPT-US9 after each configured interval. `MONOIZE_SESSION_CLEANUP_INTERVAL_SECONDS` MUST select a positive whole-second interval. Its default MUST be `3600`; a missing, empty, zero, negative, invalid, or overflowing value MUST select the default.
 
 ## 7. Concurrency Properties
 

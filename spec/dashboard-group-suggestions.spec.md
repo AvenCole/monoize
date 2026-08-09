@@ -30,3 +30,7 @@ DG-4. Every contributed label MUST be canonicalized by trimming leading/trailing
 DG-5. The endpoint MUST return the sorted unique union after canonicalization.
 
 DG-6. The endpoint is read-only. It MUST NOT create, update, delete, cache, or otherwise persist any registry of groups.
+
+DG-7. The endpoint MUST scan each of the three source tables in the fixed DG-1 order through an `id ASC` keyset query. `MONOIZE_DASHBOARD_GROUP_SCAN_BATCH_ROWS` MUST configure the positive maximum rows returned by each query and MUST default to `400` when missing, empty, zero, negative, invalid, or overflowing. SQLite and PostgreSQL MUST use the same query and cursor semantics. A later batch MUST NOT rescan rows at or before the previous batch cursor.
+
+DG-8. The endpoint MUST parse and canonicalize at most one batch of stored JSON values at a time. Excluding the returned unique-label set, process memory MUST be `O(MONOIZE_DASHBOARD_GROUP_SCAN_BATCH_ROWS)` and MUST NOT depend on source-table row count.

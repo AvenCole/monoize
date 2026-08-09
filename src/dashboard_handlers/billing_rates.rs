@@ -114,11 +114,17 @@ pub async fn update_pricing_profile_patterns(
             ));
         }
     }
+    let _update_guard = state.settings_update_lock.lock().await;
     state
         .settings_store
         .set_pricing_profile_model_patterns(&body.patterns)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    state
+        .monoize_runtime
+        .write()
+        .await
+        .pricing_profile_model_patterns = body.patterns.clone();
     Ok(Json(PricingProfilePatternsResponse {
         patterns: body.patterns,
     }))

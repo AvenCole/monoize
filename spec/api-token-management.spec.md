@@ -15,7 +15,7 @@ An API key row has:
 - `user_id: string`
 - `name: string`
 - `key_prefix: string` (first 12 characters of the full key; display only and never an authentication or cache identity)
-- `key_hash: string` (reserved; currently not used for runtime validation)
+- `key_hash: string` (deterministic complete-token lookup hash; acceptance still requires full-token equality)
 - `key: string` (the full key, stored for display)
 - `created_at: RFC3339 string`
 - `expires_at: RFC3339 string?`
@@ -51,6 +51,22 @@ TM-GRP-5. On API key create/update, subset validation against the owning user's 
 TM-GRP-6. API key create/update requests that violate TM-GRP-5 MUST be rejected with HTTP `400` and code `invalid_request`.
 
 TM-GRP-7. If a stored API key row has `allowed_groups` absent, null, empty string, or serialized empty array, runtime MUST treat it as `[]` for backward compatibility.
+
+TM-IP-1. Every non-empty `ip_whitelist` entry on create or update MUST parse as either an exact IPv4/IPv6 address or an IPv4/IPv6 CIDR network. Any invalid entry MUST reject the mutation with HTTP `400` and code `invalid_request`.
+
+TM-IP-2. The server MUST persist exact addresses and CIDR networks in their canonical string representation. It MUST trim entries, deduplicate canonical duplicates, and preserve exact-address entries as addresses rather than converting them to host-prefix CIDRs.
+
+TM-STORAGE-1. API-key dashboard reads and forwarding authentication MUST fail with a storage error when a persisted `model_limits`, `ip_whitelist`, `transforms`, or `model_redirects` value is malformed JSON, is not an array of the declared element type, or has an incompatible database type. They MUST NOT substitute an empty array.
+
+TM-STORAGE-2. Persisted `enabled`, `sub_account_enabled`, `model_limits_enabled`, and `reasoning_envelope_enabled` values MUST be integer `0` or integer `1`. A null value, incompatible database type, or any other integer MUST fail the read. It MUST NOT be replaced by a default value.
+
+TM-STORAGE-3. `allowed_groups` compatibility is limited to TM-GRP-7. Any other malformed or wrongly typed persisted `allowed_groups` value MUST fail the read and MUST NOT be treated as unrestricted or inherited access.
+
+TM-STORAGE-4. A present, non-null `request_capture_mode` MUST equal `"off"`, `"capture-all"`, or `"capture-only-abnormal"`. Any other value or incompatible database type MUST fail the read instead of falling back to `request_capture_enabled` or `"off"`. An absent or null value retains the `"off"` compatibility behavior defined by `request-capture-dumps.spec.md` RCD-C8.
+
+TM-STORAGE-5. Every selected API-key and owning-user column MUST propagate an incompatible database type as a storage error. In particular, a failed `api_keys.key` decode MUST NOT become an empty token and a failed nullable `users.email` decode MUST NOT become null.
+
+TM-STORAGE-6. Every query that decodes a complete API-key record MUST select the owning user's role in the same point or set-based JOIN as `owner_role`. API-key row decoding MUST NOT issue a fallback user query when `owner_role` is absent, null, or malformed.
 
 ## 2. Endpoints
 
@@ -91,9 +107,11 @@ TM-CREATE-1. The generated full key MUST start with the literal prefix `sk-`.
 
 TM-CREATE-2. The server MUST compute `key_prefix` as the first 12 characters of the full key.
 
-TM-CREATE-3. The server MUST persist `key_hash` as a reserved compatibility field. Runtime token validation semantics are defined in `api-key-authentication.spec.md`.
+TM-CREATE-3. The server MUST persist the deterministic complete-token lookup hash in `key_hash`. Runtime token validation semantics are defined in `api-key-authentication.spec.md`.
 
 TM-CREATE-4. After successful key creation, there is no required cache invalidation side-effect because the new key does not exist in cache yet.
+
+TM-CREATE-5. `POST /api/dashboard/tokens` MUST read only the `api_key_max_per_user` setting. One process-local async critical section shared by every `UserStore` clone MUST contain both `COUNT(*) WHERE user_id = $1` and the key insert. If the count is at least the supplied positive limit, the store MUST perform no insert and the endpoint MUST return HTTP `403` with code `max_api_keys_reached`. Concurrent create requests in one process MUST never commit more than the configured number of keys for one user.
 
 ### 2.4 Update API key
 
@@ -179,7 +197,7 @@ TM-TF-10. The dashboard transform registry consumed by the API key editor MUST c
 
 TM-DEL-1. A successful API key delete MUST invalidate in-memory API key cache entries for the deleted key id before returning the response.
 
-TM-DEL-2. A successful user delete MUST remove every cascaded API key id from the in-memory API-key name cache before returning the response.
+TM-DEL-2. Monoize MUST NOT maintain an API-key name cache. A successful user delete MUST invalidate authentication-cache entries for the deleted user's keys through the user-id reverse index before returning the response.
 
 ### 2.6 Batch delete API keys
 
@@ -190,6 +208,22 @@ TM-DEL-2. A successful user delete MUST remove every cascaded API key id from th
 - **Response:** `{ "success": true, "deleted_count": integer }`
 
 TM-BATCH-1. A successful batch delete MUST invalidate in-memory API key cache entries for all deleted key ids before returning the response.
+
+TM-BATCH-2. Batch-delete ownership filtering MUST be performed by a set-based database query constrained by both current-user id and requested key ids. It MUST NOT list every key owned by the user or issue one ownership query per requested id.
+
+TM-BATCH-3. `MONOIZE_API_KEY_BATCH_DELETE_MAX_IDS` MUST configure the positive maximum number of ids accepted by one batch-delete request or store call. Missing, zero, invalid, negative, or overflowing values MUST use `400`. A parsed value above `400` MUST be clamped to `400` so every supported SQLite build remains below its bind-variable limit.
+
+TM-BATCH-4. The HTTP endpoint MUST reject a request containing more than TM-BATCH-3 ids with HTTP `400` before an ownership query. Store ownership filtering and transactional batch deletion MUST independently reject an input above the same limit. Every dynamic `IN` list in these paths MUST therefore contain at most 400 values.
+
+## Startup Transform-ID Migration
+
+TM-MIG-1. API-key transform-rule id canonicalization MUST use the persistent `system_settings` marker `migration.api_key_transform_rule_ids.v1`. When the marker value is `complete`, startup MUST perform only the marker point query and MUST NOT scan `api_keys`.
+
+TM-MIG-2. When the marker is absent, one process MUST process API-key transform rows in ascending-ID keyset batches of at most 300 rows. Each batch MUST select, canonicalize, update changed rows through at most one CASE statement, and commit before the next batch begins. Memory use and one transaction's row count MUST remain bounded by 300. Invalid transform JSON MUST remain unchanged and MUST NOT prevent progress. The completion marker MUST be written in a separate final transaction only after every batch commits. A restart before the marker is written MAY re-read canonicalized rows and MUST converge without changing their values.
+
+TM-QUERY-1. The create limit check MUST use `COUNT(*) WHERE user_id = current_user_id`; it MUST NOT decode every API-key row. The count and insert MUST satisfy TM-CREATE-5.
+
+TM-QUERY-2. Get, update, and delete ownership checks MUST query by both `id` and `user_id`; they MUST NOT list every API key owned by the current user.
 
 ## 3. Runtime sub-account cache coherence
 

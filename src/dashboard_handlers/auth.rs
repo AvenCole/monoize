@@ -3,7 +3,7 @@ use crate::dashboard_handlers::session_helpers::{
     get_current_user, is_reserved_internal_username, is_valid_username,
 };
 use crate::error::{AppError, AppResult};
-use crate::users::{User, UserRole, format_nano_to_usd};
+use crate::users::{RegisterUserError, User, UserRole, format_nano_to_usd};
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -89,28 +89,6 @@ pub async fn register(
     let user_store = &state.user_store;
     let settings_store = &state.settings_store;
 
-    let user_count = user_store
-        .user_count()
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    let is_first_user = user_count == 0;
-
-    if !is_first_user {
-        let registration_enabled = settings_store
-            .is_registration_enabled()
-            .await
-            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-        if !registration_enabled {
-            return Err(AppError::new(
-                StatusCode::FORBIDDEN,
-                "registration_disabled",
-                "user registration is currently disabled",
-            ));
-        }
-    }
-
     if !is_valid_username(&body.username) {
         return Err(AppError::new(
             StatusCode::BAD_REQUEST,
@@ -135,36 +113,35 @@ pub async fn register(
         ));
     }
 
-    if user_store
-        .get_user_by_username(&body.username)
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?
-        .is_some()
-    {
-        return Err(AppError::new(
-            StatusCode::CONFLICT,
-            "username_exists",
-            "username already exists",
-        ));
-    }
-
-    let role = if is_first_user {
-        UserRole::SuperAdmin
-    } else {
-        UserRole::User
-    };
-
-    let user = user_store
-        .create_user(&body.username, &body.password, role, &[])
+    let registration_enabled = settings_store
+        .is_registration_enabled()
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
+    let user = user_store
+        .register_user_atomic(&body.username, &body.password, registration_enabled)
+        .await
+        .map_err(|error| match error {
+            RegisterUserError::RegistrationDisabled => AppError::new(
+                StatusCode::FORBIDDEN,
+                "registration_disabled",
+                "user registration is currently disabled",
+            ),
+            RegisterUserError::UsernameExists => AppError::new(
+                StatusCode::CONFLICT,
+                "username_exists",
+                "username already exists",
+            ),
+            RegisterUserError::Storage(error) => {
+                AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error)
+            }
+        })?;
+
     let session_ttl_days = state
         .settings_store
-        .get_all()
+        .get_session_ttl_days()
         .await
-        .map(|s| s.session_ttl_days)
-        .unwrap_or(7);
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
     let session = user_store
         .create_session(&user.id, session_ttl_days)
@@ -237,10 +214,9 @@ pub async fn login(
 
     let session_ttl_days = state
         .settings_store
-        .get_all()
+        .get_session_ttl_days()
         .await
-        .map(|s| s.session_ttl_days)
-        .unwrap_or(7);
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
     let session = user_store
         .create_session(&user.id, session_ttl_days)
@@ -270,7 +246,10 @@ pub async fn logout(
 
     let user_store = &state.user_store;
 
-    user_store.delete_session(&token).await.ok();
+    user_store
+        .delete_session(&token)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
     let clear_cookie = clear_session_cookie();
     Ok((
@@ -321,17 +300,7 @@ pub async fn update_me(
 }
 
 fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().to_string())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim().to_string())
-        })
+    crate::client_ip::canonical_client_ip_from_headers(headers).map(|address| address.to_string())
 }
 
 fn build_session_cookie(token: &str, ttl_days: i64) -> String {

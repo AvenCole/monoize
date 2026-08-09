@@ -7,13 +7,13 @@ pub fn provider_presets() -> Value {
             "defaults": {
                 "base_url": "https://api.openai.com/v1",
                 "models": {
-                    "gpt-4.1": { "redirect": null, "multiplier": 1.0 },
-                    "gpt-4.1-mini": { "redirect": null, "multiplier": 1.0 },
-                    "gpt-4.1-nano": { "redirect": null, "multiplier": 1.0 },
-                    "o1": { "redirect": null, "multiplier": 1.0 },
-                    "o3": { "redirect": null, "multiplier": 1.0 },
-                    "o3-mini": { "redirect": null, "multiplier": 1.0 },
-                    "o4-mini": { "redirect": null, "multiplier": 1.0 }
+                    "gpt-4.1": { "redirect": null, "multiplier": "1" },
+                    "gpt-4.1-mini": { "redirect": null, "multiplier": "1" },
+                    "gpt-4.1-nano": { "redirect": null, "multiplier": "1" },
+                    "o1": { "redirect": null, "multiplier": "1" },
+                    "o3": { "redirect": null, "multiplier": "1" },
+                    "o3-mini": { "redirect": null, "multiplier": "1" },
+                    "o4-mini": { "redirect": null, "multiplier": "1" }
                 },
                 "transforms": [
                     {
@@ -31,8 +31,8 @@ pub fn provider_presets() -> Value {
             "defaults": {
                 "base_url": "https://api.anthropic.com/v1",
                 "models": {
-                    "claude-sonnet-4": { "redirect": "claude-sonnet-4-20250514", "multiplier": 1.0 },
-                    "claude-3.5-haiku": { "redirect": "claude-3-5-haiku-20241022", "multiplier": 1.0 }
+                    "claude-sonnet-4": { "redirect": "claude-sonnet-4-20250514", "multiplier": "1" },
+                    "claude-3.5-haiku": { "redirect": "claude-3-5-haiku-20241022", "multiplier": "1" }
                 },
                 "transforms": [
                     {
@@ -50,8 +50,8 @@ pub fn provider_presets() -> Value {
             "defaults": {
                 "base_url": "https://api.deepseek.com/v1",
                 "models": {
-                    "deepseek-r1": { "redirect": "deepseek-reasoner", "multiplier": 1.0 },
-                    "deepseek-v3": { "redirect": "deepseek-chat", "multiplier": 1.0 }
+                    "deepseek-r1": { "redirect": "deepseek-reasoner", "multiplier": "1" },
+                    "deepseek-v3": { "redirect": "deepseek-chat", "multiplier": "1" }
                 },
                 "transforms": []
             }
@@ -61,8 +61,8 @@ pub fn provider_presets() -> Value {
             "defaults": {
                 "base_url": "https://generativelanguage.googleapis.com/v1beta",
                 "models": {
-                    "gemini-2.5-pro": { "redirect": null, "multiplier": 1.0 },
-                    "gemini-2.5-flash": { "redirect": null, "multiplier": 1.0 }
+                    "gemini-2.5-pro": { "redirect": null, "multiplier": "1" },
+                    "gemini-2.5-flash": { "redirect": null, "multiplier": "1" }
                 },
                 "transforms": []
             }
@@ -72,8 +72,8 @@ pub fn provider_presets() -> Value {
             "defaults": {
                 "base_url": "https://api.x.ai",
                 "models": {
-                    "grok-4": { "redirect": null, "multiplier": 1.0 },
-                    "grok-3": { "redirect": null, "multiplier": 1.0 }
+                    "grok-4": { "redirect": null, "multiplier": "1" },
+                    "grok-3": { "redirect": null, "multiplier": "1" }
                 },
                 "transforms": []
             }
@@ -134,5 +134,18 @@ mod tests {
             grok["defaults"]["base_url"].as_str(),
             Some("https://api.x.ai")
         );
+    }
+
+    #[test]
+    fn provider_preset_model_multipliers_use_canonical_decimal_strings() {
+        let presets = provider_presets();
+        for preset in presets.as_array().expect("provider presets array") {
+            let models = preset["defaults"]["models"]
+                .as_object()
+                .expect("provider preset models object");
+            for model in models.values() {
+                assert_eq!(model["multiplier"].as_str(), Some("1"));
+            }
+        }
     }
 }

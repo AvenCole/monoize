@@ -45,15 +45,131 @@ fn default_logs_limit() -> i64 {
     50
 }
 
+fn validate_request_log_model_filter(query: &RequestLogsQuery) -> AppResult<()> {
+    crate::users::UserStore::validate_request_log_model_filter(query.model.as_deref()).map_err(
+        |message| {
+            AppError::new(
+                StatusCode::BAD_REQUEST,
+                "request_log_model_filter_too_many_terms",
+                message,
+            )
+            .with_param("model")
+        },
+    )
+}
+
+fn validate_request_log_time_filters(query: &RequestLogsQuery) -> AppResult<()> {
+    let parse = |name: &'static str, value: Option<&str>| {
+        value
+            .map(|value| {
+                chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+                    AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_time_filter",
+                        format!("{name} must be an RFC 3339 timestamp"),
+                    )
+                    .with_param(name)
+                })
+            })
+            .transpose()
+    };
+    let time_from = parse("time_from", query.time_from.as_deref())?;
+    let time_to = parse("time_to", query.time_to.as_deref())?;
+    if time_from.zip(time_to).is_some_and(|(from, to)| from >= to) {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_time_filter",
+            "time_from must be earlier than time_to",
+        )
+        .with_param("time_from"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod request_log_query_tests {
+    use super::{
+        RequestLogsQuery, SseConnectionGuard, validate_request_log_model_filter,
+        validate_request_log_time_filters,
+    };
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn query(time_from: Option<&str>, time_to: Option<&str>) -> RequestLogsQuery {
+        RequestLogsQuery {
+            limit: 50,
+            offset: 0,
+            model: None,
+            status: None,
+            api_key_id: None,
+            username: None,
+            search: None,
+            time_from: time_from.map(str::to_string),
+            time_to: time_to.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn malformed_and_reversed_time_filters_are_bad_requests() {
+        let malformed = validate_request_log_time_filters(&query(Some("bad"), None)).unwrap_err();
+        assert_eq!(malformed.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(malformed.code, "invalid_time_filter");
+        assert_eq!(malformed.param.as_deref(), Some("time_from"));
+
+        let reversed = validate_request_log_time_filters(&query(
+            Some("2024-01-02T00:00:00Z"),
+            Some("2024-01-01T00:00:00Z"),
+        ))
+        .unwrap_err();
+        assert_eq!(reversed.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(reversed.param.as_deref(), Some("time_from"));
+    }
+
+    #[test]
+    fn over_limit_model_filter_is_a_bad_request() {
+        let mut query = query(None, None);
+        query.model = Some(
+            (0..33)
+                .map(|term| format!("model-{term}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let error = validate_request_log_model_filter(&query).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(error.code, "request_log_model_filter_too_many_terms");
+        assert_eq!(error.param.as_deref(), Some("model"));
+    }
+
+    #[test]
+    fn sse_counter_entry_is_removed_without_decrementing_a_replacement() {
+        let connections = Arc::new(DashMap::new());
+        let counter = Arc::new(AtomicUsize::new(1));
+        connections.insert("user-1".to_string(), counter.clone());
+        let replacement = Arc::new(AtomicUsize::new(1));
+        connections.insert("user-1".to_string(), replacement.clone());
+        drop(SseConnectionGuard {
+            user_id: "user-1".to_string(),
+            connections: connections.clone(),
+            counter,
+        });
+        let current = connections.get("user-1").expect("replacement remains");
+        assert!(Arc::ptr_eq(current.value(), &replacement));
+        assert_eq!(current.value().load(Ordering::Relaxed), 1);
+    }
+}
+
 pub async fn list_my_request_logs(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<RequestLogsQuery>,
 ) -> AppResult<impl IntoResponse> {
+    validate_request_log_model_filter(&query)?;
     let user = get_current_user(&headers, &state).await?;
+    validate_request_log_time_filters(&query)?;
     let limit = query.limit.clamp(1, 200);
     let offset = query.offset.max(0);
-    let (mut logs, total, total_charge_nano_usd) = if user.role.can_manage_users() {
+    let (logs, total, total_charge_nano_usd) = if user.role.can_manage_users() {
         state
             .user_store
             .list_all_request_logs(
@@ -85,27 +201,6 @@ pub async fn list_my_request_logs(
             .await
     }
     .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    for log in &mut logs {
-        if log.provider.name.is_none()
-            && let Some(ref id) = log.provider.id
-        {
-            log.provider.name = state.name_caches.get_provider_name(id);
-        }
-        if log.channel.name.is_none()
-            && let Some(ref id) = log.channel.id
-        {
-            log.channel.name = state.name_caches.get_channel_name(id);
-        }
-        if log.user.username.is_none() {
-            log.user.username = state.name_caches.get_username(&log.user.id);
-        }
-        if log.api_key.name.is_none()
-            && let Some(ref id) = log.api_key.id
-        {
-            log.api_key.name = state.name_caches.get_api_key_name(id);
-        }
-    }
 
     Ok(Json(json!({
         "data": logs,
@@ -150,8 +245,6 @@ pub async fn get_dashboard_analytics(
         .and_utc()
         .to_rfc3339();
 
-    let bucket_width_days = (range_hours as f64) / (buckets as f64) / 24.0;
-
     let user_id_filter: Option<String> = if user.role.can_manage_users() {
         None
     } else {
@@ -166,7 +259,6 @@ pub async fn get_dashboard_analytics(
             &time_to,
             &today_start,
             buckets,
-            bucket_width_days,
         )
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
@@ -258,22 +350,27 @@ pub async fn get_dashboard_analytics(
 /// ensuring no counter leaks even if the stream is abruptly cancelled.
 struct SseConnectionGuard {
     user_id: String,
-    connections: Arc<DashMap<String, AtomicUsize>>,
+    connections: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    counter: Arc<AtomicUsize>,
 }
 
 impl Drop for SseConnectionGuard {
     fn drop(&mut self) {
-        if let Some(entry) = self.connections.get(&self.user_id) {
-            let prev = entry.value().fetch_sub(1, Ordering::Relaxed);
-            if prev <= 1 {
-                drop(entry);
-                self.connections.remove(&self.user_id);
-            }
+        if self.counter.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.connections.remove_if(&self.user_id, |_, current| {
+                Arc::ptr_eq(current, &self.counter) && current.load(Ordering::Acquire) == 0
+            });
         }
     }
 }
 
-const MAX_SSE_CONNECTIONS_PER_USER: usize = 5;
+fn max_sse_connections_per_user() -> usize {
+    std::env::var("MONOIZE_REQUEST_LOG_SSE_MAX_CONNECTIONS_PER_USER")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5)
+}
 
 pub async fn stream_request_logs(
     State(state): State<AppState>,
@@ -287,13 +384,15 @@ pub async fn stream_request_logs(
     let entry = state
         .sse_connections
         .entry(user_id.clone())
-        .or_insert_with(|| AtomicUsize::new(0));
-    let current = entry.value().fetch_add(1, Ordering::Relaxed);
+        .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
+    let counter = entry.value().clone();
+    let current = counter.fetch_add(1, Ordering::AcqRel);
     drop(entry);
-    if current >= MAX_SSE_CONNECTIONS_PER_USER {
-        // Undo the speculative increment
-        if let Some(e) = state.sse_connections.get(&user_id) {
-            e.value().fetch_sub(1, Ordering::Relaxed);
+    if current >= max_sse_connections_per_user() {
+        if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
+            state.sse_connections.remove_if(&user_id, |_, current| {
+                Arc::ptr_eq(current, &counter) && current.load(Ordering::Acquire) == 0
+            });
         }
         return Err(AppError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -305,10 +404,9 @@ pub async fn stream_request_logs(
     let guard = SseConnectionGuard {
         user_id: user_id.clone(),
         connections: state.sse_connections.clone(),
+        counter,
     };
 
-    let name_caches = state.name_caches.clone();
-    let api_key_cache = state.user_store.api_key_cache.clone();
     let receiver = state.log_broadcast.subscribe();
 
     let mut initial_pending: Vec<_> = state
@@ -322,8 +420,8 @@ pub async fn stream_request_logs(
         Event::default().comment("ready")
     } else {
         let enriched_batch: Vec<_> = initial_pending
-            .iter()
-            .map(|log| name_caches.enrich_log(log, &api_key_cache))
+            .into_iter()
+            .map(|log| log.to_request_log_row())
             .collect();
         match serde_json::to_string(&enriched_batch) {
             Ok(payload) => Event::default().event("log_batch").data(payload),
@@ -332,15 +430,8 @@ pub async fn stream_request_logs(
     };
 
     let live_stream = stream::unfold(
-        (
-            receiver,
-            name_caches,
-            api_key_cache,
-            is_admin,
-            user_id,
-            guard,
-        ),
-        |(mut receiver, name_caches, api_key_cache, is_admin, user_id, guard)| async move {
+        (receiver, is_admin, user_id, guard),
+        |(mut receiver, is_admin, user_id, guard)| async move {
             loop {
                 match receiver.recv().await {
                     Ok(batch) => {
@@ -356,8 +447,8 @@ pub async fn stream_request_logs(
                             continue;
                         }
                         let enriched_batch: Vec<_> = filtered
-                            .iter()
-                            .map(|log| name_caches.enrich_log(log, &api_key_cache))
+                            .into_iter()
+                            .map(|log| log.to_request_log_row())
                             .collect();
                         let event = match serde_json::to_string(&enriched_batch) {
                             Ok(payload) => Event::default().event("log_batch").data(payload),
@@ -365,28 +456,14 @@ pub async fn stream_request_logs(
                         };
                         return Some((
                             Ok::<Event, Infallible>(event),
-                            (
-                                receiver,
-                                name_caches,
-                                api_key_cache,
-                                is_admin,
-                                user_id,
-                                guard,
-                            ),
+                            (receiver, is_admin, user_id, guard),
                         ));
                     }
                     Err(RecvError::Lagged(_)) => {
                         let event = Event::default().event("resync").data("{}");
                         return Some((
                             Ok::<Event, Infallible>(event),
-                            (
-                                receiver,
-                                name_caches,
-                                api_key_cache,
-                                is_admin,
-                                user_id,
-                                guard,
-                            ),
+                            (receiver, is_admin, user_id, guard),
                         ));
                     }
                     Err(RecvError::Closed) => return None,

@@ -5,12 +5,17 @@ use super::{
     UserStore,
 };
 use chrono::{Duration, Utc};
-use sea_orm::ConnectionTrait;
 use sea_orm::Value as SeaValue;
+use sea_orm::{AccessMode, ConnectionTrait, IsolationLevel, TransactionTrait};
 use serde_json::Value;
 
 const REQUEST_LOG_RETENTION_DAYS: i64 = 90;
 pub(super) const REQUEST_LOG_RETENTION_INTERVAL_SECS: u64 = 3600;
+const REQUEST_LOG_MODEL_FILTER_DEFAULT_MAX_TERMS: usize = 32;
+const REQUEST_LOG_MODEL_FILTER_HARD_MAX_TERMS: usize = 32;
+const REQUEST_LOG_MODEL_FILTER_MAX_TERMS_ENV: &str = "MONOIZE_REQUEST_LOG_MODEL_FILTER_MAX_TERMS";
+const ASCII_UPPERCASE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const ASCII_LOWERCASE: &str = "abcdefghijklmnopqrstuvwxyz";
 
 fn normalize_request_log_filter(value: Option<&str>) -> Option<String> {
     value
@@ -19,77 +24,846 @@ fn normalize_request_log_filter(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn parse_optional_json_text(value: Option<String>) -> Option<Value> {
-    value.and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+fn request_log_model_filter_max_terms_from_raw(raw: Option<&str>) -> usize {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=REQUEST_LOG_MODEL_FILTER_HARD_MAX_TERMS).contains(value))
+        .unwrap_or(REQUEST_LOG_MODEL_FILTER_DEFAULT_MAX_TERMS)
 }
 
-fn request_log_time_filter_column() -> &'static str {
-    "COALESCE(rl.created_at_unix_ms, -9223372036854775808)"
+fn request_log_model_filter_max_terms() -> usize {
+    let raw = std::env::var(REQUEST_LOG_MODEL_FILTER_MAX_TERMS_ENV).ok();
+    request_log_model_filter_max_terms_from_raw(raw.as_deref())
 }
 
-fn row_optional_i64(row: &sea_orm::QueryResult, col: &str) -> Option<i64> {
-    row.try_get::<Option<i64>>("", col)
-        .ok()
-        .flatten()
-        .or_else(|| {
-            row.try_get::<Option<i32>>("", col)
-                .ok()
-                .flatten()
-                .map(i64::from)
-        })
-}
-
-fn add_charge_text(total: &mut i128, raw: Option<&str>) -> Result<(), String> {
-    let Some(raw) = raw else {
-        return Ok(());
-    };
-    let trimmed = raw.trim();
-    let (negative, digits) = match trimmed.strip_prefix('-') {
-        Some(digits) => (true, digits),
-        None => (false, trimmed),
-    };
-    if raw != trimmed
-        || digits.is_empty()
-        || !digits.bytes().all(|byte| byte.is_ascii_digit())
-        || (digits.len() > 1 && digits.starts_with('0'))
-        || (negative && digits == "0")
-    {
-        return Ok(());
+fn validate_request_log_model_filter_with_limit(
+    model: Option<&str>,
+    max_terms: usize,
+) -> Result<(), String> {
+    let over_limit = model.is_some_and(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+            .take(max_terms.saturating_add(1))
+            .count()
+            > max_terms
+    });
+    if over_limit {
+        return Err(format!(
+            "request log model filter exceeds the maximum of {max_terms} terms"
+        ));
     }
-    let charge = trimmed
-        .parse::<i128>()
-        .map_err(|_| "request log charge is outside the signed i128 domain".to_string())?;
-    if charge.to_string() != trimmed {
-        return Ok(());
-    }
-    *total = total
-        .checked_add(charge)
-        .ok_or_else(|| "request log charge aggregate overflow".to_string())?;
     Ok(())
 }
 
-fn sum_charge_rows(rows: Vec<sea_orm::QueryResult>) -> Result<String, String> {
-    let mut total = 0i128;
-    for row in rows {
-        let raw = row
-            .try_get::<Option<String>>("", "charge_nano_usd")
+fn validate_request_log_model_filter(model: Option<&str>) -> Result<(), String> {
+    validate_request_log_model_filter_with_limit(model, request_log_model_filter_max_terms())
+}
+
+fn parse_optional_json_text(value: Option<String>, column: &str) -> Result<Option<Value>, String> {
+    value
+        .map(|raw| {
+            serde_json::from_str::<Value>(&raw)
+                .map_err(|error| format!("request_logs.{column}: {error}"))
+        })
+        .transpose()
+}
+
+fn escape_like_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn ascii_folded_like_pattern(value: &str) -> String {
+    format!("%{}%", escape_like_literal(&value.to_ascii_lowercase()))
+}
+
+fn ascii_folded_sql_expression(column: &str, is_postgres: bool) -> String {
+    if is_postgres {
+        format!("translate({column}, '{ASCII_UPPERCASE}', '{ASCII_LOWERCASE}')")
+    } else {
+        format!("LOWER({column})")
+    }
+}
+
+fn request_log_row_value<T: sea_orm::TryGetable>(
+    row: &sea_orm::QueryResult,
+    column: &str,
+) -> Result<T, String> {
+    row.try_get("", column)
+        .map_err(|error| format!("request_logs.{column}: {error}"))
+}
+
+fn row_optional_i64(row: &sea_orm::QueryResult, column: &str) -> Result<Option<i64>, String> {
+    match row.try_get::<Option<i64>>("", column) {
+        Ok(value) => Ok(value),
+        Err(i64_error) => row
+            .try_get::<Option<i32>>("", column)
+            .map(|value| value.map(i64::from))
+            .map_err(|i32_error| {
+                format!(
+                    "request_logs.{column}: BIGINT decode failed ({i64_error}); INTEGER decode failed ({i32_error})"
+                )
+            }),
+    }
+}
+
+fn charge_aggregate_columns(is_postgres: bool) -> String {
+    let digits = "(CASE WHEN SUBSTR(rl.charge_nano_usd, 1, 1) = '-' THEN SUBSTR(rl.charge_nano_usd, 2) ELSE rl.charge_nano_usd END)";
+    let canonical = if is_postgres {
+        "rl.charge_nano_usd ~ '^-?(0|[1-9][0-9]*)$'".to_string()
+    } else {
+        format!(
+            "(rl.charge_nano_usd = '0' OR (SUBSTR(rl.charge_nano_usd, 1, 1) BETWEEN '1' AND '9' AND rl.charge_nano_usd NOT GLOB '*[^0-9]*') OR (SUBSTR(rl.charge_nano_usd, 1, 1) = '-' AND SUBSTR(rl.charge_nano_usd, 2, 1) BETWEEN '1' AND '9' AND {digits} NOT GLOB '*[^0-9]*'))"
+        )
+    };
+    let in_range = format!(
+        "(LENGTH({digits}) < 39 OR (LENGTH({digits}) = 39 AND ((SUBSTR(rl.charge_nano_usd, 1, 1) = '-' AND {digits} <= '170141183460469231731687303715884105728') OR (SUBSTR(rl.charge_nano_usd, 1, 1) <> '-' AND {digits} <= '170141183460469231731687303715884105727'))))"
+    );
+
+    if is_postgres {
+        return format!(
+            "COALESCE(SUM(CASE WHEN {canonical} AND {in_range} THEN CAST(rl.charge_nano_usd AS NUMERIC) ELSE 0 END), 0)::TEXT AS total_charge_nano_usd, COUNT(CASE WHEN {canonical} AND NOT {in_range} THEN 1 END) AS out_of_range_count"
+        );
+    }
+
+    let padded = format!("('000000000000000000000000000000000000000000000' || {digits})");
+    let sign = "(CASE WHEN SUBSTR(rl.charge_nano_usd, 1, 1) = '-' THEN -1 ELSE 1 END)";
+    let mut select = String::new();
+    for limb in 0..5 {
+        if limb > 0 {
+            select.push_str(", ");
+        }
+        let start = -9 * (limb + 1);
+        select.push_str(&format!(
+            "COALESCE(SUM(CASE WHEN {canonical} AND {in_range} THEN {sign} * CAST(SUBSTR({padded}, {start}, 9) AS INTEGER) ELSE 0 END), 0) AS charge_limb_{limb}"
+        ));
+    }
+    select.push_str(&format!(
+        ", COUNT(CASE WHEN {canonical} AND NOT {in_range} THEN 1 END) AS out_of_range_count"
+    ));
+    select
+}
+
+fn charge_aggregate_select(is_postgres: bool) -> String {
+    format!("SELECT {}", charge_aggregate_columns(is_postgres))
+}
+
+fn decode_charge_aggregate(
+    row: &sea_orm::QueryResult,
+    is_postgres: bool,
+) -> Result<String, String> {
+    let out_of_range: i64 = row
+        .try_get("", "out_of_range_count")
+        .map_err(|e| e.to_string())?;
+    if out_of_range != 0 {
+        return Err("request log charge is outside the signed i128 domain".to_string());
+    }
+    if is_postgres {
+        let total: String = row
+            .try_get("", "total_charge_nano_usd")
             .map_err(|e| e.to_string())?;
-        add_charge_text(&mut total, raw.as_deref())?;
+        return total
+            .parse::<i128>()
+            .map(|value| value.to_string())
+            .map_err(|_| "request log charge aggregate overflow".to_string());
+    }
+
+    let mut total = 0i128;
+    let mut scale = 1i128;
+    for limb in 0..5 {
+        let value: i64 = row
+            .try_get("", &format!("charge_limb_{limb}"))
+            .map_err(|e| e.to_string())?;
+        total = total
+            .checked_add(
+                i128::from(value)
+                    .checked_mul(scale)
+                    .ok_or_else(|| "request log charge aggregate overflow".to_string())?,
+            )
+            .ok_or_else(|| "request log charge aggregate overflow".to_string())?;
+        if limb < 4 {
+            scale = scale
+                .checked_mul(1_000_000_000)
+                .ok_or_else(|| "request log charge aggregate overflow".to_string())?;
+        }
     }
     Ok(total.to_string())
 }
 
+fn analytics_bucket_expr(is_sqlite: bool) -> &'static str {
+    if is_sqlite {
+        "CAST(((rl.created_at_unix_ms - $1) * $2) / $3 AS BIGINT)"
+    } else {
+        "FLOOR(((rl.created_at_unix_ms - $1)::NUMERIC * $2) / $3)::BIGINT"
+    }
+}
+
+fn analytics_model_bucket_sql(is_sqlite: bool, user_scoped: bool) -> String {
+    let bucket_expr = analytics_bucket_expr(is_sqlite);
+    let charge_columns = charge_aggregate_columns(!is_sqlite);
+    let user_filter = if user_scoped {
+        " AND rl.user_id = $6"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT {bucket_expr} AS bucket_idx, rl.model, {charge_columns}, COUNT(*) AS call_count \
+         FROM request_logs rl \
+         WHERE rl.created_at_unix_ms >= $4 AND rl.created_at_unix_ms < $5{user_filter} \
+         GROUP BY bucket_idx, rl.model \
+         ORDER BY bucket_idx, rl.model"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::add_charge_text;
+    use super::{
+        analytics_bucket_expr, analytics_model_bucket_sql, append_request_log_filters,
+        ascii_folded_like_pattern, charge_aggregate_select, decode_charge_aggregate,
+        escape_like_literal, request_log_model_filter_max_terms_from_raw,
+        validate_request_log_model_filter_with_limit,
+    };
+    use crate::db::DbPool;
+    use sea_orm::{ConnectionTrait, TransactionTrait, Value as SeaValue};
 
     #[test]
-    fn charge_aggregation_exceeds_i64_without_losing_precision() {
-        let mut total = 0i128;
-        add_charge_text(&mut total, Some("9223372036854775807")).unwrap();
-        add_charge_text(&mut total, Some("1")).unwrap();
-        add_charge_text(&mut total, Some("+1")).unwrap();
-        assert_eq!(total.to_string(), "9223372036854775808");
+    fn like_literals_escape_wildcards_and_escape_character() {
+        assert_eq!(escape_like_literal(r"A%_\\B"), r"A\%\_\\\\B");
+        assert_eq!(ascii_folded_like_pattern("CAFÉ"), "%cafÉ%");
+    }
+
+    #[test]
+    fn postgres_filters_use_ascii_translate_and_prefold_bind_values() {
+        let mut sql = "SELECT 1 FROM request_logs rl WHERE 1 = 1".to_string();
+        let mut values = Vec::new();
+        let mut idx = 1;
+        append_request_log_filters(
+            &mut sql,
+            &mut values,
+            &mut idx,
+            true,
+            Some("CAFé"),
+            None,
+            None,
+            None,
+            Some("cafÉ"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(sql.contains("translate(rl.model"));
+        assert!(sql.contains("translate(rl.upstream_model"));
+        assert!(!sql.contains("LOWER("));
+        assert_eq!(idx, 6);
+        let SeaValue::String(Some(model_pattern)) = &values[0] else {
+            panic!("model filter must bind text");
+        };
+        assert_eq!(model_pattern.as_str(), "%café%");
+        for value in &values[1..] {
+            let SeaValue::String(Some(search_pattern)) = value else {
+                panic!("search filter must bind text");
+            };
+            assert_eq!(search_pattern.as_str(), "%cafÉ%");
+        }
+    }
+
+    #[test]
+    fn model_filter_limit_configuration_is_positive_and_hard_capped() {
+        assert_eq!(request_log_model_filter_max_terms_from_raw(None), 32);
+        assert_eq!(request_log_model_filter_max_terms_from_raw(Some("")), 32);
+        assert_eq!(request_log_model_filter_max_terms_from_raw(Some(" 7 ")), 7);
+        assert_eq!(request_log_model_filter_max_terms_from_raw(Some("0")), 32);
+        assert_eq!(request_log_model_filter_max_terms_from_raw(Some("-1")), 32);
+        assert_eq!(request_log_model_filter_max_terms_from_raw(Some("33")), 32);
+        assert_eq!(request_log_model_filter_max_terms_from_raw(Some("bad")), 32);
+    }
+
+    #[test]
+    fn model_filter_limit_counts_nonempty_and_duplicate_terms() {
+        assert!(
+            validate_request_log_model_filter_with_limit(Some("a, ,b"), 2).is_ok(),
+            "empty terms are discarded"
+        );
+        assert!(
+            validate_request_log_model_filter_with_limit(Some("a,a,b"), 2).is_err(),
+            "duplicate terms still create predicates"
+        );
+
+        let mut sql = "SELECT 1 FROM request_logs rl WHERE 1 = 1".to_string();
+        let mut values = Vec::new();
+        let mut idx = 1;
+        let over_limit = (0..33)
+            .map(|term| format!("model-{term}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            append_request_log_filters(
+                &mut sql,
+                &mut values,
+                &mut idx,
+                false,
+                Some(&over_limit),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(sql, "SELECT 1 FROM request_logs rl WHERE 1 = 1");
+        assert!(values.is_empty());
+        assert_eq!(idx, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_charge_aggregate_is_exact_and_ignores_noncanonical_text() {
+        let db = DbPool::connect("sqlite::memory:").await.unwrap();
+        db.write()
+            .await
+            .execute_unprepared("CREATE TABLE request_logs (charge_nano_usd TEXT)")
+            .await
+            .unwrap();
+        for value in [
+            "9223372036854775807",
+            "1",
+            "170141183460469231731687303715884105727",
+            "-170141183460469231731687303715884105728",
+            "+9",
+            "01",
+        ] {
+            db.write()
+                .await
+                .execute(db.stmt(
+                    "INSERT INTO request_logs (charge_nano_usd) VALUES ($1)",
+                    vec![value.into()],
+                ))
+                .await
+                .unwrap();
+        }
+
+        let row = db
+            .read()
+            .query_one(db.stmt(
+                &format!("{} FROM request_logs rl", charge_aggregate_select(false)),
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_charge_aggregate(&row, false).unwrap(),
+            "9223372036854775807"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_charge_aggregate_rejects_canonical_value_outside_i128() {
+        let db = DbPool::connect("sqlite::memory:").await.unwrap();
+        db.write()
+            .await
+            .execute_unprepared("CREATE TABLE request_logs (charge_nano_usd TEXT)")
+            .await
+            .unwrap();
+        db.write()
+            .await
+            .execute(db.stmt(
+                "INSERT INTO request_logs (charge_nano_usd) VALUES ($1)",
+                vec!["170141183460469231731687303715884105728".into()],
+            ))
+            .await
+            .unwrap();
+
+        let row = db
+            .read()
+            .query_one(db.stmt(
+                &format!("{} FROM request_logs rl", charge_aggregate_select(false)),
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_charge_aggregate(&row, false).unwrap_err(),
+            "request log charge is outside the signed i128 domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_analytics_model_buckets_group_and_decode_exact_charges() {
+        let db = DbPool::connect("sqlite::memory:").await.unwrap();
+        db.write()
+            .await
+            .execute_unprepared(
+                "CREATE TABLE request_logs (created_at_unix_ms INTEGER NOT NULL, model TEXT NOT NULL, charge_nano_usd TEXT, user_id TEXT)",
+            )
+            .await
+            .unwrap();
+        for (created_at_unix_ms, model, charge, user_id) in [
+            (100_i64, "exact", "9223372036854775807", "u1"),
+            (200_i64, "exact", "1", "u1"),
+            (300_i64, "exact", "+9", "u1"),
+            (
+                400_i64,
+                "out-of-range",
+                "170141183460469231731687303715884105728",
+                "u1",
+            ),
+            (
+                600_i64,
+                "overflow",
+                "170141183460469231731687303715884105727",
+                "u1",
+            ),
+            (700_i64, "overflow", "1", "u1"),
+            (100_i64, "excluded", "99", "u2"),
+        ] {
+            db.write()
+                .await
+                .execute(db.stmt(
+                    "INSERT INTO request_logs (created_at_unix_ms, model, charge_nano_usd, user_id) VALUES ($1, $2, $3, $4)",
+                    vec![
+                        created_at_unix_ms.into(),
+                        model.into(),
+                        charge.into(),
+                        user_id.into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+        }
+
+        let sql = analytics_model_bucket_sql(true, true);
+        assert!(sql.contains("GROUP BY bucket_idx, rl.model"));
+        assert!(!sql.contains("SELECT rl.created_at_unix_ms"));
+        let rows = db
+            .read()
+            .query_all(db.stmt(
+                &sql,
+                vec![
+                    0_i64.into(),
+                    2_i64.into(),
+                    1_000_i64.into(),
+                    0_i64.into(),
+                    1_000_i64.into(),
+                    "u1".into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        let mut groups = std::collections::BTreeMap::new();
+        for row in rows {
+            let model: String = row.try_get("", "model").unwrap();
+            let bucket_idx: i64 = row.try_get("", "bucket_idx").unwrap();
+            let call_count: i64 = row.try_get("", "call_count").unwrap();
+            groups.insert(
+                model,
+                (bucket_idx, call_count, decode_charge_aggregate(&row, false)),
+            );
+        }
+
+        assert_eq!(groups["exact"].0, 0);
+        assert_eq!(groups["exact"].1, 3);
+        assert_eq!(groups["exact"].2.as_deref().unwrap(), "9223372036854775808");
+        assert_eq!(
+            groups["out-of-range"].2.as_ref().unwrap_err(),
+            "request log charge is outside the signed i128 domain"
+        );
+        assert_eq!(groups["overflow"].0, 1);
+        assert_eq!(
+            groups["overflow"].2.as_ref().unwrap_err(),
+            "request log charge aggregate overflow"
+        );
+        assert!(!groups.contains_key("excluded"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_filters_fold_ascii_only_and_keep_non_ascii_case_distinct() {
+        let db = DbPool::connect("sqlite::memory:").await.unwrap();
+        db.write()
+            .await
+            .execute_unprepared(
+                "CREATE TABLE request_logs (model TEXT, upstream_model TEXT, request_id TEXT, request_ip TEXT, status TEXT, api_key_id TEXT, request_kind TEXT, user_id TEXT, created_at_unix_ms INTEGER, created_at TEXT)",
+            )
+            .await
+            .unwrap();
+        for model in ["CAFÉ", "café", "cafe"] {
+            db.write()
+                .await
+                .execute(db.stmt(
+                    "INSERT INTO request_logs (model, upstream_model, request_id, request_ip, created_at) VALUES ($1, '', '', '', '')",
+                    vec![model.into()],
+                ))
+                .await
+                .unwrap();
+        }
+
+        let mut model_sql = "SELECT model FROM request_logs rl WHERE 1 = 1".to_string();
+        let mut model_values = Vec::new();
+        let mut model_idx = 1;
+        append_request_log_filters(
+            &mut model_sql,
+            &mut model_values,
+            &mut model_idx,
+            false,
+            Some("CAFé"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let rows = db
+            .read()
+            .query_all(db.stmt(&model_sql, model_values))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<String>("", "model").unwrap(), "café");
+
+        let mut search_sql = "SELECT model FROM request_logs rl WHERE 1 = 1".to_string();
+        let mut search_values = Vec::new();
+        let mut search_idx = 1;
+        append_request_log_filters(
+            &mut search_sql,
+            &mut search_values,
+            &mut search_idx,
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some("cafÉ"),
+            None,
+            None,
+        )
+        .unwrap();
+        let rows = db
+            .read()
+            .query_all(db.stmt(&search_sql, search_values))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<String>("", "model").unwrap(), "CAFÉ");
+    }
+
+    #[tokio::test]
+    async fn sqlite_filters_are_literal_case_insensitive_and_include_legacy_time_rows() {
+        let db = DbPool::connect("sqlite::memory:").await.unwrap();
+        db.write()
+            .await
+            .execute_unprepared(
+                "CREATE TABLE request_logs (model TEXT, upstream_model TEXT, request_id TEXT, request_ip TEXT, status TEXT, api_key_id TEXT, request_kind TEXT, user_id TEXT, created_at_unix_ms INTEGER, created_at TEXT)",
+            )
+            .await
+            .unwrap();
+        for (model, unix_ms, created_at) in [
+            (
+                "GPT%_Model",
+                Some(1_704_067_200_000_i64),
+                "2024-01-01T00:00:00+00:00",
+            ),
+            (
+                "gptXXmodel",
+                Some(1_704_067_200_000_i64),
+                "2024-01-01T00:00:00+00:00",
+            ),
+            ("gPt%_mOdEl-legacy", None, "2024-01-01T00:30:00+00:00"),
+        ] {
+            db.write()
+                .await
+                .execute(db.stmt(
+                    "INSERT INTO request_logs (model, upstream_model, request_id, request_ip, created_at_unix_ms, created_at) VALUES ($1, '', '', '', $2, $3)",
+                    vec![model.into(), SeaValue::BigInt(unix_ms), created_at.into()],
+                ))
+                .await
+                .unwrap();
+        }
+
+        let mut sql = "SELECT model FROM request_logs rl WHERE 1 = 1".to_string();
+        let mut values = Vec::new();
+        let mut idx = 1;
+        append_request_log_filters(
+            &mut sql,
+            &mut values,
+            &mut idx,
+            false,
+            Some("gpt%_model"),
+            None,
+            None,
+            None,
+            None,
+            Some("2024-01-01T00:00:00Z"),
+            Some("2024-01-01T01:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(idx, values.len() + 1);
+        let rows = db.read().query_all(db.stmt(&sql, values)).await.unwrap();
+        let models = rows
+            .iter()
+            .map(|row| row.try_get::<String>("", "model").unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(models, vec!["GPT%_Model", "gPt%_mOdEl-legacy"]);
+
+        let bucket = db
+            .read()
+            .query_one(db.stmt(
+                &format!(
+                    "SELECT {} AS bucket_idx FROM request_logs rl WHERE model = $4",
+                    analytics_bucket_expr(true)
+                ),
+                vec![
+                    1_704_067_199_400_i64.into(),
+                    1_i64.into(),
+                    1_000_i64.into(),
+                    "GPT%_Model".into(),
+                ],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bucket.try_get::<i64>("", "bucket_idx").unwrap(), 0);
+
+        let mut malformed_sql = "SELECT 1 FROM request_logs rl WHERE 1 = 1".to_string();
+        let mut malformed_values = Vec::new();
+        let mut malformed_idx = 1;
+        assert!(
+            append_request_log_filters(
+                &mut malformed_sql,
+                &mut malformed_values,
+                &mut malformed_idx,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("bad"),
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(malformed_idx, 1);
+        assert!(malformed_values.is_empty());
+    }
+
+    #[tokio::test]
+    async fn postgres_request_log_semantics_match_sqlite_when_test_dsn_is_configured() {
+        let Some(dsn) = std::env::var("MONOIZE_TEST_POSTGRES_DSN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return;
+        };
+        let db = DbPool::connect(&dsn).await.unwrap();
+        let txn = db.read().begin().await.unwrap();
+        txn.execute_unprepared(
+            "CREATE TEMP TABLE request_logs (model TEXT, upstream_model TEXT, request_id TEXT, request_ip TEXT, status TEXT, api_key_id TEXT, request_kind TEXT, user_id TEXT, created_at_unix_ms BIGINT, created_at TEXT, charge_nano_usd TEXT)",
+        )
+        .await
+        .unwrap();
+        for (model, charge) in [("GPT%_Model", "9223372036854775808"), ("gptXXmodel", "4")] {
+            txn.execute(db.stmt(
+                "INSERT INTO request_logs (model, upstream_model, request_id, request_ip, created_at_unix_ms, created_at, charge_nano_usd) VALUES ($1, '', '', '', $2, $3, $4)",
+                vec![
+                    model.into(),
+                    1_704_067_200_000_i64.into(),
+                    "2024-01-01T00:00:00+00:00".into(),
+                    charge.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+        for model in ["CAFÉ", "café", "cafe"] {
+            txn.execute(db.stmt(
+                "INSERT INTO request_logs (model, upstream_model, request_id, request_ip, created_at_unix_ms, created_at) VALUES ($1, '', '', '', $2, $3)",
+                vec![
+                    model.into(),
+                    1_704_067_200_000_i64.into(),
+                    "2024-01-01T00:00:00+00:00".into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let mut sql = "SELECT model FROM request_logs rl WHERE 1 = 1".to_string();
+        let mut values = Vec::new();
+        let mut idx = 1;
+        append_request_log_filters(
+            &mut sql,
+            &mut values,
+            &mut idx,
+            true,
+            Some("gpt%_model"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let rows = txn.query_all(db.stmt(&sql, values)).await.unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let mut non_ascii_sql = "SELECT model FROM request_logs rl WHERE 1 = 1".to_string();
+        let mut non_ascii_values = Vec::new();
+        let mut non_ascii_idx = 1;
+        append_request_log_filters(
+            &mut non_ascii_sql,
+            &mut non_ascii_values,
+            &mut non_ascii_idx,
+            true,
+            Some("CAFé"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(non_ascii_sql.contains("translate(rl.model"));
+        let rows = txn
+            .query_all(db.stmt(&non_ascii_sql, non_ascii_values))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<String>("", "model").unwrap(), "café");
+
+        let mut non_ascii_search_sql = "SELECT model FROM request_logs rl WHERE 1 = 1".to_string();
+        let mut non_ascii_search_values = Vec::new();
+        let mut non_ascii_search_idx = 1;
+        append_request_log_filters(
+            &mut non_ascii_search_sql,
+            &mut non_ascii_search_values,
+            &mut non_ascii_search_idx,
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("cafÉ"),
+            None,
+            None,
+        )
+        .unwrap();
+        let rows = txn
+            .query_all(db.stmt(&non_ascii_search_sql, non_ascii_search_values))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<String>("", "model").unwrap(), "CAFÉ");
+
+        let aggregate = txn
+            .query_one(db.stmt(
+                &format!("{} FROM request_logs rl", charge_aggregate_select(true)),
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_charge_aggregate(&aggregate, true).unwrap(),
+            "9223372036854775812"
+        );
+
+        let bucket_sql = format!(
+            "SELECT {} AS bucket_idx FROM request_logs rl WHERE model = $4",
+            analytics_bucket_expr(false)
+        );
+        let bucket = txn
+            .query_one(db.stmt(
+                &bucket_sql,
+                vec![
+                    1_704_067_199_400_i64.into(),
+                    1_i64.into(),
+                    1_000_i64.into(),
+                    "GPT%_Model".into(),
+                ],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bucket.try_get::<i64>("", "bucket_idx").unwrap(), 0);
+
+        for (model, charge) in [
+            ("analytics-exact", "9223372036854775807"),
+            ("analytics-exact", "1"),
+            (
+                "analytics-out-of-range",
+                "170141183460469231731687303715884105728",
+            ),
+            (
+                "analytics-overflow",
+                "170141183460469231731687303715884105727",
+            ),
+            ("analytics-overflow", "1"),
+        ] {
+            txn.execute(db.stmt(
+                "INSERT INTO request_logs (model, upstream_model, request_id, request_ip, user_id, created_at_unix_ms, created_at, charge_nano_usd) VALUES ($1, '', '', '', 'u1', $2, $3, $4)",
+                vec![
+                    model.into(),
+                    1_704_067_200_000_i64.into(),
+                    "2024-01-01T00:00:00+00:00".into(),
+                    charge.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+        let analytics_rows = txn
+            .query_all(db.stmt(
+                &analytics_model_bucket_sql(false, true),
+                vec![
+                    1_704_067_199_000_i64.into(),
+                    2_i64.into(),
+                    2_000_i64.into(),
+                    1_704_067_199_000_i64.into(),
+                    1_704_067_201_000_i64.into(),
+                    "u1".into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(analytics_rows.len(), 3);
+        let mut analytics_groups = std::collections::BTreeMap::new();
+        for row in analytics_rows {
+            let model: String = row.try_get("", "model").unwrap();
+            analytics_groups.insert(model, decode_charge_aggregate(&row, true));
+        }
+        assert_eq!(
+            analytics_groups["analytics-exact"].as_deref().unwrap(),
+            "9223372036854775808"
+        );
+        assert_eq!(
+            analytics_groups["analytics-out-of-range"]
+                .as_ref()
+                .unwrap_err(),
+            "request log charge is outside the signed i128 domain"
+        );
+        assert_eq!(
+            analytics_groups["analytics-overflow"].as_ref().unwrap_err(),
+            "request log charge aggregate overflow"
+        );
+        txn.rollback().await.unwrap();
     }
 }
 
@@ -106,16 +880,18 @@ fn append_request_log_filters(
     search: Option<&str>,
     time_from: Option<&str>,
     time_to: Option<&str>,
-) {
+) -> Result<(), String> {
     if let Some(model) = model {
+        validate_request_log_model_filter(Some(model))?;
+        let folded_model = ascii_folded_sql_expression("rl.model", is_postgres);
         let models: Vec<&str> = model
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect();
         if models.len() == 1 {
-            sql.push_str(&format!(" AND rl.model LIKE '%' || ${} || '%'", *idx));
-            values.push(models[0].into());
+            sql.push_str(&format!(" AND {folded_model} LIKE ${} ESCAPE '\\'", *idx,));
+            values.push(ascii_folded_like_pattern(models[0]).into());
             *idx += 1;
         } else if !models.is_empty() {
             sql.push_str(" AND (");
@@ -123,8 +899,8 @@ fn append_request_log_filters(
                 if i > 0 {
                     sql.push_str(" OR ");
                 }
-                sql.push_str(&format!("rl.model LIKE '%' || ${} || '%'", *idx));
-                values.push((*m).into());
+                sql.push_str(&format!("{folded_model} LIKE ${} ESCAPE '\\'", *idx,));
+                values.push(ascii_folded_like_pattern(m).into());
                 *idx += 1;
             }
             sql.push(')');
@@ -146,9 +922,13 @@ fn append_request_log_filters(
         *idx += 1;
     }
     if let Some(search) = search {
-        let search_like = format!("%{search}%");
+        let search_like = ascii_folded_like_pattern(search);
+        let model = ascii_folded_sql_expression("rl.model", is_postgres);
+        let upstream_model = ascii_folded_sql_expression("rl.upstream_model", is_postgres);
+        let request_id = ascii_folded_sql_expression("rl.request_id", is_postgres);
+        let request_ip = ascii_folded_sql_expression("rl.request_ip", is_postgres);
         sql.push_str(&format!(
-            " AND (rl.model LIKE ${i} OR rl.upstream_model LIKE ${j} OR rl.request_id LIKE ${k} OR rl.request_ip LIKE ${l})",
+            " AND ({model} LIKE ${i} ESCAPE '\\' OR {upstream_model} LIKE ${j} ESCAPE '\\' OR {request_id} LIKE ${k} ESCAPE '\\' OR {request_ip} LIKE ${l} ESCAPE '\\')",
             i = *idx, j = *idx + 1, k = *idx + 2, l = *idx + 3
         ));
         values.push(search_like.clone().into());
@@ -159,116 +939,103 @@ fn append_request_log_filters(
     }
     if let Some(time_from) = time_from {
         let parsed = chrono::DateTime::parse_from_rfc3339(time_from)
-            .map_err(|e| e.to_string())
-            .ok()
-            .map(|dt| dt.timestamp_millis());
-        if let Some(time_from_unix_ms) = parsed {
-            let _ = is_postgres;
-            sql.push_str(&format!(
-                " AND {} >= ${}",
-                request_log_time_filter_column(),
-                *idx
-            ));
-            values.push(time_from_unix_ms.into());
-        }
-        *idx += 1;
+            .map_err(|_| "invalid time_from RFC 3339 timestamp".to_string())?
+            .with_timezone(&Utc);
+        sql.push_str(&format!(
+            " AND ((rl.created_at_unix_ms IS NOT NULL AND rl.created_at_unix_ms >= ${}) OR (rl.created_at_unix_ms IS NULL AND rl.created_at >= ${}))",
+            *idx,
+            *idx + 1
+        ));
+        values.push(parsed.timestamp_millis().into());
+        values.push(parsed.to_rfc3339().into());
+        *idx += 2;
     }
     if let Some(time_to) = time_to {
         let parsed = chrono::DateTime::parse_from_rfc3339(time_to)
-            .map_err(|e| e.to_string())
-            .ok()
-            .map(|dt| dt.timestamp_millis());
-        if let Some(time_to_unix_ms) = parsed {
-            let _ = is_postgres;
-            sql.push_str(&format!(
-                " AND {} < ${}",
-                request_log_time_filter_column(),
-                *idx
-            ));
-            values.push(time_to_unix_ms.into());
-        }
-        *idx += 1;
+            .map_err(|_| "invalid time_to RFC 3339 timestamp".to_string())?
+            .with_timezone(&Utc);
+        sql.push_str(&format!(
+            " AND ((rl.created_at_unix_ms IS NOT NULL AND rl.created_at_unix_ms < ${}) OR (rl.created_at_unix_ms IS NULL AND rl.created_at < ${}))",
+            *idx,
+            *idx + 1
+        ));
+        values.push(parsed.timestamp_millis().into());
+        values.push(parsed.to_rfc3339().into());
+        *idx += 2;
     }
+    Ok(())
 }
 
-fn row_to_request_log(row: &sea_orm::QueryResult) -> RequestLogRow {
-    let is_stream = row.try_get::<i32>("", "is_stream").unwrap_or_else(|_| {
-        row.try_get::<Option<i32>>("", "is_stream")
-            .unwrap_or(None)
-            .unwrap_or(0)
-    }) == 1;
+fn row_to_request_log(row: &sea_orm::QueryResult) -> Result<RequestLogRow, String> {
+    let is_stream = request_log_row_value::<i32>(row, "is_stream")? == 1;
+    let charge_nano_usd = request_log_row_value(row, "charge_nano_usd")?;
+    let provider_multiplier = request_log_row_value::<Option<String>>(row, "provider_multiplier")?
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error| format!("request_logs.provider_multiplier: {error}"))
+        })
+        .transpose()?;
 
-    let charge_nano_usd = row
-        .try_get::<Option<String>>("", "charge_nano_usd")
-        .unwrap_or(None);
-
-    RequestLogRow {
-        id: row.try_get("", "id").unwrap_or_default(),
-        request_id: row.try_get("", "request_id").unwrap_or(None),
-        created_at: row.try_get("", "created_at").unwrap_or_default(),
-        status: row
-            .try_get("", "status")
-            .unwrap_or_else(|_| "unknown".to_string()),
+    Ok(RequestLogRow {
+        id: request_log_row_value(row, "id")?,
+        request_id: request_log_row_value(row, "request_id")?,
+        created_at: request_log_row_value(row, "created_at")?,
+        status: request_log_row_value(row, "status")?,
         is_stream,
-        model: row.try_get("", "model").unwrap_or_default(),
-        upstream_model: row.try_get("", "upstream_model").unwrap_or(None),
-        effective_provider_type: row.try_get("", "effective_provider_type").unwrap_or(None),
-        request_kind: row.try_get("", "request_kind").unwrap_or(None),
-        reasoning_effort: row.try_get("", "reasoning_effort").unwrap_or(None),
-        request_ip: row.try_get("", "request_ip").unwrap_or(None),
+        model: request_log_row_value(row, "model")?,
+        upstream_model: request_log_row_value(row, "upstream_model")?,
+        effective_provider_type: request_log_row_value(row, "effective_provider_type")?,
+        request_kind: request_log_row_value(row, "request_kind")?,
+        reasoning_effort: request_log_row_value(row, "reasoning_effort")?,
+        request_ip: request_log_row_value(row, "request_ip")?,
         tried_providers: parse_optional_json_text(
-            row.try_get::<Option<String>>("", "tried_providers_json")
-                .unwrap_or(None),
-        ),
+            request_log_row_value(row, "tried_providers_json")?,
+            "tried_providers_json",
+        )?,
         provider: RequestLogProvider {
-            id: row.try_get("", "provider_id").unwrap_or(None),
-            name: row.try_get("", "provider_name").unwrap_or(None),
-            multiplier: row
-                .try_get::<Option<String>>("", "provider_multiplier")
-                .unwrap_or(None)
-                .and_then(|value| value.parse().ok()),
+            id: request_log_row_value(row, "provider_id")?,
+            name: request_log_row_value(row, "provider_name")?,
+            multiplier: provider_multiplier,
         },
         channel: RequestLogChannel {
-            id: row.try_get("", "channel_id").unwrap_or(None),
-            name: row.try_get("", "channel_name").unwrap_or(None),
+            id: request_log_row_value(row, "channel_id")?,
+            name: request_log_row_value(row, "channel_name")?,
         },
         affinity: RequestLogAffinity {
-            hit: row
-                .try_get::<Option<i32>>("", "affinity_hit")
-                .unwrap_or(None)
-                .map(|v| v != 0),
-            key_hash: row.try_get("", "affinity_key_hash").unwrap_or(None),
-            target: row.try_get("", "affinity_target").unwrap_or(None),
+            hit: request_log_row_value::<Option<i32>>(row, "affinity_hit")?.map(|v| v != 0),
+            key_hash: request_log_row_value(row, "affinity_key_hash")?,
+            target: request_log_row_value(row, "affinity_target")?,
         },
         user: RequestLogUser {
-            id: row.try_get("", "user_id").unwrap_or_default(),
-            username: row.try_get("", "username").unwrap_or(None),
+            id: request_log_row_value(row, "user_id")?,
+            username: request_log_row_value(row, "username")?,
         },
         api_key: RequestLogApiKey {
-            id: row.try_get("", "api_key_id").unwrap_or(None),
-            name: row.try_get("", "api_key_name").unwrap_or(None),
+            id: request_log_row_value(row, "api_key_id")?,
+            name: request_log_row_value(row, "api_key_name")?,
         },
         tokens: RequestLogTokens {
-            input: row_optional_i64(row, "input_tokens"),
-            output: row_optional_i64(row, "output_tokens"),
-            cache_read: row_optional_i64(row, "cache_read_tokens"),
-            cache_creation: row_optional_i64(row, "cache_creation_tokens"),
-            tool_prompt: row_optional_i64(row, "tool_prompt_tokens"),
-            reasoning: row_optional_i64(row, "reasoning_tokens"),
-            accepted_prediction: row_optional_i64(row, "accepted_prediction_tokens"),
-            rejected_prediction: row_optional_i64(row, "rejected_prediction_tokens"),
+            input: row_optional_i64(row, "input_tokens")?,
+            output: row_optional_i64(row, "output_tokens")?,
+            cache_read: row_optional_i64(row, "cache_read_tokens")?,
+            cache_creation: row_optional_i64(row, "cache_creation_tokens")?,
+            tool_prompt: row_optional_i64(row, "tool_prompt_tokens")?,
+            reasoning: row_optional_i64(row, "reasoning_tokens")?,
+            accepted_prediction: row_optional_i64(row, "accepted_prediction_tokens")?,
+            rejected_prediction: row_optional_i64(row, "rejected_prediction_tokens")?,
         },
         timing: {
-            let duration_ms = row_optional_i64(row, "duration_ms");
-            let ttfb_ms = row_optional_i64(row, "ttfb_ms");
+            let duration_ms = row_optional_i64(row, "duration_ms")?;
+            let ttfb_ms = row_optional_i64(row, "ttfb_ms")?;
             RequestLogTiming {
                 duration_ms,
                 ttfb_ms,
-                first_visible_output_ms: row_optional_i64(row, "first_visible_output_ms"),
-                last_visible_output_ms: row_optional_i64(row, "last_visible_output_ms"),
-                visible_generation_ms: row_optional_i64(row, "visible_generation_ms"),
-                visible_output_tokens: row_optional_i64(row, "visible_output_tokens"),
-                tps_mode: row.try_get("", "tps_mode").unwrap_or(None),
+                first_visible_output_ms: row_optional_i64(row, "first_visible_output_ms")?,
+                last_visible_output_ms: row_optional_i64(row, "last_visible_output_ms")?,
+                visible_generation_ms: row_optional_i64(row, "visible_generation_ms")?,
+                visible_output_tokens: row_optional_i64(row, "visible_output_tokens")?,
+                tps_mode: request_log_row_value(row, "tps_mode")?,
                 duration_ms_alias: duration_ms,
                 elapsed_ms: duration_ms,
                 latency_ms: duration_ms,
@@ -280,23 +1047,56 @@ fn row_to_request_log(row: &sea_orm::QueryResult) -> RequestLogRow {
         billing: RequestLogBilling {
             charge_nano_usd,
             breakdown: parse_optional_json_text(
-                row.try_get::<Option<String>>("", "billing_breakdown_json")
-                    .unwrap_or(None),
-            ),
+                request_log_row_value(row, "billing_breakdown_json")?,
+                "billing_breakdown_json",
+            )?,
         },
         usage: parse_optional_json_text(
-            row.try_get::<Option<String>>("", "usage_breakdown_json")
-                .unwrap_or(None),
-        ),
+            request_log_row_value(row, "usage_breakdown_json")?,
+            "usage_breakdown_json",
+        )?,
         error: RequestLogError {
-            code: row.try_get("", "error_code").unwrap_or(None),
-            message: row.try_get("", "error_message").unwrap_or(None),
-            http_status: row_optional_i64(row, "error_http_status"),
+            code: request_log_row_value(row, "error_code")?,
+            message: request_log_row_value(row, "error_message")?,
+            http_status: row_optional_i64(row, "error_http_status")?,
         },
-    }
+    })
 }
 
 impl UserStore {
+    pub(crate) fn validate_request_log_model_filter(model: Option<&str>) -> Result<(), String> {
+        validate_request_log_model_filter(model)
+    }
+
+    pub fn reserve_terminal_request_log(
+        &self,
+    ) -> Result<crate::db_cache::RequestLogReservation, String> {
+        self.request_log_batcher
+            .reserve_terminal_log()
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn arm_terminal_request_log(
+        &self,
+        fallback_log: InsertRequestLog,
+        reservation: &crate::db_cache::RequestLogReservation,
+    ) -> Result<(), String> {
+        self.request_log_batcher
+            .arm_reserved(fallback_log, reservation)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn cancel_terminal_request_log(
+        &self,
+        reservation: &crate::db_cache::RequestLogReservation,
+    ) -> Result<(), String> {
+        self.request_log_batcher
+            .cancel_reserved(reservation)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     pub async fn cleanup_expired_request_logs(&self) -> Result<u64, String> {
         let cutoff_unix_ms =
             (Utc::now() - Duration::days(REQUEST_LOG_RETENTION_DAYS)).timestamp_millis();
@@ -364,12 +1164,29 @@ impl UserStore {
     }
 
     pub async fn finalize_request_log(&self, log: InsertRequestLog) -> Result<(), String> {
-        self.request_log_batcher.push(log).await;
+        self.request_log_batcher
+            .push(log)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
+    pub async fn finalize_reserved_request_log(
+        &self,
+        log: InsertRequestLog,
+        reservation: crate::db_cache::RequestLogReservation,
+    ) -> Result<(), String> {
+        self.request_log_batcher
+            .push_reserved(log, reservation)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     pub async fn insert_request_log(&self, log: InsertRequestLog) -> Result<(), String> {
-        self.request_log_batcher.push(log).await;
+        self.request_log_batcher
+            .push(log)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -386,11 +1203,21 @@ impl UserStore {
         time_from: Option<&str>,
         time_to: Option<&str>,
     ) -> Result<(Vec<RequestLogRow>, i64, String), String> {
+        Self::validate_request_log_model_filter(model)?;
         let is_postgres = self.db.is_postgres();
         let model = normalize_request_log_filter(model);
         let status = normalize_request_log_filter(status);
         let api_key_id = normalize_request_log_filter(api_key_id);
         let search = normalize_request_log_filter(search);
+        let txn = self
+            .db
+            .read()
+            .begin_with_config(
+                is_postgres.then_some(IsolationLevel::RepeatableRead),
+                is_postgres.then_some(AccessMode::ReadOnly),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
 
         // Count query
         let mut count_sql =
@@ -409,10 +1236,8 @@ impl UserStore {
             search.as_deref(),
             time_from,
             time_to,
-        );
-        let count_row = self
-            .db
-            .read()
+        )?;
+        let count_row = txn
             .query_one(self.db.stmt(&count_sql, count_values))
             .await
             .map_err(|e| e.to_string())?;
@@ -422,8 +1247,10 @@ impl UserStore {
             .map_err(|e| e.to_string())?;
 
         // Sum query
-        let mut sum_sql =
-            "SELECT rl.charge_nano_usd FROM request_logs rl WHERE rl.user_id = $1".to_string();
+        let mut sum_sql = format!(
+            "{} FROM request_logs rl WHERE rl.user_id = $1",
+            charge_aggregate_select(is_postgres)
+        );
         let mut sum_values: Vec<SeaValue> = vec![user_id.into()];
         let mut sum_idx = 2usize;
         append_request_log_filters(
@@ -438,14 +1265,13 @@ impl UserStore {
             search.as_deref(),
             time_from,
             time_to,
-        );
-        let sum_rows = self
-            .db
-            .read()
-            .query_all(self.db.stmt(&sum_sql, sum_values))
+        )?;
+        let sum_row = txn
+            .query_one(self.db.stmt(&sum_sql, sum_values))
             .await
-            .map_err(|e| e.to_string())?;
-        let total_charge_nano_usd = sum_charge_rows(sum_rows)?;
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "no request log charge aggregate row".to_string())?;
+        let total_charge_nano_usd = decode_charge_aggregate(&sum_row, is_postgres)?;
 
         // Rows query
         let mut rows_sql = r#"SELECT rl.id, rl.request_id, rl.user_id, rl.api_key_id, rl.model, rl.provider_id, rl.upstream_model,
@@ -483,16 +1309,16 @@ impl UserStore {
             search.as_deref(),
             time_from,
             time_to,
-        );
+        )?;
         if is_postgres {
             rows_sql.push_str(&format!(
-                " ORDER BY rl.created_at_unix_ms DESC NULLS LAST, rl.created_at DESC LIMIT ${} OFFSET ${}",
+                " ORDER BY rl.created_at_unix_ms DESC NULLS LAST, rl.created_at DESC, rl.id DESC LIMIT ${} OFFSET ${}",
                 rows_idx,
                 rows_idx + 1
             ));
         } else {
             rows_sql.push_str(&format!(
-                " ORDER BY rl.created_at_unix_ms DESC, rl.created_at DESC LIMIT ${} OFFSET ${}",
+                " ORDER BY rl.created_at_unix_ms DESC, rl.created_at DESC, rl.id DESC LIMIT ${} OFFSET ${}",
                 rows_idx,
                 rows_idx + 1
             ));
@@ -500,17 +1326,16 @@ impl UserStore {
         rows_values.push(SeaValue::BigInt(Some(limit)));
         rows_values.push(SeaValue::BigInt(Some(offset)));
 
-        let rows = self
-            .db
-            .read()
+        let rows = txn
             .query_all(self.db.stmt(&rows_sql, rows_values))
             .await
             .map_err(|e| e.to_string())?;
 
+        txn.commit().await.map_err(|e| e.to_string())?;
         let logs = rows
             .into_iter()
             .map(|row| row_to_request_log(&row))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok((logs, total, total_charge_nano_usd))
     }
@@ -528,12 +1353,22 @@ impl UserStore {
         time_from: Option<&str>,
         time_to: Option<&str>,
     ) -> Result<(Vec<RequestLogRow>, i64, String), String> {
+        Self::validate_request_log_model_filter(model)?;
         let is_postgres = self.db.is_postgres();
         let model = normalize_request_log_filter(model);
         let status = normalize_request_log_filter(status);
         let api_key_id = normalize_request_log_filter(api_key_id);
         let username = normalize_request_log_filter(username);
         let search = normalize_request_log_filter(search);
+        let txn = self
+            .db
+            .read()
+            .begin_with_config(
+                is_postgres.then_some(IsolationLevel::RepeatableRead),
+                is_postgres.then_some(AccessMode::ReadOnly),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
 
         // Count query
         let mut count_sql = r#"SELECT COUNT(*) as cnt FROM request_logs rl
@@ -553,10 +1388,8 @@ impl UserStore {
             search.as_deref(),
             time_from,
             time_to,
-        );
-        let count_row = self
-            .db
-            .read()
+        )?;
+        let count_row = txn
             .query_one(self.db.stmt(&count_sql, count_values))
             .await
             .map_err(|e| e.to_string())?;
@@ -566,7 +1399,10 @@ impl UserStore {
             .map_err(|e| e.to_string())?;
 
         // Sum query
-        let mut sum_sql = "SELECT rl.charge_nano_usd FROM request_logs rl WHERE 1 = 1".to_string();
+        let mut sum_sql = format!(
+            "{} FROM request_logs rl WHERE 1 = 1",
+            charge_aggregate_select(is_postgres)
+        );
         let mut sum_values: Vec<SeaValue> = Vec::new();
         let mut sum_idx = 1usize;
         append_request_log_filters(
@@ -581,14 +1417,13 @@ impl UserStore {
             search.as_deref(),
             time_from,
             time_to,
-        );
-        let sum_rows = self
-            .db
-            .read()
-            .query_all(self.db.stmt(&sum_sql, sum_values))
+        )?;
+        let sum_row = txn
+            .query_one(self.db.stmt(&sum_sql, sum_values))
             .await
-            .map_err(|e| e.to_string())?;
-        let total_charge_nano_usd = sum_charge_rows(sum_rows)?;
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "no request log charge aggregate row".to_string())?;
+        let total_charge_nano_usd = decode_charge_aggregate(&sum_row, is_postgres)?;
 
         // Rows query
         let mut rows_sql = r#"SELECT rl.id, rl.request_id, rl.user_id, rl.api_key_id, rl.model, rl.provider_id, rl.upstream_model,
@@ -626,16 +1461,16 @@ impl UserStore {
             search.as_deref(),
             time_from,
             time_to,
-        );
+        )?;
         if is_postgres {
             rows_sql.push_str(&format!(
-                " ORDER BY rl.created_at_unix_ms DESC NULLS LAST, rl.created_at DESC LIMIT ${} OFFSET ${}",
+                " ORDER BY rl.created_at_unix_ms DESC NULLS LAST, rl.created_at DESC, rl.id DESC LIMIT ${} OFFSET ${}",
                 rows_idx,
                 rows_idx + 1
             ));
         } else {
             rows_sql.push_str(&format!(
-                " ORDER BY rl.created_at_unix_ms DESC, rl.created_at DESC LIMIT ${} OFFSET ${}",
+                " ORDER BY rl.created_at_unix_ms DESC, rl.created_at DESC, rl.id DESC LIMIT ${} OFFSET ${}",
                 rows_idx,
                 rows_idx + 1
             ));
@@ -643,17 +1478,16 @@ impl UserStore {
         rows_values.push(SeaValue::BigInt(Some(limit)));
         rows_values.push(SeaValue::BigInt(Some(offset)));
 
-        let rows = self
-            .db
-            .read()
+        let rows = txn
             .query_all(self.db.stmt(&rows_sql, rows_values))
             .await
             .map_err(|e| e.to_string())?;
 
+        txn.commit().await.map_err(|e| e.to_string())?;
         let logs = rows
             .into_iter()
             .map(|row| row_to_request_log(&row))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok((logs, total, total_charge_nano_usd))
     }
@@ -665,7 +1499,6 @@ impl UserStore {
         time_to: &str,
         today_start: &str,
         bucket_count: i64,
-        bucket_width_days: f64,
     ) -> Result<DashboardAnalyticsRaw, String> {
         let is_sqlite = self.db.is_sqlite();
         let time_from_unix_ms = chrono::DateTime::parse_from_rfc3339(time_from)
@@ -681,15 +1514,15 @@ impl UserStore {
             return Err("analytics time range and bucket count must be positive".to_string());
         }
 
-        let mut model_sql = "SELECT rl.created_at_unix_ms, rl.model, rl.charge_nano_usd
-             FROM request_logs rl
-             WHERE rl.created_at_unix_ms >= $1 AND rl.created_at_unix_ms < $2"
-            .to_string();
-        let mut model_values: Vec<SeaValue> =
-            vec![time_from_unix_ms.into(), time_to_unix_ms.into()];
-
+        let model_sql = analytics_model_bucket_sql(is_sqlite, user_id.is_some());
+        let mut model_values: Vec<SeaValue> = vec![
+            time_from_unix_ms.into(),
+            bucket_count.into(),
+            range_ms.into(),
+            time_from_unix_ms.into(),
+            time_to_unix_ms.into(),
+        ];
         if let Some(uid) = user_id {
-            model_sql.push_str(" AND rl.user_id = $3");
             model_values.push(uid.into());
         }
 
@@ -700,48 +1533,25 @@ impl UserStore {
             .await
             .map_err(|e| e.to_string())?;
 
-        let mut grouped = std::collections::BTreeMap::<(i64, String), (i128, i64)>::new();
-        for row in model_rows {
-            let created_at_unix_ms: i64 = row
-                .try_get("", "created_at_unix_ms")
-                .map_err(|e| e.to_string())?;
-            let offset = created_at_unix_ms
-                .checked_sub(time_from_unix_ms)
-                .ok_or_else(|| "analytics bucket offset overflow".to_string())?;
-            let bucket_idx = (i128::from(offset)
-                .checked_mul(i128::from(bucket_count))
-                .ok_or_else(|| "analytics bucket calculation overflow".to_string())?
-                / i128::from(range_ms))
-            .clamp(0, i128::from(bucket_count - 1)) as i64;
-            let model: String = row.try_get("", "model").map_err(|e| e.to_string())?;
-            let raw_charge: Option<String> = row
-                .try_get("", "charge_nano_usd")
-                .map_err(|e| e.to_string())?;
-            let entry = grouped.entry((bucket_idx, model)).or_insert((0, 0));
-            add_charge_text(&mut entry.0, raw_charge.as_deref())?;
-            entry.1 = entry
-                .1
-                .checked_add(1)
-                .ok_or_else(|| "analytics call count overflow".to_string())?;
-        }
-        let model_buckets = grouped
+        let model_buckets = model_rows
             .into_iter()
-            .map(
-                |((bucket_idx, model), (cost_nano, call_count))| AnalyticsModelBucketRow {
-                    bucket_idx,
+            .map(|row| {
+                let bucket_idx: i64 = row.try_get("", "bucket_idx").map_err(|e| e.to_string())?;
+                let model = row.try_get("", "model").map_err(|e| e.to_string())?;
+                let cost_nano = decode_charge_aggregate(&row, !is_sqlite)?
+                    .parse::<i128>()
+                    .map_err(|_| "request log charge aggregate overflow".to_string())?;
+                let call_count = row.try_get("", "call_count").map_err(|e| e.to_string())?;
+                Ok(AnalyticsModelBucketRow {
+                    bucket_idx: bucket_idx.clamp(0, bucket_count - 1),
                     model,
                     cost_nano,
                     call_count,
-                },
-            )
-            .collect::<Vec<_>>();
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
 
-        let bucket_expr = if is_sqlite {
-            "CAST(((rl.created_at_unix_ms - $1) / 86400000.0) / $2 AS BIGINT)".to_string()
-        } else {
-            "CAST(((rl.created_at_unix_ms - $1)::DOUBLE PRECISION / 86400000.0) / $2 AS BIGINT)"
-                .to_string()
-        };
+        let bucket_expr = analytics_bucket_expr(is_sqlite);
 
         // 2. Provider bucketed aggregation (calls only)
         let mut prov_sql = format!(
@@ -751,17 +1561,18 @@ impl UserStore {
                  COUNT(*) AS call_count
                 FROM request_logs rl
                 LEFT JOIN monoize_providers mp ON rl.provider_id = mp.id
-               WHERE {time_col} >= $3 AND {time_col} < $4"#,
+               WHERE {time_col} >= $4 AND {time_col} < $5"#,
             time_col = "rl.created_at_unix_ms"
         );
         prov_sql.push_str(" AND rl.created_at_unix_ms IS NOT NULL");
         let mut prov_values: Vec<SeaValue> = vec![
             time_from_unix_ms.into(),
-            SeaValue::Double(Some(bucket_width_days)),
+            bucket_count.into(),
+            range_ms.into(),
             time_from_unix_ms.into(),
             time_to_unix_ms.into(),
         ];
-        let mut prov_idx = 5usize;
+        let mut prov_idx = 6usize;
 
         if let Some(uid) = user_id {
             prov_sql.push_str(&format!(" AND rl.user_id = ${prov_idx}"));
@@ -781,14 +1592,16 @@ impl UserStore {
         let provider_buckets: Vec<AnalyticsProviderBucketRow> = prov_rows
             .into_iter()
             .map(|row| {
-                let idx: i64 = row.try_get("", "bucket_idx").unwrap_or(0);
-                AnalyticsProviderBucketRow {
+                let idx: i64 = row.try_get("", "bucket_idx").map_err(|e| e.to_string())?;
+                Ok(AnalyticsProviderBucketRow {
                     bucket_idx: idx.clamp(0, bucket_count - 1),
-                    provider_label: row.try_get("", "provider_label").unwrap_or_default(),
-                    call_count: row.try_get("", "call_count").unwrap_or(0),
-                }
+                    provider_label: row
+                        .try_get("", "provider_label")
+                        .map_err(|e| e.to_string())?,
+                    call_count: row.try_get("", "call_count").map_err(|e| e.to_string())?,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
 
         let (total_cost_nano_usd, total_calls) = model_buckets.iter().try_fold(
             (0i128, 0i64),
@@ -803,9 +1616,10 @@ impl UserStore {
             },
         )?;
 
-        let mut today_sql = "SELECT rl.charge_nano_usd FROM request_logs rl
-             WHERE rl.created_at_unix_ms >= $1 AND rl.created_at_unix_ms IS NOT NULL"
-            .to_string();
+        let mut today_sql = format!(
+            "{}, COUNT(*) AS call_count FROM request_logs rl WHERE rl.created_at_unix_ms >= $1 AND rl.created_at_unix_ms IS NOT NULL",
+            charge_aggregate_select(!is_sqlite)
+        );
         let today_start_unix_ms = chrono::DateTime::parse_from_rfc3339(today_start)
             .map_err(|e| e.to_string())?
             .timestamp_millis();
@@ -815,15 +1629,17 @@ impl UserStore {
             today_sql.push_str(" AND rl.user_id = $2");
             today_values.push(uid.into());
         }
-        let today_rows = self
+        let today_row = self
             .db
             .read()
-            .query_all(self.db.stmt(&today_sql, today_values))
+            .query_one(self.db.stmt(&today_sql, today_values))
             .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "no today analytics aggregate row".to_string())?;
+        let today_calls: i64 = today_row
+            .try_get("", "call_count")
             .map_err(|e| e.to_string())?;
-        let today_calls = i64::try_from(today_rows.len())
-            .map_err(|_| "analytics call count overflow".to_string())?;
-        let today_cost_nano_usd = sum_charge_rows(today_rows)?
+        let today_cost_nano_usd = decode_charge_aggregate(&today_row, !is_sqlite)?
             .parse::<i128>()
             .map_err(|_| "request log charge is outside the signed i128 domain".to_string())?;
 

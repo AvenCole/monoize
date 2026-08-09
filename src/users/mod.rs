@@ -244,6 +244,31 @@ pub struct CreateApiKeyInput {
     pub request_capture_mode: RequestCaptureMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterUserError {
+    RegistrationDisabled,
+    UsernameExists,
+    Storage(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateApiKeyWithLimitError {
+    LimitReached { limit: i64 },
+    InvalidRequest(String),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AdminUpdateUserInput {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub role: Option<UserRole>,
+    pub enabled: Option<bool>,
+    pub balance_nano_usd: Option<String>,
+    pub balance_unlimited: Option<bool>,
+    pub email: Option<Option<String>>,
+    pub allowed_groups: Option<Vec<String>>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -372,9 +397,19 @@ pub struct UserStore {
     pub(crate) request_log_batcher: crate::db_cache::RequestLogBatcher,
     pub(crate) api_key_cache: crate::db_cache::ApiKeyCache,
     pub(crate) balance_cache: crate::db_cache::BalanceCache,
+    pub(crate) registration_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub(crate) api_key_creation_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 pub(crate) const RESERVED_INTERNAL_USER_PREFIX: &str = "_monoize_";
+
+#[derive(Debug, Clone, Default)]
+pub struct RequestLogNameSnapshots {
+    pub username: Option<String>,
+    pub api_key_name: Option<String>,
+    pub provider_name: Option<String>,
+    pub channel_name: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct InsertRequestLog {
@@ -385,6 +420,7 @@ pub struct InsertRequestLog {
     pub provider_id: Option<String>,
     pub upstream_model: Option<String>,
     pub channel_id: Option<String>,
+    pub names: RequestLogNameSnapshots,
     pub is_stream: bool,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -525,6 +561,96 @@ pub struct RequestLogRow {
     pub billing: RequestLogBilling,
     pub usage: Option<Value>,
     pub error: RequestLogError,
+}
+
+impl InsertRequestLog {
+    pub fn to_request_log_row(&self) -> RequestLogRow {
+        RequestLogRow {
+            id: self.request_id.clone().unwrap_or_default(),
+            request_id: self.request_id.clone(),
+            created_at: self.created_at.to_rfc3339(),
+            status: self.status.clone(),
+            is_stream: self.is_stream,
+            model: self.model.clone(),
+            upstream_model: self.upstream_model.clone(),
+            effective_provider_type: self.effective_provider_type.clone(),
+            request_kind: self.request_kind.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            request_ip: self.request_ip.clone(),
+            tried_providers: self.tried_providers_json.clone(),
+            provider: RequestLogProvider {
+                id: self.provider_id.clone(),
+                name: self.names.provider_name.clone(),
+                multiplier: self.provider_multiplier,
+            },
+            channel: RequestLogChannel {
+                id: self.channel_id.clone(),
+                name: self.names.channel_name.clone(),
+            },
+            affinity: RequestLogAffinity {
+                hit: self.affinity_hit,
+                key_hash: self.affinity_key_hash.clone(),
+                target: self.affinity_target.clone(),
+            },
+            user: RequestLogUser {
+                id: self.user_id.clone(),
+                username: self.names.username.clone(),
+            },
+            api_key: RequestLogApiKey {
+                id: self.api_key_id.clone(),
+                name: self.names.api_key_name.clone(),
+            },
+            tokens: RequestLogTokens {
+                input: self.input_tokens.and_then(|v| i64::try_from(v).ok()),
+                output: self.output_tokens.and_then(|v| i64::try_from(v).ok()),
+                cache_read: self.cache_read_tokens.and_then(|v| i64::try_from(v).ok()),
+                cache_creation: self
+                    .cache_creation_tokens
+                    .and_then(|v| i64::try_from(v).ok()),
+                tool_prompt: self.tool_prompt_tokens.and_then(|v| i64::try_from(v).ok()),
+                reasoning: self.reasoning_tokens.and_then(|v| i64::try_from(v).ok()),
+                accepted_prediction: self
+                    .accepted_prediction_tokens
+                    .and_then(|v| i64::try_from(v).ok()),
+                rejected_prediction: self
+                    .rejected_prediction_tokens
+                    .and_then(|v| i64::try_from(v).ok()),
+            },
+            timing: RequestLogTiming {
+                duration_ms: self.duration_ms.and_then(|v| i64::try_from(v).ok()),
+                ttfb_ms: self.ttfb_ms.and_then(|v| i64::try_from(v).ok()),
+                first_visible_output_ms: self
+                    .first_visible_output_ms
+                    .and_then(|v| i64::try_from(v).ok()),
+                last_visible_output_ms: self
+                    .last_visible_output_ms
+                    .and_then(|v| i64::try_from(v).ok()),
+                visible_generation_ms: self
+                    .visible_generation_ms
+                    .and_then(|v| i64::try_from(v).ok()),
+                visible_output_tokens: self
+                    .visible_output_tokens
+                    .and_then(|v| i64::try_from(v).ok()),
+                tps_mode: self.tps_mode.clone(),
+                duration_ms_alias: self.duration_ms.and_then(|v| i64::try_from(v).ok()),
+                elapsed_ms: self.duration_ms.and_then(|v| i64::try_from(v).ok()),
+                latency_ms: self.duration_ms.and_then(|v| i64::try_from(v).ok()),
+                ttfb_ms_alias: self.ttfb_ms.and_then(|v| i64::try_from(v).ok()),
+                first_token_ms: self.ttfb_ms.and_then(|v| i64::try_from(v).ok()),
+                first_token_ms_alias: self.ttfb_ms.and_then(|v| i64::try_from(v).ok()),
+            },
+            billing: RequestLogBilling {
+                charge_nano_usd: self.charge_nano_usd.map(|v| v.to_string()),
+                breakdown: self.billing_breakdown_json.clone(),
+            },
+            usage: self.usage_breakdown_json.clone(),
+            error: RequestLogError {
+                code: self.error_code.clone(),
+                message: self.error_message.clone(),
+                http_status: self.error_http_status.map(i64::from),
+            },
+        }
+    }
 }
 
 pub struct AnalyticsModelBucketRow {

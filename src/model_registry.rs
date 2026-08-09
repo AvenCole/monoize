@@ -1,7 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -87,68 +84,4 @@ pub struct FileInputSupport {
 #[derive(Default)]
 pub struct ImageOutputSupport {
     pub supported: bool,
-}
-
-#[derive(Clone)]
-pub struct ModelRegistry {
-    inner: Arc<RwLock<HashMap<(String, String), ModelRecord>>>,
-}
-
-impl Default for ModelRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ModelRegistry {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    pub async fn all_records(&self) -> Vec<ModelRecord> {
-        let guard = self.inner.read().await;
-        guard.values().cloned().collect()
-    }
-
-    pub async fn find_candidates(&self, logical_model: &str) -> Vec<ModelRecord> {
-        let guard = self.inner.read().await;
-        guard
-            .values()
-            .filter(|record| record.logical_model == logical_model)
-            .cloned()
-            .collect()
-    }
-
-    /// Replace the in-memory registry with enabled database records.
-    pub async fn replace_db_records(
-        &self,
-        db_records: Vec<crate::model_registry_store::DbModelRecord>,
-    ) {
-        let mut guard = self.inner.write().await;
-        guard.clear();
-        for db_record in db_records {
-            let record = db_record.to_model_record();
-            guard.insert(
-                (record.logical_model.clone(), record.provider_id.clone()),
-                record,
-            );
-        }
-    }
-
-    /// Merge database records into the registry.
-    pub async fn merge_db_records(
-        &self,
-        db_records: Vec<crate::model_registry_store::DbModelRecord>,
-    ) {
-        let mut guard = self.inner.write().await;
-        for db_record in db_records {
-            let record = db_record.to_model_record();
-            guard.insert(
-                (record.logical_model.clone(), record.provider_id.clone()),
-                record,
-            );
-        }
-    }
 }

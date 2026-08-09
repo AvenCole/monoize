@@ -205,6 +205,8 @@ TF-17. The canonicalization map MUST include:
 1. `remove_anthropic_billing_header`, `remove_anthropic_billing_headers`, `strip_anthropic_billing_headers`, and `strip_claude_code_billing_header` to `strip_anthropic_billing_header`; and
 2. `auto_cache_openai`, `auto_cache_openai_prompt_key`, and `openai_prompt_cache` to `auto_cache_openai_prompt`.
 
+TF-18. Provider transform-rule id canonicalization MUST use the persistent `system_settings` marker `migration.provider_transform_rule_ids.v1`. When the marker value is `complete`, startup MUST perform only the marker point query and MUST NOT scan `monoize_providers`. When the marker is absent, startup MUST scan Provider transform rows in `id ASC` keyset batches of at most `199`. Each batch read and its set-based CASE update MUST commit in one transaction before the next batch; process memory MUST remain `O(199)`. After every batch commits, startup MUST write the completion marker in a separate final transaction. Invalid transform JSON MUST remain unchanged and MUST NOT prevent the completion marker.
+
 ### 4.1 Transform-visible request and response surfaces
 
 SURF-1. Request-phase transforms MAY read and write typed top-level request fields and top-level request `extra_body`.
@@ -401,7 +403,7 @@ CUMI-8. When `output_format = original`, the transform MUST emit the same suppor
 Both JPEG XL modes MUST emit media type `image/jxl`. Both WebP modes MUST emit media type `image/webp`.
 
 CUMI-9. The cache key material MUST be the ordered byte sequence:
-1. UTF-8 bytes of `compress_user_message_images:v4`;
+1. UTF-8 bytes of `compress_user_message_images:v5`;
 2. one zero byte;
 3. UTF-8 bytes of the source media type;
 4. one zero byte;
@@ -415,9 +417,17 @@ CUMI-9. The cache key material MUST be the ordered byte sequence:
 12. one zero byte; and
 13. the decoded original image bytes.
 
-CUMI-10. The cache key MUST be xxHash3 128-bit over the cache key material, formatted as 32 lowercase hexadecimal characters.
+CUMI-10. The cache key MUST be SHA-256 over the cache key material, formatted as 64 lowercase hexadecimal characters.
 
 CUMI-11. The cache persistence, eviction, and failure-isolation rules from the previous transform specification remain normative, but they apply to eligible ordinary `Image` nodes rather than to nested message parts.
+
+CUMI-12. The decoded source payload MUST be bounded before allocation and image decode. Defaults are 20971520 encoded bytes and 40000000 pixels, configured by `MONOIZE_IMAGE_TRANSFORM_MAX_ENCODED_BYTES` and `MONOIZE_IMAGE_TRANSFORM_MAX_PIXELS`. A source exceeding either limit MUST remain unchanged.
+
+CUMI-13. Concurrent blocking image transformations MUST be limited by a semaphore. The default permit count is 2, configured by `MONOIZE_IMAGE_TRANSFORM_MAX_CONCURRENCY`.
+
+CUMI-14. The content cache root defaults to `${TMPDIR}/monoize/image-transform-cache` and is configured by `MONOIZE_IMAGE_TRANSFORM_CACHE_DIR`. Cache entries expire after 3600 seconds by default; `MONOIZE_IMAGE_TRANSFORM_CACHE_TTL_SECONDS` configures a positive expiration interval in seconds. The cache defaults to at most 2048 regular entry files, 536870912 total entry bytes, and 33554432 bytes per entry. These limits are configured by `MONOIZE_IMAGE_TRANSFORM_CACHE_MAX_FILES`, `MONOIZE_IMAGE_TRANSFORM_CACHE_MAX_BYTES`, and `MONOIZE_IMAGE_TRANSFORM_CACHE_MAX_ENTRY_BYTES`. Writes MUST validate cache keys, use unique same-directory temporary files, and use atomic rename. Startup MUST remove transform-owned stale temporary files. Before admitting a write, cleanup MAY evict oldest entries to remain within both file and byte quotas.
+
+CUMI-15. Cache construction MUST scan the cache directory once, delete expired or invalid entries, evict oldest entries until startup file/byte quotas hold, and build a bounded in-memory metadata index containing key, byte count, modification time, and LRU sequence. Point reads and writes MUST use that index and MUST NOT rescan the cache directory. A point read MUST verify the indexed file's current size before allocating its contents. Point reads MUST update LRU order. A stale point-read observation MUST NOT delete a concurrently published replacement for the same key; validation and deletion MUST serialize with replacement or perform equivalent identity revalidation. Writes MUST evict through the ordered metadata index and MUST update metadata only after atomic rename succeeds. A deletion failure MUST leave metadata accounting intact and fail that cleanup/write operation. Periodic cleanup MAY traverse the bounded metadata index and MUST NOT rescan the directory.
 
 RIU-1. `resolve_image_urls` is request-phase only.
 

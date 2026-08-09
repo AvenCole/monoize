@@ -43,7 +43,7 @@ A request log row has:
 - `visible_generation_ms: integer?` (`last_visible_output_ms - first_visible_output_ms`; null when no visible streaming output basis exists)
 - `visible_output_tokens: integer?` (token count used as the TPS numerator; null when no visible streaming output basis exists)
 - `tps_mode: string?` (`"exact"`, `"estimated"`, or `"approx"`; null for rows without new TPS basis)
-- `request_ip: string?` (client IP address extracted from `x-forwarded-for` header or socket peer)
+- `request_ip: string?` (the server-generated canonical client IP for the request)
 - `tried_providers_json: object[]?` (array of `{ provider_id, channel_id, error }` objects recording providers/channels that were attempted and failed before the final result; persisted as JSON text in DB; null when no fallback occurred)
 - `request_kind: string?` (classification of log source; null for normal client requests. `"active_probe_connectivity"` for active health-probe connectivity tests)
 - `effective_provider_type: string?` (effective upstream type used for the selected attempt; null when no attempt was selected)
@@ -82,11 +82,13 @@ RL1b. The lifecycle row MUST transition from `"pending"` to exactly one terminal
 
 RL1b-1. The only exception to RL1b for an already-delivered normal streaming response is a post-response billing settlement failure. That lifecycle row MUST use `status = "error"` with `error_code = "billing_settlement_failed"`. No additional terminal status value is introduced.
 
-RL1c. Terminal logging MUST enqueue exactly one new row with all fields populated (including terminal status, usage, billing, and provider metadata) into the request-log write batcher. There is no preceding pending row to update. An entry MAY remain in process memory until a successful flush; an abrupt process termination can lose such memory-only entries.
+RL1c. Terminal logging MUST enqueue exactly one new row with all fields populated (including terminal status, usage, billing, and provider metadata) into the request-log write batcher. There is no preceding pending row to update. Enqueue succeeds only after a durable bounded spool file exists. An abrupt process termination after successful enqueue MUST NOT lose the spooled entry.
 
 RL1c-2. The write batcher MUST assign a stable database row ID when an entry is enqueued. If transaction begin, any insert, or commit reports failure, the complete drained batch MUST be returned to the front of the buffer for retry. Retrying the same stable row ID MUST be idempotent so an ambiguous commit outcome cannot create duplicate rows.
 
 RL1c-3. Requeuing a failed batch MUST preserve its original order ahead of entries enqueued while the flush was in progress. A failed flush MUST NOT silently discard any entry.
+
+RL1c-4. If the durable request-log spool cannot accept a terminal row because its byte quota, per-entry quota, or filesystem write failed, terminal-log enqueue MUST return an error to the request-finalization path. The path MUST expose a fail-closed signal and MUST NOT silently report durable billing-log success.
 
 RL1c-0. Enqueuing a terminal row into the request-log write batcher MUST immediately broadcast that terminal row to the request-log SSE stream. SSE visibility of terminal lifecycle transitions MUST NOT wait for the later batch-flush tick, database transaction begin, database commit, or any other write-behind persistence step.
 
@@ -100,15 +102,33 @@ RL1e. When all provider attempts are exhausted (including the case where zero at
 
 RL1f. On server startup, all request-log rows with `status = "pending"` MUST be transitioned to `status = "error"` with `error_code = "server_shutdown"` and `error_message = "interrupted by server restart"`. This cleanup MUST execute before the HTTP listener begins accepting connections.
 
-RL1g. On receipt of SIGINT or SIGTERM, the server MUST initiate graceful shutdown: stop accepting new connections, allow in-flight requests to drain, flush all write batchers (including the request-log batcher), then transition any remaining `"pending"` rows (legacy) to `"error"` with the same fields as RL1f before process exit.
+RL1g. On receipt of SIGINT or SIGTERM, the server MUST initiate graceful shutdown: set the process-local background-shutdown flag, stop accepting new connections, allow in-flight requests to drain, wait for all tracked request-log and active-probe work to finish, flush all write batchers (including the request-log batcher), then transition any remaining `"pending"` rows (legacy) to `"error"` with the same fields as RL1f before process exit.
 
 RL1h. For pass-through streaming requests, if the downstream client disconnects (the response channel closes) before the upstream stream completes, the stream adapter MUST stop consuming upstream events at the next iteration boundary. The request MUST finalize as `status = "success"` with whatever usage was accumulated up to the point of disconnection, and billing MUST execute normally on that accumulated usage.
 
 RL1i. When a provider attempt is selected (upstream call succeeds or streaming begins), the provider metadata (`provider_id`, `channel_id`, `upstream_model`, `provider_multiplier`) MUST be captured in memory and included in the terminal INSERT. No intermediate database write is performed.
 
+RL1j. For every dashboard-managed API-key request that will generate a terminal request log, Monoize MUST reserve durable request-log spool admission after authentication succeeds and before it dispatches an HTTP request upstream, opens an upstream WebSocket, or commits any upstream request headers. If admission is unavailable, Monoize MUST return HTTP `503` with code `request_log_spool_unavailable` and MUST NOT dispatch or partially dispatch the request upstream.
+
+RL1j-1. After duplicate-request-id admission succeeds and before any action listed by RL1j, Monoize MUST arm the reservation with a durable terminal fallback containing the canonical `request_id`, authenticated `user_id` and `api_key_id`, requested model, stream flag, and captured creation time. An arm failure MUST remove that lifecycle by lifecycle identity, return HTTP `503` with code `request_log_spool_unavailable`, and perform no upstream dispatch. A duplicate-request-id rejection MUST drop only an unarmed probe and MUST NOT create a recoverable fallback row.
+
+RL1k. Before forwarding code observes `x-request-id`, Monoize MUST derive one canonical value by trimming its leading and trailing ASCII whitespace. Admission lookup, the pending-snapshot map key, pending and terminal snapshot `request_id`, billing reconciliation, and the terminal database row MUST use that canonical value. An absent, invalid, or whitespace-only incoming value MUST be replaced with a generated UUID before forwarding code observes it.
+
+RL1k-1. At most one in-flight dashboard-managed request may own a given non-empty canonical `request_id`. Admission for a second in-flight request with the same canonical `request_id` MUST fail before upstream dispatch with HTTP `409` and code `duplicate_request_id`.
+
+RL1k-2. One request-log lifecycle owns one preflight `RequestLogReservation` and one atomic `terminal_scheduled` state. Exactly one explicit terminal scheduler or guard fallback MAY change `terminal_scheduled` from false to true. Every losing scheduler MUST perform no terminal enqueue. The winning scheduler MUST enqueue with the lifecycle's original reservation; it MUST NOT reserve replacement capacity by looking up an unnormalized key or by using the unreserved terminal API.
+
+RL1k-3. The lifecycle admission and pending snapshot MUST remain present until the winning terminal task has durably enqueued its row. After successful enqueue, `RequestLogBatcher` removes the pending snapshot before the lifecycle removes its admission entry. Admission removal MUST compare lifecycle identity while the map entry is locked. A terminal task from an older lifecycle MUST NOT remove a later lifecycle after canonical key reuse.
+
+RL1k-4. Dropping a request guard while `terminal_scheduled = false` MUST atomically win terminal scheduling and enqueue one `status = "error"` row from the latest pending snapshot. The fallback row MUST set `error_code = "request_finalization_aborted"`, `error_message = "request ended before terminal log scheduling"`, and `error_http_status = 500`. Guard drop MUST NOT silently release the reservation or delete the pending snapshot.
+
 RL2. Requests authenticated only by static config keys MUST NOT generate request logs.
 
-RL3. Terminal log finalization (`pending -> success/error`) MUST be fire-and-forget (spawned asynchronously) and MUST NOT block the response to the client.
+RL3. Terminal log finalization (`pending -> success/error`) MUST be fire-and-forget (spawned asynchronously) and MUST NOT block the response to the client. Admission MUST register the lifecycle with a process-local terminal-task tracker before upstream dispatch. The tracker count MUST reach zero only after every registered lifecycle's terminal task has returned.
+
+RL3b. SIGINT or SIGTERM handling MUST only signal the HTTP server to stop accepting new work. After HTTP graceful drain completes, shutdown MUST wait until the terminal-task tracker count is zero, then flush all write batchers, then transition legacy database rows that still have `status = "pending"`. Shutdown MUST NOT flush or clean legacy pending rows from the signal future before HTTP drain.
+
+RL3c. `AppState` MUST contain one process-local background-shutdown flag initialized to false. SIGINT or SIGTERM handling MUST set the flag to true before HTTP graceful drain begins. The active-probe scheduler MUST register one task with the same tracker used by request-log lifecycles before the scheduler task is spawned. The scheduler MUST check the flag before each scheduler iteration and before each channel probe dispatch. After the flag becomes true, the scheduler MUST dispatch no new probe. A probe already dispatched MUST finish its upstream call, terminal persistence, and health-state update before the scheduler completes its tracker registration. Shutdown MUST wait for that completion before the final batcher flush.
 
 RL3a. *(Removed — pending row creation is no longer performed. See RL1a for the in-memory accumulation pattern.)*
 
@@ -146,7 +166,7 @@ RL7. The `duration_ms` field MUST measure wall-clock time from the start of requ
 
 RL8. The `request_id` field MUST be populated from the `x-request-id` header set by the tower-http middleware.
 
-RL9. The `request_ip` field MUST be extracted from the `x-forwarded-for` header (first IP), falling back to `x-real-ip`, then omitted if neither is present.
+RL9. The `request_ip` field MUST equal the canonical client IP generated by the server's client-IP middleware. The middleware MUST use the socket peer IP unless that peer matches `MONOIZE_TRUSTED_PROXY_CIDRS`. Only for a trusted proxy peer may the middleware parse `Forwarded`, then `X-Forwarded-For`, then `X-Real-IP`, according to the canonical client-IP rules. A forwarding header supplied by an untrusted peer MUST NOT affect `request_ip`.
 
 RL10. The `channel_id` field MUST record the ID of the channel that ultimately served the request.
 
@@ -202,6 +222,14 @@ RL18b. Within each candidate profile, active-probe pricing MUST use the first el
 
 RL18c. A successful active probe with missing usage, no complete RL18b pair, an invalid selected price, or arithmetic overflow MUST still persist its connectivity log with `charge_nano_usd = null` and `billing_breakdown_json = null`. It MUST NOT substitute zero for a missing or failed calculation. A successful calculated probe snapshot MUST use metered-billing version `2`, include the selected `pricing_profile` and `pricing_model`, and satisfy RL16a through RL16c.
 
+RL18d. Monoize MUST resolve the active-probe system user ID once during process startup and reuse that ID for every probe log. The system user MUST have unlimited balance before startup completes. If the user cannot be read, created, or changed to unlimited balance, startup MUST fail with `active_probe_user_init_failed`. One scheduler tick MUST NOT execute a system-user query per Provider, Channel, or probe.
+
+RL18e. Before each active probe that can produce a successful request log dispatches any upstream bytes, the scheduler MUST reserve durable request-log spool capacity. If reservation fails, the scheduler MUST skip that probe, MUST NOT dispatch it upstream, and MUST NOT update its channel health state.
+
+RL18f. Before dispatch, an active probe MUST arm its reservation with a terminal fallback whose `request_kind = "active_probe_connectivity"` and `error_code = "active_probe_interrupted"`. A completed failed active probe MUST explicitly cancel that armed reservation and MUST NOT persist a request log. A successful active probe MUST enqueue its terminal row with that exact reservation and MUST await successful durable spool enqueue before the scheduler proceeds. It MUST NOT acquire a replacement reservation after upstream dispatch. An abrupt process exit after arming and before either outcome operation MUST leave the fallback recoverable.
+
+RL18g. When the process-local background-shutdown flag becomes true, the active-probe scheduler MUST stop before the next probe dispatch. A probe already dispatched MUST complete the RL18f transition before the scheduler exits. The final shutdown flush MUST occur only after the scheduler's shared task-tracker registration has completed.
+
 RL19. For active probe logs, `api_key_id` MUST be null and UI token column label MUST be rendered as a localized "Connectivity Test" string.
 
 ## 3. Dashboard endpoint
@@ -213,11 +241,11 @@ RL19. For active probe logs, `api_key_id` MUST be null and UI token column label
 - **Query parameters:**
   - `limit: integer` (default 50, clamped to [1, 200])
   - `offset: integer` (default 0, clamped to >= 0)
-  - `model: string?` (filter by model name; supports comma-separated list for multi-model OR matching, e.g. `"gpt-4o, gpt-5"`. Each entry is trimmed and matched via substring.)
+  - `model: string?` (filter by model name; supports comma-separated list for multi-model OR matching, e.g. `"gpt-4o, gpt-5"`. Each entry is trimmed and matched as a case-insensitive literal substring. `%`, `_`, and `\` in an entry are ordinary characters, not LIKE syntax.)
   - `status: string?` (filter by status, exact match: `"pending"`, `"success"`, or `"error"`)
   - `api_key_id: string?` (filter by specific API key ID)
   - `username: string?` (filter by username, exact match via JOIN on `users.username`; only effective when the caller has admin role — non-admin callers ignore this parameter)
-- `search: string?` (full-text search across model, upstream_model, request_id, request_ip)
+  - `search: string?` (case-insensitive literal-substring search across model, upstream_model, request_id, request_ip; `%`, `_`, and `\` are ordinary characters)
   - `time_from: string?` (ISO 8601 / RFC 3339 timestamp; inclusive lower bound on `created_at`)
   - `time_to: string?` (ISO 8601 / RFC 3339 timestamp; exclusive upper bound on `created_at`)
 - **Response:**
@@ -238,13 +266,27 @@ RL-API6. `total_charge_nano_usd` MUST equal the SUM of `charge_nano_usd` across 
 
 RL-API1. When the authenticated user has role `super_admin` or `admin`, the endpoint MUST return logs for ALL users. Otherwise, it MUST return only logs belonging to the current authenticated user.
 
-RL-API2. Results MUST be ordered by `created_at DESC` (most recent first).
+RL-API2. Results MUST be ordered newest first using the complete ordering in RL-API10.
 
 RL-API3. `total` MUST reflect the count of logs matching all active filters, not the page size.
 
 RL-API4. Filter parameters are combined with AND logic.
 
 RL-API5. For admin users applying `username` filter, rows with `request_kind = "active_probe_connectivity"` MUST remain included regardless of username value.
+
+RL-API7. A present `time_from` or `time_to` value MUST parse as RFC 3339. If either value is malformed, the endpoint MUST return HTTP `400`, code `invalid_time_filter`, and `param` equal to the malformed parameter name. The endpoint MUST perform no request-log database query for that request. When both values are present, `time_from` MUST be earlier than `time_to`; otherwise the endpoint MUST return the same HTTP `400` error with `param = "time_from"`.
+
+RL-API8. All filter predicates MUST use a contiguous placeholder sequence. An omitted or rejected filter MUST NOT reserve a placeholder index.
+
+RL-API9. `model` and `search` matching MUST have the same ASCII-case-insensitive literal-substring semantics on SQLite and PostgreSQL. Matching MUST fold only ASCII `A` through `Z` to `a` through `z`; every non-ASCII code point MUST remain unchanged and case-sensitive. The implementation MUST ASCII-fold the bound search text, escape `\`, `%`, and `_` before binding a LIKE pattern, and declare `\` as the LIKE escape character. SQLite MUST fold stored text with `LOWER`. PostgreSQL MUST fold stored text with an ASCII-only expression such as `translate(value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')`; PostgreSQL `LOWER` is not sufficient because its non-ASCII behavior depends on database collation.
+
+RL-API10. The page rows, `total`, and `total_charge_nano_usd` returned by one request MUST be computed from one database snapshot. PostgreSQL reads MUST use at least repeatable-read isolation. The final row order MUST be `created_at_unix_ms DESC` with nulls last, then `created_at DESC`, then `id DESC`; `id` is the unique pagination tie-breaker.
+
+RL-API11. Exact charge totals MUST be aggregated in the database into bounded exact integer components or an exact decimal value. The server MUST NOT transfer one `charge_nano_usd` value per matching row solely to calculate a list-page total. Rust MUST reconstruct or parse the database aggregate with checked `i128` arithmetic. A syntactically canonical charge outside the signed `i128` domain, or a total outside that domain, MUST return an explicit internal storage error. Non-canonical stored charge text is ignored.
+
+RL-API12. The effective maximum number of non-empty comma-separated `model` terms MUST be configured by `MONOIZE_REQUEST_LOG_MODEL_FILTER_MAX_TERMS`. The default and hard maximum MUST both be `32`. A trimmed base-10 integer in `[1, 32]` selects that value. An unset, empty, malformed, zero, negative, or greater-than-32 value MUST resolve to `32`. Empty comma-separated entries are discarded; every remaining entry, including a duplicate, counts as one term because it creates one SQL predicate and one bind value.
+
+RL-API13. If a request supplies more `model` terms than the effective RL-API12 limit, `GET /api/dashboard/request-logs` MUST return HTTP `400`, code `request_log_model_filter_too_many_terms`, and `param = "model"` before executing any database query, including authentication or session lookup. Both admin and non-admin paths MUST apply the same check. The `UserStore` list methods and the SQL filter builder MUST independently reject an over-limit model filter so non-HTTP callers cannot construct an unbounded OR expression or bind list.
 
 ### 3.2 Admin-visible vs user-visible fields
 
@@ -262,8 +304,9 @@ RL-S2. The table MUST have a persisted sortable time column `created_at_unix_ms`
 RL-S2a. The table MUST have indexes on the persisted sortable time column:
 - a composite index on `(user_id, created_at_unix_ms DESC)` for per-user pagination and time-range filtering,
 - an index on `(created_at_unix_ms DESC)` for global pagination, analytics range scans, and retention cleanup.
+- a partial compatibility index on `(created_at)` where `created_at_unix_ms IS NULL`, so the explicit legacy-null range branch does not force a full-table scan.
 
-RL-S2b. Request-log reads MUST use `created_at_unix_ms` as the primary ordering and range-filter column on both SQLite and PostgreSQL. When a row has `created_at_unix_ms IS NULL`, the system MUST fall back to the canonical `created_at` text column only as a compatibility tie-breaker for legacy rows.
+RL-S2b. Request-log reads MUST use `created_at_unix_ms` as the primary ordering and range-filter column on both SQLite and PostgreSQL. A range predicate MUST compare `created_at_unix_ms` directly, without wrapping that indexed column in `COALESCE`, a cast, or a date function. A separate `created_at_unix_ms IS NULL AND created_at ...` branch MUST retain compatibility for legacy null rows. The legacy branch compares normalized UTC RFC 3339 text and MUST NOT change the direct indexed predicate for non-null rows.
 
 RL-S2c. `created_at_unix_ms` MUST be backfilled for pre-existing rows during migration using the canonical `created_at` value when that value is parseable. Rows whose legacy `created_at` cannot be parsed may retain `created_at_unix_ms = NULL`.
 
@@ -271,9 +314,11 @@ RL-S2d. Request-log writes MUST populate both canonical time representations fro
 - `created_at` stores RFC3339 text,
 - `created_at_unix_ms` stores the same instant as Unix epoch milliseconds.
 
-RL-S2e. Request-log charge aggregation MUST preserve the full signed `i128` nano-dollar domain on both backends. The implementation MUST parse syntactically valid canonical `charge_nano_usd` text and fold values with checked `i128` addition. It MUST NOT cast canonical charge text through SQLite `INTEGER`/`BIGINT`, PostgreSQL `BIGINT`, Rust `i64`, `REAL`, `DOUBLE PRECISION`, or `f64`. Aggregate overflow MUST return an explicit internal storage error.
+RL-S2e. Request-log charge aggregation MUST preserve the full signed `i128` nano-dollar domain on both backends. The implementation MUST aggregate syntactically valid canonical `charge_nano_usd` text through exact database decimal arithmetic or bounded decimal limbs, then parse or reconstruct the result with checked `i128` arithmetic. It MUST NOT cast a complete canonical charge through SQLite `INTEGER`/`BIGINT`, PostgreSQL `BIGINT`, Rust `i64`, `REAL`, `DOUBLE PRECISION`, or `f64`. A canonical input outside the signed `i128` domain and aggregate overflow MUST return an explicit internal storage error.
 
 RL-S2f. Request-log scalar token and timing columns decoded into Rust `i64` MUST use SQLite `INTEGER` and PostgreSQL `BIGINT`. Conversion from an in-memory `u64` MUST be checked. A value above `i64::MAX` MUST NOT wrap to a negative number. When the full unsigned value is also present in canonical usage JSON, the unrepresentable scalar field MUST be stored as null and the batcher MUST emit a warning without dropping the terminal row.
+
+RL-S2g. A request-log row read MUST decode every selected database column explicitly. A database type mismatch, malformed persisted JSON, or malformed persisted multiplier MUST return an internal storage error for the read. The decoder MUST NOT replace a failed decode with null, zero, an empty string, or an empty object.
 
 RL-S3. The `user_id` foreign key MUST cascade on delete.
 
@@ -526,11 +571,11 @@ FL51. The aggregate fields `total` and `total_charge_nano_usd` (as defined in se
 
 ### 6.8 Name-cache enrichment model
 
-FL52. REST request-log responses MUST compute enriched fields by query-time joins against the related tables listed in section 1.2. A REST response MUST NOT replace a non-null joined enriched field with null because an in-memory name cache misses the same ID.
+FL52. REST request-log responses MUST compute enriched fields only by query-time joins against the related tables listed in section 1.2. The REST path MUST NOT consult a full-table in-memory name cache or replace JOIN results with cache values.
 
-FL52a. SSE request-log events MUST use in-memory ID-to-name caches for the enriched fields: `provider_name`, `channel_name`, `username`, and `api_key_name`. The server MUST NOT perform database JOINs at SSE event delivery time. If a cache miss occurs for a given ID in an SSE event, the enriched field MUST be null (not omitted), and the client MUST render the raw ID as fallback display text where applicable (per FL9 for channel, analogous for others).
+FL52a. Each in-memory request-log event MUST carry the request-time name snapshots available for `provider_name`, `channel_name`, `username`, and `api_key_name`. SSE delivery MUST convert the event directly to `RequestLogRow` from those snapshots. It MUST NOT perform database JOINs or consult full-table ID-to-name caches at delivery time. A name that was unavailable in the event snapshot MUST be null, and the client MUST render the raw ID as fallback display text where applicable.
 
-FL52b. After a user deletion cascades to that user's API keys, the server MUST remove the deleted user id and all cascaded API key ids from the corresponding in-memory name caches before returning the delete response.
+FL52b. Monoize MUST NOT maintain full-table user, API-key, Provider, or Channel name caches for request-log enrichment. Related-row deletion therefore requires no request-log name-cache invalidation.
 
 ### 6.9 No server-side filtering on SSE
 
@@ -544,7 +589,7 @@ FL54a. The client MUST treat the stream as stale if no SSE bytes (data events or
 
 ### 6.11 Concurrent connection policy
 
-FL55. The endpoint `GET /api/dashboard/request-logs/stream` MUST enforce a per-user concurrent SSE connection cap of 5. When a user already has 5 active SSE connections open on this endpoint, any additional connection attempt by that user MUST be rejected with HTTP 429 Too Many Requests. The active connection count MUST be tracked per authenticated user ID and MUST be decremented atomically when a connection closes (via a Drop guard or equivalent RAII mechanism), ensuring the count remains accurate under concurrent open and close operations.
+FL55. The endpoint `GET /api/dashboard/request-logs/stream` MUST enforce a per-user concurrent SSE connection cap. The default cap is 5 and `MONOIZE_REQUEST_LOG_SSE_MAX_CONNECTIONS_PER_USER` MAY set any positive integer cap. When a user already has the configured number of active SSE connections open on this endpoint, any additional connection attempt by that user MUST be rejected with HTTP 429 Too Many Requests. The active connection count MUST be tracked per authenticated user ID and MUST be decremented atomically when a connection closes (via a Drop guard or equivalent RAII mechanism). A zero counter MUST be removed without an ABA race by comparing the shared counter identity while the map entry is locked. The counter map MUST contain only users with active or concurrently-opening SSE streams.
 
 ### 6.12 Tooltip-pause interaction with SSE
 

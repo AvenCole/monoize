@@ -85,6 +85,18 @@ pub async fn update_settings(
         settings.monoize_affinity_failback_mode,
         settings.monoize_affinity_failback_delay_seconds,
     );
+    let health_settings_before = (
+        settings.monoize_passive_failure_threshold,
+        settings.monoize_passive_cooldown_seconds,
+        settings.monoize_passive_window_seconds,
+        settings.monoize_passive_min_samples,
+        settings.monoize_passive_failure_rate_threshold.to_bits(),
+        settings.monoize_passive_rate_limit_cooldown_seconds,
+        settings.monoize_active_probe_enabled,
+        settings.monoize_active_probe_interval_seconds,
+        settings.monoize_active_probe_success_threshold,
+        settings.monoize_active_probe_model.clone(),
+    );
 
     if let Some(v) = body.registration_enabled {
         settings.registration_enabled = v;
@@ -93,9 +105,23 @@ pub async fn update_settings(
         settings.default_user_role = v;
     }
     if let Some(v) = body.session_ttl_days {
+        if v <= 0 {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "session_ttl_days must be positive",
+            ));
+        }
         settings.session_ttl_days = v;
     }
     if let Some(v) = body.api_key_max_per_user {
+        if v <= 0 {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "api_key_max_per_user must be positive",
+            ));
+        }
         settings.api_key_max_per_user = v;
     }
     if let Some(v) = body.site_name {
@@ -195,13 +221,8 @@ pub async fn update_settings(
         settings.monoize_affinity_failback_delay_seconds = v;
     }
 
-    settings_store
-        .update_all(&settings)
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
     let updated = settings_store
-        .get_all()
+        .update_all(&settings)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
@@ -221,6 +242,9 @@ pub async fn update_settings(
         rt.active_probe_model = updated.monoize_active_probe_model.clone();
         rt.global_transforms = updated.global_transforms.clone();
         rt.global_model_redirects = updated.global_model_redirects.clone();
+        rt.reasoning_suffix_map = updated.reasoning_suffix_map.clone();
+        rt.pricing_profile_model_patterns = updated.pricing_profile_model_patterns.clone();
+        rt.codex_model_ids = updated.codex_model_ids.clone();
         rt.extra_fields_whitelist = updated.monoize_extra_fields_whitelist.clone();
         rt.strip_cross_protocol_nested_extra = updated.monoize_strip_cross_protocol_nested_extra;
         rt.request_capture_enabled = updated.monoize_request_capture_enabled;
@@ -237,9 +261,28 @@ pub async fn update_settings(
         updated.monoize_affinity_failback_mode,
         updated.monoize_affinity_failback_delay_seconds,
     );
-    if affinity_settings_before != affinity_settings_after {
+    let health_settings_after = (
+        updated.monoize_passive_failure_threshold,
+        updated.monoize_passive_cooldown_seconds,
+        updated.monoize_passive_window_seconds,
+        updated.monoize_passive_min_samples,
+        updated.monoize_passive_failure_rate_threshold.to_bits(),
+        updated.monoize_passive_rate_limit_cooldown_seconds,
+        updated.monoize_active_probe_enabled,
+        updated.monoize_active_probe_interval_seconds,
+        updated.monoize_active_probe_success_threshold,
+        updated.monoize_active_probe_model.clone(),
+    );
+    let affinity_changed = affinity_settings_before != affinity_settings_after;
+    let health_changed = health_settings_before != health_settings_after;
+    if affinity_changed || health_changed {
         state.routing_config_revision.fetch_add(1, Ordering::AcqRel);
+    }
+    if affinity_changed {
         state.channel_affinity.lock().await.clear();
+    }
+    if health_changed {
+        state.channel_health.lock().await.clear();
     }
 
     Ok(Json(updated))
@@ -258,8 +301,8 @@ pub async fn get_dashboard_stats(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
-    let my_api_keys = user_store
-        .list_user_api_keys(&user.id)
+    let my_api_keys_count = user_store
+        .count_user_api_keys(&user.id)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
@@ -271,7 +314,7 @@ pub async fn get_dashboard_stats(
 
     Ok(Json(json!({
         "user_count": user_count,
-        "my_api_keys_count": my_api_keys.len(),
+        "my_api_keys_count": my_api_keys_count,
         "providers_count": providers_count,
         "current_user": UserResponse::from(user),
     })))
@@ -303,19 +346,12 @@ pub async fn get_config_overview(
 }
 
 pub async fn get_public_settings(State(state): State<AppState>) -> AppResult<impl IntoResponse> {
-    let settings_store = &state.settings_store;
-
-    let settings = settings_store
-        .get_all()
+    let settings = state
+        .settings_store
+        .get_public_settings()
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    Ok(Json(json!({
-        "registration_enabled": settings.registration_enabled,
-        "site_name": settings.site_name,
-        "site_description": settings.site_description,
-        "api_base_url": settings.api_base_url,
-    })))
+    Ok(Json(settings))
 }
 
 /// Redact credentials from a DSN string.

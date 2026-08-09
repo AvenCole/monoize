@@ -92,18 +92,22 @@ struct CatalogBillingRate {
     modality: Option<String>,
     #[serde(default)]
     cache_ttl: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_json_object")]
     match_json: Value,
     #[serde(default)]
     priority: i32,
     #[serde(default = "default_true")]
     enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_json_object")]
     raw_json: Value,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_json_object() -> Value {
+    serde_json::json!({})
 }
 
 #[derive(Clone)]
@@ -130,7 +134,7 @@ impl BillingRateStore {
             ))
             .await
             .map_err(|e| e.to_string())?;
-        rows.iter().map(row_to_billing_rate).collect()
+        rows.iter().map(decode_billing_rate_row).collect()
     }
 
     pub async fn list_matching_rates(
@@ -156,23 +160,150 @@ impl BillingRateStore {
             .await
             .map_err(|e| e.to_string())?;
 
-        rows.iter()
-            .map(row_to_billing_rate)
-            .filter_map(|result| match result {
-                Ok(rate) => {
-                    if rate
-                        .model_pattern
-                        .as_deref()
-                        .is_none_or(|pattern| glob_matches(pattern, model))
-                    {
-                        Some(Ok(rate))
-                    } else {
-                        None
-                    }
+        let mut rates = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let rate = decode_billing_rate_row(row)?;
+            if rate
+                .model_pattern
+                .as_deref()
+                .is_none_or(|pattern| glob_matches(pattern, model))
+            {
+                rates.push(rate);
+            }
+        }
+        Ok(rates)
+    }
+
+    pub async fn list_matching_rates_for_profiles(
+        &self,
+        pricing_profiles: &[String],
+        provider_type: Option<&str>,
+        model: &str,
+    ) -> Result<Vec<DbBillingRateRecord>, String> {
+        if pricing_profiles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pricing_profiles = pricing_profiles
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut rates = Vec::new();
+        const PROFILE_LOOKUP_CHUNK_SIZE: usize = 399;
+        for chunk in pricing_profiles.chunks(PROFILE_LOOKUP_CHUNK_SIZE) {
+            let placeholders = (0..chunk.len())
+                .map(|index| format!("${}", index + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() + 1);
+            values.push(provider_type.unwrap_or("").into());
+            values.extend(chunk.iter().cloned().map(Into::into));
+            let rows = self
+                .db
+                .read()
+                .query_all(self.db.stmt(
+                    &format!(
+                        "SELECT id, source, pricing_profile, model_pattern, provider_type, rate_kind,
+                                usage_class, unit, unit_price_nano_usd, context_tier, service_tier,
+                                modality, cache_ttl, match_json, priority, enabled, raw_json, updated_at
+                         FROM billing_rate_records
+                         WHERE enabled = 1
+                           AND (provider_type IS NULL OR provider_type = $1)
+                           AND pricing_profile IN ({placeholders})
+                         ORDER BY priority DESC, id ASC"
+                    ),
+                    values,
+                ))
+                .await
+                .map_err(|e| e.to_string())?;
+            for row in &rows {
+                let rate = decode_billing_rate_row(row)?;
+                if rate
+                    .model_pattern
+                    .as_deref()
+                    .is_none_or(|pattern| glob_matches(pattern, model))
+                {
+                    rates.push(rate);
                 }
-                Err(err) => Some(Err(err)),
-            })
-            .collect()
+            }
+        }
+        rates.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(rates)
+    }
+
+    pub async fn list_candidate_rates_for_profiles_and_provider_types(
+        &self,
+        pricing_profiles: &[String],
+        provider_types: &[String],
+    ) -> Result<Vec<DbBillingRateRecord>, String> {
+        if pricing_profiles.is_empty() || provider_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pricing_profiles = pricing_profiles
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let provider_types = provider_types
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut rates_by_id = std::collections::HashMap::new();
+        const SET_LOOKUP_CHUNK_SIZE: usize = 200;
+        for profile_chunk in pricing_profiles.chunks(SET_LOOKUP_CHUNK_SIZE) {
+            for type_chunk in provider_types.chunks(SET_LOOKUP_CHUNK_SIZE) {
+                let profile_placeholders = (0..profile_chunk.len())
+                    .map(|index| format!("${}", index + 1))
+                    .collect::<Vec<_>>();
+                let type_placeholders = (0..type_chunk.len())
+                    .map(|index| format!("${}", profile_chunk.len() + index + 1))
+                    .collect::<Vec<_>>();
+                let mut values: Vec<sea_orm::Value> =
+                    profile_chunk.iter().cloned().map(Into::into).collect();
+                values.extend(type_chunk.iter().cloned().map(Into::into));
+                let rows = self
+                    .db
+                    .read()
+                    .query_all(self.db.stmt(
+                        &format!(
+                            "SELECT id, source, pricing_profile, model_pattern, provider_type, rate_kind,
+                                    usage_class, unit, unit_price_nano_usd, context_tier, service_tier,
+                                    modality, cache_ttl, match_json, priority, enabled, raw_json, updated_at
+                             FROM billing_rate_records
+                             WHERE enabled = 1
+                               AND pricing_profile IN ({})
+                               AND (provider_type IS NULL OR provider_type IN ({}))
+                             ORDER BY priority DESC, id ASC",
+                            profile_placeholders.join(", "),
+                            type_placeholders.join(", ")
+                        ),
+                        values,
+                    ))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                for row in &rows {
+                    let rate = decode_billing_rate_row(row)?;
+                    rates_by_id.insert(rate.id.clone(), rate);
+                }
+            }
+        }
+        let mut rates = rates_by_id.into_values().collect::<Vec<_>>();
+        rates.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(rates)
     }
 
     pub async fn upsert_billing_rate(
@@ -184,7 +315,34 @@ impl BillingRateStore {
             return Err("id must not be empty".to_string());
         }
 
-        let existing = self.get_billing_rate(id).await?;
+        let write_guard = self.db.write().await;
+        let txn = write_guard.begin().await.map_err(|e| e.to_string())?;
+        if self.db.is_postgres() {
+            txn.execute_unprepared("LOCK TABLE billing_rate_records IN SHARE ROW EXCLUSIVE MODE")
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let lock_suffix = if self.db.is_postgres() {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let existing_row = txn
+            .query_one(self.db.stmt(
+                &format!(
+                    "SELECT id, source, pricing_profile, model_pattern, provider_type, rate_kind,
+                            usage_class, unit, unit_price_nano_usd, context_tier, service_tier,
+                            modality, cache_ttl, match_json, priority, enabled, raw_json, updated_at
+                     FROM billing_rate_records WHERE id = $1{lock_suffix}"
+                ),
+                vec![id.into()],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        let existing = existing_row
+            .as_ref()
+            .map(decode_billing_rate_row)
+            .transpose()?;
         let source = input.source.unwrap_or_else(|| "manual".to_string());
         let pricing_profile = input
             .pricing_profile
@@ -249,12 +407,11 @@ impl BillingRateStore {
             .raw_json
             .or_else(|| existing.as_ref().map(|r| r.raw_json.clone()))
             .unwrap_or_else(|| serde_json::json!({}));
+        require_json_object(id, "match_json", &match_json)?;
+        require_json_object(id, "raw_json", &raw_json)?;
         let now = Utc::now().to_rfc3339();
 
-        self.db
-            .write()
-            .await
-            .execute(self.db.stmt(
+        txn.execute(self.db.stmt(
                 "INSERT INTO billing_rate_records
                  (id, source, pricing_profile, model_pattern, provider_type, rate_kind, usage_class,
                   unit, unit_price_nano_usd, context_tier, service_tier, modality, cache_ttl,
@@ -302,6 +459,8 @@ impl BillingRateStore {
             .await
             .map_err(|e| e.to_string())?;
 
+        txn.commit().await.map_err(|e| e.to_string())?;
+
         self.get_billing_rate(id)
             .await?
             .ok_or_else(|| "upsert succeeded but billing rate not found".to_string())
@@ -321,7 +480,7 @@ impl BillingRateStore {
             ))
             .await
             .map_err(|e| e.to_string())?;
-        row.as_ref().map(row_to_billing_rate).transpose()
+        row.as_ref().map(decode_billing_rate_row).transpose()
     }
 
     pub async fn delete_billing_rate(&self, id: &str) -> Result<bool, String> {
@@ -341,6 +500,24 @@ impl BillingRateStore {
     pub async fn sync_catalog(&self) -> Result<BillingRateSyncResult, String> {
         let catalog: CatalogRoot = serde_json::from_str(BILLING_RATE_CATALOG)
             .map_err(|e| format!("catalog_parse_failed: {e}"))?;
+        for rate in &catalog.rates {
+            let parsed = rate.unit_price_nano_usd.parse::<i128>().map_err(|_| {
+                format!(
+                    "catalog_parse_failed: invalid unit_price_nano_usd for {}",
+                    rate.id
+                )
+            })?;
+            if parsed < 0 || parsed.to_string() != rate.unit_price_nano_usd {
+                return Err(format!(
+                    "catalog_parse_failed: non-canonical unit_price_nano_usd for {}",
+                    rate.id
+                ));
+            }
+            require_json_object(&rate.id, "match_json", &rate.match_json)
+                .map_err(|error| format!("catalog_parse_failed: {error}"))?;
+            require_json_object(&rate.id, "raw_json", &rate.raw_json)
+                .map_err(|error| format!("catalog_parse_failed: {error}"))?;
+        }
         let fetched_at = Utc::now().to_rfc3339();
         let _write_guard = self.db.write().await;
         let txn = _write_guard.begin().await.map_err(|e| e.to_string())?;
@@ -354,8 +531,11 @@ impl BillingRateStore {
             .map_err(|e| e.to_string())?;
         let manual_ids: HashSet<String> = manual_rows
             .iter()
-            .filter_map(|row| row.try_get::<String>("", "id").ok())
-            .collect();
+            .map(|row| {
+                row.try_get::<String>("", "id")
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<_, _>>()?;
 
         let del_result = txn
             .execute(self.db.stmt(
@@ -366,45 +546,62 @@ impl BillingRateStore {
             .map_err(|e| e.to_string())?;
         let deleted = del_result.rows_affected();
 
-        let mut upserted = 0usize;
         let mut skipped = 0usize;
+        let mut writes = Vec::with_capacity(catalog.rates.len());
         for rate in catalog.rates {
             if manual_ids.contains(&rate.id) {
                 skipped += 1;
                 continue;
             }
-            txn.execute(self.db.stmt(
-                "INSERT INTO billing_rate_records
-                 (id, source, pricing_profile, model_pattern, provider_type, rate_kind, usage_class,
-                  unit, unit_price_nano_usd, context_tier, service_tier, modality, cache_ttl,
-                  match_json, priority, enabled, raw_json, updated_at)
-                 VALUES ($1, 'catalog', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
-                vec![
-                    rate.id.into(),
-                    rate.pricing_profile.into(),
-                    rate.model_pattern.into(),
-                    rate.provider_type.into(),
-                    rate.rate_kind.into(),
-                    rate.usage_class.into(),
-                    rate.unit.into(),
-                    rate.unit_price_nano_usd.into(),
-                    rate.context_tier.into(),
-                    rate.service_tier.into(),
-                    rate.modality.into(),
-                    rate.cache_ttl.into(),
+            writes.push(rate);
+        }
+
+        const CATALOG_SYNC_CHUNK_SIZE: usize = 23;
+        for chunk in writes.chunks(CATALOG_SYNC_CHUNK_SIZE) {
+            let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 17);
+            let mut rows = Vec::with_capacity(chunk.len());
+            for rate in chunk {
+                let start = values.len() + 1;
+                values.extend([
+                    rate.id.clone().into(),
+                    rate.pricing_profile.clone().into(),
+                    rate.model_pattern.clone().into(),
+                    rate.provider_type.clone().into(),
+                    rate.rate_kind.clone().into(),
+                    rate.usage_class.clone().into(),
+                    rate.unit.clone().into(),
+                    rate.unit_price_nano_usd.clone().into(),
+                    rate.context_tier.clone().into(),
+                    rate.service_tier.clone().into(),
+                    rate.modality.clone().into(),
+                    rate.cache_ttl.clone().into(),
                     rate.match_json.to_string().into(),
                     rate.priority.into(),
                     (if rate.enabled { 1_i32 } else { 0_i32 }).into(),
                     rate.raw_json.to_string().into(),
                     fetched_at.clone().into(),
-                ],
+                ]);
+                let mut placeholders = vec![format!("${start}"), "'catalog'".to_string()];
+                placeholders.extend((start + 1..start + 17).map(|index| format!("${index}")));
+                rows.push(format!("({})", placeholders.join(", ")));
+            }
+            txn.execute(self.db.stmt(
+                &format!(
+                    "INSERT INTO billing_rate_records
+                     (id, source, pricing_profile, model_pattern, provider_type, rate_kind,
+                      usage_class, unit, unit_price_nano_usd, context_tier, service_tier,
+                      modality, cache_ttl, match_json, priority, enabled, raw_json, updated_at)
+                     VALUES {}",
+                    rows.join(", ")
+                ),
+                values,
             ))
             .await
             .map_err(|e| e.to_string())?;
-            upserted += 1;
         }
 
         txn.commit().await.map_err(|e| e.to_string())?;
+        let upserted = writes.len();
         Ok(BillingRateSyncResult {
             success: true,
             upserted,
@@ -416,17 +613,38 @@ impl BillingRateStore {
 }
 
 pub fn glob_matches(pattern: &str, value: &str) -> bool {
-    fn inner(p: &[u8], v: &[u8]) -> bool {
-        if p.is_empty() {
-            return v.is_empty();
-        }
-        match p[0] {
-            b'*' => inner(&p[1..], v) || (!v.is_empty() && inner(p, &v[1..])),
-            b'?' => !v.is_empty() && inner(&p[1..], &v[1..]),
-            ch => !v.is_empty() && ch.eq_ignore_ascii_case(&v[0]) && inner(&p[1..], &v[1..]),
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let mut pattern_index = 0;
+    let mut value_index = 0;
+    let mut last_star_index = None;
+    let mut last_star_match_index = 0;
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && pattern[pattern_index] != b'*'
+            && (pattern[pattern_index] == b'?'
+                || pattern[pattern_index].eq_ignore_ascii_case(&value[value_index]))
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            last_star_index = Some(pattern_index);
+            pattern_index += 1;
+            last_star_match_index = value_index;
+        } else if let Some(star_index) = last_star_index {
+            last_star_match_index += 1;
+            value_index = last_star_match_index;
+            pattern_index = star_index + 1;
+        } else {
+            return false;
         }
     }
-    inner(pattern.as_bytes(), value.as_bytes())
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 pub fn select_pricing_profile<'a>(
@@ -439,9 +657,27 @@ pub fn select_pricing_profile<'a>(
         .map(|entry| entry.pricing_profile.as_str())
 }
 
-fn row_to_billing_rate(row: &sea_orm::QueryResult) -> Result<DbBillingRateRecord, String> {
+fn require_json_object(id: &str, column: &str, value: &Value) -> Result<(), String> {
+    if value.is_object() {
+        Ok(())
+    } else {
+        Err(format!("billing rate {id} {column} must be a JSON object"))
+    }
+}
+
+fn decode_json_object(id: &str, column: &str, raw: &str) -> Result<Value, String> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| format!("invalid billing_rate_records.{column} for row {id}: {error}"))?;
+    require_json_object(id, column, &value)?;
+    Ok(value)
+}
+
+fn decode_billing_rate_row(row: &sea_orm::QueryResult) -> Result<DbBillingRateRecord, String> {
+    let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
     let match_json_raw: String = row.try_get("", "match_json").map_err(|e| e.to_string())?;
     let raw_json_raw: String = row.try_get("", "raw_json").map_err(|e| e.to_string())?;
+    let match_json = decode_json_object(&id, "match_json", &match_json_raw)?;
+    let raw_json = decode_json_object(&id, "raw_json", &raw_json_raw)?;
     let updated_at_raw: String = row.try_get("", "updated_at").map_err(|e| e.to_string())?;
     let updated_at = DateTime::parse_from_rfc3339(&updated_at_raw)
         .map_err(|e| e.to_string())?
@@ -449,7 +685,7 @@ fn row_to_billing_rate(row: &sea_orm::QueryResult) -> Result<DbBillingRateRecord
     let enabled_i: i32 = row.try_get("", "enabled").map_err(|e| e.to_string())?;
 
     Ok(DbBillingRateRecord {
-        id: row.try_get("", "id").map_err(|e| e.to_string())?,
+        id,
         source: row.try_get("", "source").map_err(|e| e.to_string())?,
         pricing_profile: row
             .try_get("", "pricing_profile")
@@ -470,24 +706,43 @@ fn row_to_billing_rate(row: &sea_orm::QueryResult) -> Result<DbBillingRateRecord
         service_tier: row.try_get("", "service_tier").map_err(|e| e.to_string())?,
         modality: row.try_get("", "modality").map_err(|e| e.to_string())?,
         cache_ttl: row.try_get("", "cache_ttl").map_err(|e| e.to_string())?,
-        match_json: serde_json::from_str(&match_json_raw).unwrap_or_else(|_| serde_json::json!({})),
+        match_json,
         priority: row.try_get("", "priority").map_err(|e| e.to_string())?,
         enabled: enabled_i != 0,
-        raw_json: serde_json::from_str(&raw_json_raw).unwrap_or_else(|_| serde_json::json!({})),
+        raw_json,
         updated_at,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{glob_matches, select_pricing_profile};
+    use super::{BillingRateStore, UpsertBillingRateInput, glob_matches, select_pricing_profile};
+    use crate::db::DbPool;
+    use crate::migration::Migrator;
     use crate::settings::PricingProfilePattern;
+    use sea_orm::ConnectionTrait;
+    use sea_orm_migration::MigratorTrait;
 
     #[test]
     fn glob_matching_is_case_insensitive_and_orderable() {
         assert!(glob_matches("gpt-*", "GPT-5.5"));
         assert!(glob_matches("claude-sonnet-4?", "claude-sonnet-45"));
         assert!(!glob_matches("claude-opus-*", "claude-sonnet-4"));
+    }
+
+    #[test]
+    fn glob_matching_handles_long_values_without_recursive_stack_growth() {
+        let value = format!("{}Z", "a".repeat(200_000));
+        assert!(glob_matches("*a*a*a*?", &value));
+        assert!(!glob_matches("*a*a*a*y", &value));
+    }
+
+    #[test]
+    fn glob_matching_preserves_multiple_star_and_question_semantics() {
+        assert!(glob_matches("**a***b?c**", "xxAyybZc-tail"));
+        assert!(glob_matches("***", "anything"));
+        assert!(glob_matches("a**", "A"));
+        assert!(!glob_matches("*a?b*", "ab"));
     }
 
     #[test]
@@ -514,6 +769,101 @@ mod tests {
         assert_eq!(
             select_pricing_profile(&patterns, "claude-opus-4"),
             Some("fallback")
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_billing_rate_json_decode_is_fail_closed() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let store = BillingRateStore::new(db.clone())
+            .await
+            .expect("store creates");
+        db.write()
+            .await
+            .execute(db.stmt(
+                "INSERT INTO billing_rate_records
+                 (id, source, pricing_profile, rate_kind, usage_class, unit,
+                  unit_price_nano_usd, match_json, priority, enabled, raw_json, updated_at)
+                 VALUES ($1, 'manual', 'corrupt-test', 'token', 'input_uncached', 'token',
+                         '1', $2, 0, 1, $3, '2026-01-01T00:00:00+00:00')",
+                vec!["corrupt-json".into(), "{not-json".into(), "{}".into()],
+            ))
+            .await
+            .expect("corrupt row inserts");
+
+        let error = store
+            .list_matching_rates("corrupt-test", None, "any-model")
+            .await
+            .expect_err("malformed match_json must fail the complete lookup");
+        assert!(error.contains("corrupt-json"));
+        assert!(error.contains("match_json"));
+
+        db.write()
+            .await
+            .execute(db.stmt(
+                "UPDATE billing_rate_records SET match_json = '{}', raw_json = $1 WHERE id = $2",
+                vec!["not-json".into(), "corrupt-json".into()],
+            ))
+            .await
+            .expect("raw json corrupts");
+        let error = store
+            .get_billing_rate("corrupt-json")
+            .await
+            .expect_err("malformed raw_json must fail the point lookup");
+        assert!(error.contains("corrupt-json"));
+        assert!(error.contains("raw_json"));
+
+        db.write()
+            .await
+            .execute(db.stmt(
+                "UPDATE billing_rate_records SET match_json = '[]', raw_json = '{}' WHERE id = $1",
+                vec!["corrupt-json".into()],
+            ))
+            .await
+            .expect("non-object match json stores");
+        let error = store
+            .get_billing_rate("corrupt-json")
+            .await
+            .expect_err("non-object match_json must fail the point lookup");
+        assert!(error.contains("match_json must be a JSON object"));
+
+        let error = store
+            .upsert_billing_rate(
+                "invalid-input",
+                UpsertBillingRateInput {
+                    source: None,
+                    pricing_profile: Some("corrupt-test".to_string()),
+                    model_pattern: None,
+                    provider_type: None,
+                    rate_kind: Some("token".to_string()),
+                    usage_class: Some("output".to_string()),
+                    unit: Some("token".to_string()),
+                    unit_price_nano_usd: Some("1".to_string()),
+                    context_tier: None,
+                    service_tier: None,
+                    modality: None,
+                    cache_ttl: None,
+                    match_json: Some(serde_json::json!([])),
+                    priority: None,
+                    enabled: None,
+                    raw_json: Some(serde_json::json!({})),
+                },
+            )
+            .await
+            .expect_err("upsert must reject a non-object match_json");
+        assert!(error.contains("match_json must be a JSON object"));
+        assert!(
+            store
+                .get_billing_rate("invalid-input")
+                .await
+                .expect("point lookup succeeds")
+                .is_none()
         );
     }
 }

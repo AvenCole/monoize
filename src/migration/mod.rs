@@ -32,6 +32,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260729_000024_channel_affinity_overrides::Migration),
             Box::new(m20260809_000025_storage_ledger_integrity::Migration),
             Box::new(m20260809_000026_exact_multiplier_text::Migration),
+            Box::new(m20260809_000027_request_log_legacy_time_index::Migration),
+            Box::new(m20260809_000028_channel_model_name_index::Migration),
+            Box::new(m20260809_000029_sessions_expires_at_index::Migration),
         ]
     }
 }
@@ -62,3 +65,6 @@ mod m20260718_000023_channel_model_multiplier_float8;
 mod m20260729_000024_channel_affinity_overrides;
 mod m20260809_000025_storage_ledger_integrity;
 mod m20260809_000026_exact_multiplier_text;
+mod m20260809_000027_request_log_legacy_time_index;
+mod m20260809_000028_channel_model_name_index;
+mod m20260809_000029_sessions_expires_at_index;

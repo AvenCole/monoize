@@ -11,7 +11,116 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-pub(crate) type SseFrameCapture = Arc<Mutex<Vec<String>>>;
+const DEFAULT_MAX_ATTEMPTS: usize = 16;
+const DEFAULT_MAX_FRAMES: usize = 4_096;
+const DEFAULT_MAX_FRAME_BYTES: usize = 256 * 1024;
+const DEFAULT_MAX_SESSION_BYTES: usize = 16 * 1024 * 1024;
+const MIN_SESSION_BYTES: usize = 8 * 1024;
+const MAX_CAPTURE_IDENTIFIER_BYTES: usize = 256;
+
+#[derive(Clone, Copy, Debug)]
+struct RequestCaptureLimits {
+    max_attempts: usize,
+    max_frames: usize,
+    max_frame_bytes: usize,
+    max_session_bytes: usize,
+}
+
+impl RequestCaptureLimits {
+    fn from_env() -> Self {
+        Self {
+            max_attempts: positive_env(
+                "MONOIZE_REQUEST_CAPTURE_MAX_ATTEMPTS",
+                DEFAULT_MAX_ATTEMPTS,
+            ),
+            max_frames: positive_env("MONOIZE_REQUEST_CAPTURE_MAX_FRAMES", DEFAULT_MAX_FRAMES),
+            max_frame_bytes: positive_env(
+                "MONOIZE_REQUEST_CAPTURE_MAX_FRAME_BYTES",
+                DEFAULT_MAX_FRAME_BYTES,
+            ),
+            max_session_bytes: positive_env(
+                "MONOIZE_REQUEST_CAPTURE_MAX_SESSION_BYTES",
+                DEFAULT_MAX_SESSION_BYTES,
+            )
+            .max(MIN_SESSION_BYTES),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SseFrameCapture {
+    state: Arc<Mutex<SseFrameCaptureState>>,
+    limits: RequestCaptureLimits,
+}
+
+#[derive(Debug, Default)]
+struct SseFrameCaptureState {
+    frames: Vec<String>,
+    omitted_frames: usize,
+    omitted_bytes: usize,
+    retained_bytes: usize,
+}
+
+impl SseFrameCapture {
+    pub(crate) fn new() -> Self {
+        Self::with_limits(RequestCaptureLimits::from_env())
+    }
+
+    fn with_limits(limits: RequestCaptureLimits) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SseFrameCaptureState::default())),
+            limits,
+        }
+    }
+
+    pub(crate) async fn record(&self, frame: String) {
+        let mut state = self.state.lock().await;
+        if state.frames.len() >= self.limits.max_frames {
+            state.omitted_frames = state.omitted_frames.saturating_add(1);
+            state.omitted_bytes = state.omitted_bytes.saturating_add(frame.len());
+            return;
+        }
+        let available = self
+            .limits
+            .max_session_bytes
+            .saturating_sub(state.retained_bytes);
+        if available == 0 {
+            state.omitted_frames = state.omitted_frames.saturating_add(1);
+            state.omitted_bytes = state.omitted_bytes.saturating_add(frame.len());
+            return;
+        }
+        let retained = truncate_utf8(&frame, self.limits.max_frame_bytes.min(available));
+        if retained.is_empty() && !frame.is_empty() {
+            state.omitted_frames = state.omitted_frames.saturating_add(1);
+            state.omitted_bytes = state.omitted_bytes.saturating_add(frame.len());
+            return;
+        }
+        state.omitted_bytes = state
+            .omitted_bytes
+            .saturating_add(frame.len().saturating_sub(retained.len()));
+        state.retained_bytes = state.retained_bytes.saturating_add(retained.len());
+        state.frames.push(retained);
+    }
+
+    pub(crate) async fn snapshot(&self) -> CapturedSseFrames {
+        let state = self.state.lock().await;
+        CapturedSseFrames {
+            frames: state.frames.clone(),
+            truncation: CaptureTruncation {
+                omitted_frames: state.omitted_frames,
+                omitted_bytes: state.omitted_bytes,
+                retained_bytes: state.retained_bytes,
+                retained_frames: state.frames.len(),
+                ..CaptureTruncation::default()
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn captured_frames(&self) -> Vec<String> {
+        self.state.lock().await.frames.clone()
+    }
+}
 
 tokio::task_local! {
     static CURRENT_SSE_CAPTURE: SseFrameCapture;
@@ -19,7 +128,7 @@ tokio::task_local! {
 
 pub(crate) async fn capture_sse_frame(frame: String) {
     if let Ok(capture) = CURRENT_SSE_CAPTURE.try_with(Clone::clone) {
-        capture.lock().await.push(frame);
+        capture.record(frame).await;
     }
 }
 
@@ -38,7 +147,7 @@ where
     let capture = CURRENT_SSE_CAPTURE.try_with(Clone::clone).ok();
     tokio::spawn(async move {
         if let Some(capture) = capture {
-            with_sse_capture(capture, future).await
+            CURRENT_SSE_CAPTURE.scope(capture, future).await
         } else {
             future.await
         }
@@ -48,6 +157,7 @@ where
 #[derive(Clone)]
 pub struct RequestCaptureStore {
     dump_dir: Arc<PathBuf>,
+    limits: RequestCaptureLimits,
 }
 
 #[derive(Clone)]
@@ -61,6 +171,36 @@ pub(crate) struct RequestCaptureSession {
     is_stream: bool,
     mode: RequestCaptureMode,
     attempts: Arc<Mutex<Vec<Value>>>,
+    limits: RequestCaptureLimits,
+    truncation: Arc<Mutex<CaptureTruncation>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CaptureTruncation {
+    omitted_attempts: usize,
+    omitted_frames: usize,
+    omitted_bytes: usize,
+    retained_bytes: usize,
+    retained_frames: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedSseFrames {
+    frames: Vec<String>,
+    truncation: CaptureTruncation,
+}
+
+impl CaptureTruncation {
+    fn to_json(&self) -> Value {
+        json!({
+            "truncated": self.omitted_attempts > 0 || self.omitted_frames > 0 || self.omitted_bytes > 0,
+            "omitted_attempts": self.omitted_attempts,
+            "omitted_frames": self.omitted_frames,
+            "omitted_bytes": self.omitted_bytes,
+            "retained_bytes": self.retained_bytes,
+            "retained_frames": self.retained_frames,
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -76,9 +216,12 @@ pub(crate) fn build_attempt_dump(
     transformed_urp_request: &crate::urp::UrpRequest,
     upstream_request: Value,
     downstream_response: Option<Value>,
-    downstream_sse_frames: Option<Vec<String>>,
+    downstream_sse_frames: Option<CapturedSseFrames>,
     error: Option<Value>,
 ) -> Value {
+    let (downstream_sse_frames, frame_truncation) = downstream_sse_frames
+        .map(|capture| (Some(capture.frames), capture.truncation))
+        .unwrap_or((None, CaptureTruncation::default()));
     json!({
         "attempt_number": attempt_number,
         "provider_id": provider_id,
@@ -92,6 +235,7 @@ pub(crate) fn build_attempt_dump(
         "upstream_request": upstream_request,
         "downstream_response": downstream_response,
         "downstream_sse_frames": downstream_sse_frames,
+        "downstream_sse_frames_truncation": frame_truncation.to_json(),
         "error": error,
     })
 }
@@ -100,6 +244,7 @@ impl RequestCaptureStore {
     pub fn new(database_dsn: &str) -> Self {
         Self {
             dump_dir: Arc::new(data_dir_from_database_dsn(database_dsn).join("dumps")),
+            limits: RequestCaptureLimits::from_env(),
         }
     }
 
@@ -121,6 +266,18 @@ impl RequestCaptureStore {
         }
         let api_key_id = auth.api_key_id.clone()?;
         let user_id = auth.user_id.clone()?;
+        let (request_id, omitted_request_id_bytes) = match request_id {
+            Some(request_id) => {
+                let retained = truncate_utf8(&request_id, MAX_CAPTURE_IDENTIFIER_BYTES);
+                let omitted = request_id.len().saturating_sub(retained.len());
+                (Some(retained), omitted)
+            }
+            None => (None, 0),
+        };
+        let initial_truncation = CaptureTruncation {
+            omitted_bytes: omitted_request_id_bytes,
+            ..CaptureTruncation::default()
+        };
         Some(RequestCaptureSession {
             store: self.clone(),
             request_id,
@@ -131,6 +288,8 @@ impl RequestCaptureStore {
             is_stream,
             mode: auth.request_capture_mode,
             attempts: Arc::new(Mutex::new(Vec::new())),
+            limits: self.limits,
+            truncation: Arc::new(Mutex::new(initial_truncation)),
         })
     }
 
@@ -164,8 +323,113 @@ impl RequestCaptureStore {
 }
 
 impl RequestCaptureSession {
-    pub(crate) async fn push_attempt(&self, attempt: Value) {
-        self.attempts.lock().await.push(attempt);
+    pub(crate) async fn push_attempt(&self, mut attempt: Value) {
+        let mut attempts = self.attempts.lock().await;
+        let mut truncation = self.truncation.lock().await;
+        if attempts.len() >= self.limits.max_attempts {
+            truncation.omitted_attempts = truncation.omitted_attempts.saturating_add(1);
+            truncation.omitted_frames = truncation.omitted_frames.saturating_add(
+                attempt
+                    .get("downstream_sse_frames")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+            );
+            truncation.omitted_bytes = truncation
+                .omitted_bytes
+                .saturating_add(serialized_len(&attempt));
+            return;
+        }
+        let mut additionally_omitted_frames = 0_usize;
+        let mut additionally_omitted_bytes = 0_usize;
+        let retained_frame_count = if let Some(frames) = attempt
+            .get_mut("downstream_sse_frames")
+            .and_then(Value::as_array_mut)
+        {
+            let available = self
+                .limits
+                .max_frames
+                .saturating_sub(truncation.retained_frames);
+            if frames.len() > available {
+                let omitted = frames.split_off(available);
+                additionally_omitted_frames = omitted.len();
+                additionally_omitted_bytes = omitted
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::len)
+                    .sum::<usize>();
+            }
+            frames.len()
+        } else {
+            0
+        };
+        if additionally_omitted_frames > 0
+            && let Some(metadata) = attempt
+                .get_mut("downstream_sse_frames_truncation")
+                .and_then(Value::as_object_mut)
+        {
+            let prior_frames = metadata
+                .get("omitted_frames")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let prior_bytes = metadata
+                .get("omitted_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            metadata.insert(
+                "omitted_frames".to_string(),
+                json!(prior_frames.saturating_add(additionally_omitted_frames as u64)),
+            );
+            metadata.insert(
+                "omitted_bytes".to_string(),
+                json!(prior_bytes.saturating_add(additionally_omitted_bytes as u64)),
+            );
+            metadata.insert("truncated".to_string(), Value::Bool(true));
+        }
+        if let Some(frame_meta) = attempt.get("downstream_sse_frames_truncation") {
+            truncation.omitted_frames = truncation.omitted_frames.saturating_add(
+                frame_meta
+                    .get("omitted_frames")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize,
+            );
+            truncation.omitted_bytes = truncation.omitted_bytes.saturating_add(
+                frame_meta
+                    .get("omitted_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize,
+            );
+        }
+        let attempt_bytes = serialized_len(&attempt);
+        let remaining = self
+            .limits
+            .max_session_bytes
+            .saturating_sub(truncation.retained_bytes);
+        let retained_attempt = if attempt_bytes <= remaining {
+            truncation.retained_frames = truncation
+                .retained_frames
+                .saturating_add(retained_frame_count);
+            attempt
+        } else {
+            truncation.omitted_frames = truncation
+                .omitted_frames
+                .saturating_add(retained_frame_count);
+            let placeholder = truncated_attempt_placeholder(&attempt, attempt_bytes);
+            let placeholder_bytes = serialized_len(&placeholder);
+            truncation.omitted_bytes = truncation
+                .omitted_bytes
+                .saturating_add(attempt_bytes.saturating_sub(placeholder_bytes.min(attempt_bytes)));
+            if placeholder_bytes > remaining {
+                truncation.omitted_attempts = truncation.omitted_attempts.saturating_add(1);
+                truncation.omitted_bytes =
+                    truncation.omitted_bytes.saturating_add(placeholder_bytes);
+                return;
+            }
+            placeholder
+        };
+        truncation.retained_bytes = truncation
+            .retained_bytes
+            .saturating_add(serialized_len(&retained_attempt));
+        attempts.push(retained_attempt);
     }
 
     pub(crate) async fn persist_with_result(
@@ -173,7 +437,7 @@ impl RequestCaptureSession {
         upstream_usage: Option<&crate::urp::Usage>,
         upstream_error_seen: bool,
     ) {
-        let attempts = self.attempts.lock().await.clone();
+        let mut attempts = self.attempts.lock().await.clone();
         if attempts.is_empty() {
             return;
         }
@@ -183,19 +447,65 @@ impl RequestCaptureSession {
         {
             return;
         }
-        let payload = json!({
-            "version": 1,
-            "request_id": self.request_id,
-            "created_at": self.created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-            "api_key_id": self.api_key_id,
-            "user_id": self.user_id,
-            "downstream_protocol": downstream_protocol_name(self.downstream_protocol),
-            "is_stream": self.is_stream,
-            "attempts": attempts,
-        });
+        let mut truncation = self.truncation.lock().await.clone();
+        let encoded = loop {
+            let payload = json!({
+                "version": 1,
+                "request_id": self.request_id,
+                "created_at": self.created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "api_key_id": self.api_key_id,
+                "user_id": self.user_id,
+                "downstream_protocol": downstream_protocol_name(self.downstream_protocol),
+                "is_stream": self.is_stream,
+                "attempts": &attempts,
+                "capture_truncation": truncation.to_json(),
+            });
+            let encoded = match serde_json::to_vec(&payload) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    tracing::warn!("failed to encode request capture dump: {error}");
+                    return;
+                }
+            };
+            if encoded.len() <= self.limits.max_session_bytes {
+                break encoded;
+            }
+            if attempts.len() == 1 {
+                let original_bytes = serialized_len(&attempts[0]);
+                let placeholder = truncated_attempt_placeholder(&attempts[0], original_bytes);
+                let placeholder_bytes = serialized_len(&placeholder);
+                if placeholder_bytes >= original_bytes {
+                    tracing::warn!(
+                        max_session_bytes = self.limits.max_session_bytes,
+                        "bounded request capture envelope exceeds configured session byte limit"
+                    );
+                    return;
+                }
+                attempts[0] = placeholder;
+                truncation.omitted_bytes = truncation
+                    .omitted_bytes
+                    .saturating_add(original_bytes.saturating_sub(placeholder_bytes));
+                truncation.retained_bytes = truncation
+                    .retained_bytes
+                    .saturating_sub(original_bytes)
+                    .saturating_add(placeholder_bytes);
+                continue;
+            }
+            let Some(removed) = attempts.pop() else {
+                tracing::warn!(
+                    max_session_bytes = self.limits.max_session_bytes,
+                    "request capture envelope exceeds configured session byte limit"
+                );
+                return;
+            };
+            let removed_bytes = serialized_len(&removed);
+            truncation.omitted_attempts = truncation.omitted_attempts.saturating_add(1);
+            truncation.omitted_bytes = truncation.omitted_bytes.saturating_add(removed_bytes);
+            truncation.retained_bytes = truncation.retained_bytes.saturating_sub(removed_bytes);
+        };
         if let Err(err) = self
             .store
-            .write_dump(self.request_id.as_deref(), self.created_at, payload)
+            .write_dump(self.request_id.as_deref(), self.created_at, encoded)
             .await
         {
             tracing::warn!("failed to write request capture dump: {err}");
@@ -208,7 +518,7 @@ impl RequestCaptureStore {
         &self,
         request_id: Option<&str>,
         created_at: chrono::DateTime<Utc>,
-        payload: Value,
+        bytes: Vec<u8>,
     ) -> Result<(), String> {
         let dump_dir = self.dump_dir.clone();
         let prefix = request_id_prefix(request_id);
@@ -221,7 +531,6 @@ impl RequestCaptureStore {
                 "json.tmp.{}",
                 uuid::Uuid::new_v4().to_string().replace('-', "")
             ));
-            let bytes = serde_json::to_vec_pretty(&payload).map_err(|err| err.to_string())?;
             std::fs::write(&tmp_path, bytes).map_err(|err| err.to_string())?;
             std::fs::rename(&tmp_path, &final_path).map_err(|err| err.to_string())?;
             Ok::<(), String>(())
@@ -316,12 +625,163 @@ fn sqlite_file_path_from_dsn(dsn: &str) -> Option<PathBuf> {
     Some(PathBuf::from(path_part))
 }
 
+fn positive_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn serialized_len(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+#[cfg(test)]
+fn bound_frames(
+    frames: Vec<String>,
+    limits: RequestCaptureLimits,
+) -> (Vec<String>, CaptureTruncation) {
+    let mut retained = Vec::with_capacity(frames.len().min(limits.max_frames));
+    let mut metadata = CaptureTruncation::default();
+    for frame in frames {
+        if retained.len() >= limits.max_frames
+            || metadata.retained_bytes >= limits.max_session_bytes
+        {
+            metadata.omitted_frames = metadata.omitted_frames.saturating_add(1);
+            metadata.omitted_bytes = metadata.omitted_bytes.saturating_add(frame.len());
+            continue;
+        }
+        let max_bytes = limits.max_frame_bytes.min(
+            limits
+                .max_session_bytes
+                .saturating_sub(metadata.retained_bytes),
+        );
+        let bounded = truncate_utf8(&frame, max_bytes);
+        if bounded.len() < frame.len() {
+            metadata.omitted_bytes = metadata
+                .omitted_bytes
+                .saturating_add(frame.len().saturating_sub(bounded.len()));
+        }
+        metadata.retained_bytes = metadata.retained_bytes.saturating_add(bounded.len());
+        retained.push(bounded);
+    }
+    metadata.retained_frames = retained.len();
+    (retained, metadata)
+}
+
+fn truncated_attempt_placeholder(attempt: &Value, original_bytes: usize) -> Value {
+    let field = |name: &str| bounded_attempt_field(attempt, name);
+    let prior_frame_metadata = attempt
+        .get("downstream_sse_frames_truncation")
+        .cloned()
+        .unwrap_or_else(|| CaptureTruncation::default().to_json());
+    let retained_frames = attempt
+        .get("downstream_sse_frames")
+        .and_then(Value::as_array);
+    let additionally_omitted_frames = retained_frames.map_or(0, Vec::len);
+    let additionally_omitted_bytes = retained_frames
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::len)
+        .sum::<usize>();
+    let prior_omitted_frames = prior_frame_metadata
+        .get("omitted_frames")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let prior_omitted_bytes = prior_frame_metadata
+        .get("omitted_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let frame_truncation = json!({
+        "truncated": prior_omitted_frames > 0
+            || prior_omitted_bytes > 0
+            || additionally_omitted_frames > 0
+            || additionally_omitted_bytes > 0,
+        "omitted_attempts": 0,
+        "omitted_frames": prior_omitted_frames.saturating_add(additionally_omitted_frames as u64),
+        "omitted_bytes": prior_omitted_bytes.saturating_add(additionally_omitted_bytes as u64),
+        "retained_bytes": 0,
+        "retained_frames": 0,
+    });
+    json!({
+        "attempt_number": field("attempt_number"),
+        "provider_id": field("provider_id"),
+        "channel_id": field("channel_id"),
+        "provider_type": field("provider_type"),
+        "logical_model": field("logical_model"),
+        "upstream_model": field("upstream_model"),
+        "upstream_path": field("upstream_path"),
+        "raw_input": null,
+        "transformed_urp_request": null,
+        "upstream_request": null,
+        "downstream_response": null,
+        "downstream_sse_frames": null,
+        "downstream_sse_frames_truncation": frame_truncation,
+        "error": bounded_attempt_error(attempt),
+        "capture_truncation": {
+            "truncated": true,
+            "reason": "attempt_bytes",
+            "original_bytes": original_bytes,
+        }
+    })
+}
+
+fn bounded_attempt_field(attempt: &Value, name: &str) -> Value {
+    match attempt.get(name) {
+        Some(Value::String(value)) => {
+            Value::String(truncate_utf8(value, MAX_CAPTURE_IDENTIFIER_BYTES))
+        }
+        Some(value) => value.clone(),
+        None => Value::Null,
+    }
+}
+
+fn bounded_attempt_error(attempt: &Value) -> Value {
+    let Some(error) = attempt.get("error").and_then(Value::as_object) else {
+        return Value::Null;
+    };
+    let mut bounded = serde_json::Map::new();
+    for key in ["code", "message", "status"] {
+        if let Some(value) = error.get(key) {
+            bounded.insert(
+                key.to_string(),
+                match value {
+                    Value::String(value) => {
+                        Value::String(truncate_utf8(value, MAX_CAPTURE_IDENTIFIER_BYTES))
+                    }
+                    value if value.is_number() || value.is_boolean() || value.is_null() => {
+                        value.clone()
+                    }
+                    _ => Value::Null,
+                },
+            );
+        }
+    }
+    Value::Object(bounded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::AuthResult;
     use crate::monoize_routing::MonoizeRuntimeConfig;
     use crate::users::UserRole;
+    use tempfile::TempDir;
     use tokio::sync::RwLock;
 
     fn test_auth(request_capture_mode: RequestCaptureMode) -> AuthResult {
@@ -331,6 +791,7 @@ mod tests {
             username: None,
             user_role: UserRole::User,
             api_key_id: Some("key-1".to_string()),
+            api_key_name: Some("test key".to_string()),
             max_multiplier: None,
             transforms: Vec::new(),
             model_redirects: Vec::new(),
@@ -412,5 +873,129 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[test]
+    fn frames_are_bounded_on_utf8_boundaries_with_metadata() {
+        let limits = RequestCaptureLimits {
+            max_attempts: 2,
+            max_frames: 2,
+            max_frame_bytes: 5,
+            max_session_bytes: 8,
+        };
+        let (frames, metadata) = bound_frames(
+            vec!["ééé".to_string(), "abcd".to_string(), "omitted".to_string()],
+            limits,
+        );
+        assert_eq!(frames, vec!["éé".to_string(), "abcd".to_string()]);
+        assert_eq!(metadata.retained_bytes, 8);
+        assert_eq!(metadata.omitted_frames, 1);
+        assert_eq!(metadata.omitted_bytes, 9);
+    }
+
+    #[tokio::test]
+    async fn spawned_children_share_one_sse_byte_quota() {
+        let active = SseFrameCapture::with_limits(RequestCaptureLimits {
+            max_attempts: 1,
+            max_frames: 8,
+            max_frame_bytes: 8,
+            max_session_bytes: 8,
+        });
+
+        CURRENT_SSE_CAPTURE
+            .scope(active.clone(), async {
+                let first = spawn_with_sse_capture(async {
+                    capture_sse_frame("aaaaaaaa".to_string()).await;
+                });
+                let second = spawn_with_sse_capture(async {
+                    capture_sse_frame("bbbbbbbb".to_string()).await;
+                });
+                first.await.unwrap();
+                second.await.unwrap();
+            })
+            .await;
+
+        let captured = active.snapshot().await;
+        assert_eq!(captured.frames.len(), 1);
+        assert_eq!(captured.frames.iter().map(String::len).sum::<usize>(), 8);
+        assert_eq!(captured.truncation.omitted_frames, 1);
+        assert_eq!(captured.truncation.omitted_bytes, 8);
+    }
+
+    #[tokio::test]
+    async fn persisted_dump_uses_the_checked_compact_bytes_and_retains_a_placeholder() {
+        let temp = TempDir::new().expect("temporary directory");
+        let limits = RequestCaptureLimits {
+            max_attempts: 1,
+            max_frames: 8,
+            max_frame_bytes: 1024,
+            max_session_bytes: MIN_SESSION_BYTES,
+        };
+        let store = RequestCaptureStore {
+            dump_dir: Arc::new(temp.path().join("dumps")),
+            limits,
+        };
+        let runtime = RwLock::new(MonoizeRuntimeConfig {
+            request_capture_enabled: true,
+            ..MonoizeRuntimeConfig::default()
+        });
+        let session = store
+            .maybe_start_session(
+                &runtime,
+                &test_auth(RequestCaptureMode::CaptureAll),
+                Some("request-id".repeat(100)),
+                DownstreamProtocol::Responses,
+                true,
+            )
+            .await
+            .expect("capture starts");
+        session
+            .push_attempt(json!({
+                "attempt_number": 1,
+                "provider_id": "provider".repeat(100),
+                "channel_id": "channel".repeat(100),
+                "provider_type": "responses",
+                "logical_model": "model".repeat(100),
+                "upstream_model": "upstream".repeat(100),
+                "upstream_path": "/v1/responses",
+                "raw_input": "x".repeat(MIN_SESSION_BYTES * 2),
+                "transformed_urp_request": null,
+                "upstream_request": null,
+                "downstream_response": null,
+                "downstream_sse_frames": ["retained-frame"],
+                "downstream_sse_frames_truncation": {
+                    "truncated": true,
+                    "omitted_attempts": 0,
+                    "omitted_frames": 2,
+                    "omitted_bytes": 7,
+                    "retained_bytes": 14,
+                    "retained_frames": 1
+                },
+                "error": null
+            }))
+            .await;
+        session.persist_with_result(None, false).await;
+
+        let path = std::fs::read_dir(store.dump_dir())
+            .expect("dump directory exists")
+            .next()
+            .expect("one dump exists")
+            .expect("dump entry reads")
+            .path();
+        let bytes = std::fs::read(path).expect("dump reads");
+        assert!(bytes.len() <= MIN_SESSION_BYTES);
+        let payload: Value = serde_json::from_slice(&bytes).expect("dump is JSON");
+        assert_eq!(bytes, serde_json::to_vec(&payload).unwrap());
+        assert_eq!(payload["attempts"].as_array().unwrap().len(), 1);
+        assert!(
+            payload["capture_truncation"]["truncated"]
+                .as_bool()
+                .unwrap()
+        );
+        let frame_meta = &payload["attempts"][0]["downstream_sse_frames_truncation"];
+        assert_eq!(frame_meta["omitted_frames"], 3);
+        assert_eq!(frame_meta["omitted_bytes"], 21);
+        assert_eq!(frame_meta["retained_frames"], 0);
+        assert_eq!(frame_meta["retained_bytes"], 0);
     }
 }

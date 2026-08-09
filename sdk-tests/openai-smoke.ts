@@ -159,16 +159,15 @@ async function bootstrapMonoizeRouting() {
     },
     body: JSON.stringify({
       name: "sdk-mock-provider",
-      models: {
-        "gpt-4o-mini": { multiplier: 1.0 },
-      },
       channels: [
         {
           name: "sdk-mock-channel",
           provider_type: "responses",
           base_url: mockBase,
           api_key: env.MOCK_API_KEY,
-          supported_models: ["gpt-4o-mini"],
+          models: {
+            "gpt-4o-mini": { redirect: null, multiplier: "1" },
+          },
         },
       ],
     }),

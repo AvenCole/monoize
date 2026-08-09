@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import useSWR from 'swr'
 import {
 	ArrowLeft,
 	Braces,
@@ -51,7 +50,6 @@ import {
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
-import { api } from '@/lib/api'
 import type {
 	CreateProviderInput,
 	AffinityFailbackMode,
@@ -64,7 +62,7 @@ import type {
 } from '@/lib/api'
 import {
 	createProviderOptimistic,
-	providerDetailSWRKey,
+	useProviderDetail,
 	updateProviderOptimistic
 } from '@/lib/swr'
 import { cn } from '@/lib/utils'
@@ -206,9 +204,8 @@ export function ProviderDialog({
 	const [v1ChannelIndex, setV1ChannelIndex] = useState<number | null>(null)
 	const initialSnapshot = useRef('')
 
-	const { data: detail, error: detailError, isLoading: detailLoading } = useSWR(
-		open && isEdit && current ? providerDetailSWRKey(current.id) : null,
-		() => api.getProvider(current!.id),
+	const { data: detail, error: detailError, isLoading: detailLoading } = useProviderDetail(
+		open && isEdit && current ? current.id : null,
 		{ revalidateOnFocus: false }
 	)
 
