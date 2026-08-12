@@ -725,6 +725,7 @@ fn rate_matrix_selects_short_vs_long_context_tier() {
     let components = calculate_rate_matrix_charge_components(
         &usage,
         None,
+        None,
         &resolution,
         Multiplier::ONE,
         &Vec::new(),
@@ -804,6 +805,7 @@ fn rate_matrix_bills_anthropic_cache_ttl_split_and_read() {
     let components = calculate_rate_matrix_charge_components(
         &usage,
         None,
+        None,
         &resolution,
         Multiplier::ONE,
         &Vec::new(),
@@ -874,6 +876,7 @@ fn rate_matrix_rejects_aggregate_cache_creation_without_ttl_split() {
     let err = calculate_rate_matrix_charge_components(
         &usage,
         None,
+        None,
         &resolution,
         Multiplier::ONE,
         &Vec::new(),
@@ -934,6 +937,7 @@ fn rate_matrix_uses_dimensionless_defaults_for_cache_and_missing_modality_breakd
 
     let components = calculate_rate_matrix_charge_components(
         &usage,
+        None,
         None,
         &resolution,
         Multiplier::ONE,
@@ -1094,6 +1098,7 @@ fn rate_matrix_bills_gpt_image_2_modality_token_lines() {
     let components = calculate_rate_matrix_charge_components(
         &usage,
         None,
+        None,
         &resolution,
         Multiplier::ONE,
         &Vec::new(),
@@ -1154,6 +1159,7 @@ fn rate_matrix_supports_input_cached_usage_class_alias() {
 
     let components = calculate_rate_matrix_charge_components(
         &usage,
+        None,
         None,
         &resolution,
         Multiplier::ONE,
@@ -1225,6 +1231,7 @@ fn rate_matrix_does_not_double_add_inclusive_tool_prompt_or_reasoning_details() 
     let components = calculate_rate_matrix_charge_components(
         &usage,
         None,
+        None,
         &resolution,
         Multiplier::ONE,
         &Vec::new(),
@@ -1276,6 +1283,7 @@ fn rate_matrix_counts_call_meter_from_decoded_native_events_and_requires_duratio
     let call_components = calculate_rate_matrix_charge_components(
         &usage,
         Some(&output),
+        None,
         &call_resolution,
         Multiplier::ONE,
         &["web_search".to_string()],
@@ -1313,6 +1321,7 @@ fn rate_matrix_counts_call_meter_from_decoded_native_events_and_requires_duratio
     ]);
     let err = calculate_rate_matrix_charge_components(
         &usage,
+        None,
         None,
         &duration_resolution,
         Multiplier::ONE,
@@ -1354,6 +1363,7 @@ fn rate_matrix_uses_only_first_dimension_matching_meter_row_per_usage_class() {
     let components = calculate_rate_matrix_charge_components(
         &usage,
         Some(&output),
+        None,
         &resolution,
         Multiplier::ONE,
         &["web_search".to_string()],
@@ -1363,6 +1373,76 @@ fn rate_matrix_uses_only_first_dimension_matching_meter_row_per_usage_class() {
     assert_eq!(components.base_charge, 102);
     assert_eq!(components.meter_line_items.len(), 1);
     assert_eq!(components.meter_line_items[0]["rate_id"], json!("selected"));
+}
+
+#[test]
+fn rate_matrix_uses_actual_response_service_tier_and_requires_exact_rates() {
+    let default_rates = vec![
+        test_rate(
+            "input-default",
+            "input_uncached",
+            1,
+            None,
+            None,
+            None,
+            json!({}),
+        ),
+        test_rate("output-default", "output", 2, None, None, None, json!({})),
+    ];
+    let usage = urp::Usage {
+        input_tokens: 1,
+        output_tokens: 1,
+        input_details: None,
+        output_details: None,
+        extra_body: HashMap::from([("service_tier".to_string(), json!("default"))]),
+    };
+
+    let err = calculate_rate_matrix_charge_components(
+        &usage,
+        None,
+        Some("priority"),
+        &test_resolution(default_rates.clone()),
+        Multiplier::ONE,
+        &[],
+    )
+    .expect_err("a non-default response tier must not use default rates");
+    assert!(err.contains("service_tier=\"priority\""), "{err}");
+
+    let mut priority_input = test_rate(
+        "input-priority",
+        "input_uncached",
+        20,
+        None,
+        None,
+        None,
+        json!({}),
+    );
+    priority_input.service_tier = Some("priority".to_string());
+    let mut priority_output =
+        test_rate("output-priority", "output", 30, None, None, None, json!({}));
+    priority_output.service_tier = Some("priority".to_string());
+    let mut rates = default_rates;
+    rates.extend([priority_input, priority_output]);
+
+    let components = calculate_rate_matrix_charge_components(
+        &usage,
+        None,
+        Some("priority"),
+        &test_resolution(rates),
+        Multiplier::ONE,
+        &[],
+    )
+    .expect("the exact response-tier rates are billable");
+    assert_eq!(components.service_tier.as_deref(), Some("priority"));
+    assert_eq!(components.base_charge, 50);
+    assert_eq!(
+        components.token_line_items[0]["rate_id"],
+        json!("input-priority")
+    );
+    assert_eq!(
+        components.token_line_items[1]["rate_id"],
+        json!("output-priority")
+    );
 }
 
 #[test]

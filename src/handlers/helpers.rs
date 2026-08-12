@@ -684,7 +684,6 @@ const EXTRA_WHITELIST_CHAT_COMPLETION: &[&str] = &[
     "structured_outputs",
     "verbosity",
     // OpenRouter / third-party extension fields
-    "models",
     "provider",
     "plugins",
     "session_id",
@@ -722,7 +721,6 @@ const EXTRA_WHITELIST_RESPONSES: &[&str] = &[
 const EXTRA_WHITELIST_ANTHROPIC: &[&str] = &[
     "cache_control",
     "container",
-    "fallbacks",
     "max_tokens",
     "metadata",
     "output_config",
@@ -1071,12 +1069,14 @@ mod tests {
         }
         assert!(EXTRA_WHITELIST_RESPONSES.contains(&"prompt_cache_retention"));
 
-        for field in ["cache_control", "container", "fallbacks"] {
+        for field in ["cache_control", "container"] {
             assert!(
                 EXTRA_WHITELIST_ANTHROPIC.contains(&field),
                 "missing Messages field {field}"
             );
         }
+        assert!(!EXTRA_WHITELIST_CHAT_COMPLETION.contains(&"models"));
+        assert!(!EXTRA_WHITELIST_ANTHROPIC.contains(&"fallbacks"));
     }
 
     #[test]

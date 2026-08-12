@@ -482,16 +482,14 @@ pub fn encode_request(req: &UrpRequest, upstream_model: &str) -> Value {
 
     merge_chat_wire_extra(obj, &req.extra_body);
 
-    // Streaming usage otherwise arrives only when the caller explicitly opts in.
-    // Non-stream requests carry usage on the response object and must not receive
-    // a stream-only option.
     if req.stream == Some(true) {
         match obj.get_mut("stream_options") {
             Some(Value::Object(so)) => {
-                so.entry("include_usage".to_string())
-                    .or_insert(Value::Bool(true));
+                so.insert("include_usage".to_string(), Value::Bool(true));
             }
-            Some(_) => {}
+            Some(_) => {
+                obj.insert("stream_options".to_string(), json!({"include_usage": true}));
+            }
             None => {
                 obj.insert("stream_options".to_string(), json!({"include_usage": true}));
             }
@@ -1623,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_stream_options_are_synthesized_only_for_streaming_requests() {
+    fn chat_stream_options_force_usage_only_for_streaming_requests() {
         let mut req = base_request(vec![Item::new_message(Role::User)]);
 
         let absent = encode_request(&req, "gpt-5.4");
@@ -1636,6 +1634,24 @@ mod tests {
         req.stream = Some(true);
         let stream = encode_request(&req, "gpt-5.4");
         assert_eq!(stream["stream_options"]["include_usage"], json!(true));
+
+        req.extra_body.insert(
+            "stream_options".to_string(),
+            json!({"include_usage": false, "include_obfuscation": false}),
+        );
+        let explicit_false = encode_request(&req, "gpt-5.4");
+        assert_eq!(
+            explicit_false["stream_options"],
+            json!({"include_usage": true, "include_obfuscation": false})
+        );
+
+        req.extra_body
+            .insert("stream_options".to_string(), json!(false));
+        let invalid_object = encode_request(&req, "gpt-5.4");
+        assert_eq!(
+            invalid_object["stream_options"],
+            json!({"include_usage": true})
+        );
     }
 
     #[test]

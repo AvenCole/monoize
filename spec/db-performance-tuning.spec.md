@@ -72,6 +72,8 @@ DPT-RL3d. `push(log)` without a preflight reservation is reserved for internal p
 
 DPT-RL3e. `push_reserved` MUST serialize the complete entry when it fits the reservation. If it does not fit, it MUST serialize a deterministic compact terminal entry with the same stable spool UUID, exact system-issued `user_id` and `api_key_id`, bounded `request_id`, `model`, and `status`, `is_stream`, captured creation time, and `error_code = "request_log_payload_truncated"`. The bounded text encoding MUST retain ASCII alphanumeric characters and `-`, `_`, `.`, `:`, and `/`, replace each other Unicode scalar with `_`, and stop at `128`, `64`, and `32` output bytes respectively. All other optional payload fields MUST be absent and MUST deserialize as null. A valid compact entry MUST fit the `1024`-byte minimum. Oversize degradation MUST occur before reservation claim, and a successfully admitted terminal log MUST NOT be discarded solely because its complete encoding exceeds the entry quota.
 
+DPT-RL3f. A successful local spool-file publication MUST remain serialized by `flush_lock` until `spool_bytes`, `admitted_bytes`, and the in-memory spool reference reflect that file. `flush` MUST NOT delete a locally published file between its final rename and its accounting transition.
+
 ### 3.3 Flush
 
 DPT-RL4. `flush(db)` MUST select a bounded batch of durable spool files and open one database transaction. It MUST partition the selected entries into consecutive chunks of at most `20` rows. Each non-empty chunk MUST execute exactly one multi-row `INSERT INTO request_logs (...) VALUES (...), (...) ON CONFLICT(id) DO NOTHING` statement. Each row MUST bind exactly the `42` request-log columns, so one statement binds at most `840` values and remains below the portable SQLite `999`-variable ceiling. Placeholder numbering MUST be contiguous across every row in one statement and MUST restart at `$1` for each chunk. The transaction MUST commit only after every chunk succeeds.
@@ -81,6 +83,8 @@ DPT-RL5. Each INSERT MUST use the stable UUID stored in the spool entry and the 
 DPT-RL6. If transaction begin, any INSERT, or commit fails, the selected spool files MUST remain available for a later retry and the failure MUST be logged at `warn` level.
 
 DPT-RL7. After a successful commit, the selected spool files MUST be deleted. An ambiguous commit outcome is safe because retries use `ON CONFLICT(id) DO NOTHING` with the stable UUID.
+
+DPT-RL7a. Removing a committed spool file MUST subtract its size from `spool_bytes` and `admitted_bytes` without unsigned wraparound. If a file was published outside the current batcher's accounting window, subtraction MUST stop at zero. Such a file MUST NOT make later admission fail with a false quota-exhausted state.
 
 ### 3.4 Background Task
 

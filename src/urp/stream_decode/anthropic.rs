@@ -1,8 +1,8 @@
 use crate::error::{AppError, AppResult};
 use crate::handlers::usage::{
     mark_stream_ttfb_if_needed, record_cumulative_stream_usage_snapshot,
-    record_stream_done_sentinel, record_stream_terminal_error, record_stream_terminal_event,
-    record_visible_stream_event_delta,
+    record_stream_done_sentinel, record_stream_response_service_tier, record_stream_terminal_error,
+    record_stream_terminal_event, record_visible_stream_event_delta,
 };
 use crate::handlers::{StreamRuntimeMetrics, StreamTerminalError, UrpRequest as HandlerUrpRequest};
 use crate::urp::{
@@ -408,6 +408,7 @@ pub(crate) async fn stream_messages_to_urp_events(
                 return Ok(());
             }
         };
+        record_stream_response_service_tier(&runtime_metrics, &data_val).await;
         let cumulative_usage = state.usage.merge_event(&data_val);
         record_cumulative_stream_usage_snapshot(&runtime_metrics, cumulative_usage).await;
 

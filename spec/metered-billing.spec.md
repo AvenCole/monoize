@@ -131,6 +131,12 @@ MB-R9. Preflight MUST parse `unit_price_nano_usd` for every candidate row as a c
 
 MB-R10. A complete matrix MUST contain dimensionless fallback rows for `input_uncached` and `output`. A dimensionless fallback row has `modality = null`, `cache_ttl = null`, and `service_tier` equal to null or `default`. For a non-tiered matrix, its `context_tier` MUST equal null or `default`. For a context-tiered matrix, each tier required by MB-R8 MUST contain such a fallback row. Preflight MUST reject a matrix that lacks one of these rows.
 
+MB-R11. Settlement MUST select the service tier from the non-empty `service_tier` field in the actual upstream response envelope. For a Responses stream, the field is `response.service_tier`. For a Chat Completions stream, the field is the top-level `service_tier`. For a Messages stream, the field is `message.service_tier`. A request field or `Usage.extra_body.service_tier` MUST NOT select the settled service tier.
+
+MB-R12. If the settled service tier is absent or equals `default`, a rate row with `service_tier` equal to null or `default` is eligible. If the settled service tier has any other value, only a rate row with the same non-null `service_tier` is eligible. A null or `default` row MUST NOT act as a fallback for a different settled service tier.
+
+MB-R13. For a non-default settled service tier, the matrix MUST contain matching dimensionless `input_uncached` and `output` token rows. It MUST also contain a matching meter row for each requested server-native usage class. If one of these rows is absent, settlement MUST fail with HTTP `403` and code `model_pricing_required`.
+
 ## 4. Token Billing
 
 MB-T1. Token quantities MUST be read from normalized upstream `Usage`. Monoize MUST NOT estimate token quantities when upstream usage is available.

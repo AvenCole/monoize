@@ -77,7 +77,7 @@ async fn chat_streaming_records_ttfb_usage_and_charge_in_request_logs() {
 }
 
 #[tokio::test]
-async fn chat_streaming_requests_upstream_include_usage_by_default() {
+async fn chat_streaming_forces_upstream_include_usage_true() {
     let ctx = setup().await;
     let req = Request::builder()
         .method("POST")
@@ -88,7 +88,11 @@ async fn chat_streaming_requests_upstream_include_usage_by_default() {
             json!({
                 "model":"gpt-5-mini-chat",
                 "messages":[{"role":"user","content":"stream-log-include-usage"}],
-                "stream": true
+                "stream": true,
+                "stream_options": {
+                    "include_usage": false,
+                    "include_obfuscation": false
+                }
             })
             .to_string(),
         ))
@@ -97,6 +101,20 @@ async fn chat_streaming_requests_upstream_include_usage_by_default() {
     let resp = ctx.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let _ = resp.into_body().collect().await.unwrap().to_bytes();
+    let upstream = ctx
+        .captured_bodies
+        .lock()
+        .expect("captured bodies lock")
+        .iter()
+        .rev()
+        .find(|(endpoint, _)| endpoint == "chat")
+        .map(|(_, body)| body.clone())
+        .expect("captured Chat Completions body");
+    assert_eq!(upstream["stream_options"]["include_usage"], json!(true));
+    assert_eq!(
+        upstream["stream_options"]["include_obfuscation"],
+        json!(false)
+    );
     ctx.state.user_store.flush_all_batchers().await;
 
     let user = ctx

@@ -81,6 +81,7 @@ pub(crate) async fn stream_responses_to_urp_events(
                 return Ok(());
             }
         };
+        record_stream_response_service_tier(&runtime_metrics, &data_val).await;
         if let Some(native_response_id) = data_val
             .get("response")
             .and_then(|response| response.get("id"))

@@ -166,7 +166,7 @@ async fn chat_to_responses_upstream_reasoning_inputs_always_include_summary() {
 }
 
 #[tokio::test]
-async fn chat_nonstream_openrouter_request_extensions_passthrough() {
+async fn chat_nonstream_drops_default_model_fallback_but_keeps_other_extensions() {
     let ctx = setup().await;
     let (status, body) = json_post(
         &ctx,
@@ -186,10 +186,7 @@ async fn chat_nonstream_openrouter_request_extensions_passthrough() {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     let upstream = last_captured_body(&ctx, "chat");
-    assert_eq!(
-        upstream["models"],
-        json!(["openai/gpt-5-mini", "anthropic/claude-3.7-sonnet"])
-    );
+    assert!(upstream.get("models").is_none());
     assert_eq!(upstream["route"], json!("fallback"));
     assert_eq!(
         upstream["provider"],

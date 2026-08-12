@@ -5072,6 +5072,38 @@ async fn seed_test_server_tool_meter_rates(state: &monoize::app::AppState) {
     }
 }
 
+async fn seed_test_priority_token_rates(state: &monoize::app::AppState) {
+    for (usage_class, unit_price_nano_usd) in
+        [("input_uncached", "2000"), ("output", "3000")]
+    {
+        state
+            .billing_rate_store
+            .upsert_billing_rate(
+                &format!("test:openai:priority:{usage_class}"),
+                monoize::billing_rate_store::UpsertBillingRateInput {
+                    source: Some("test".to_string()),
+                    pricing_profile: Some("openai".to_string()),
+                    model_pattern: Some(None),
+                    provider_type: Some(None),
+                    rate_kind: Some("token".to_string()),
+                    usage_class: Some(usage_class.to_string()),
+                    unit: Some("token".to_string()),
+                    unit_price_nano_usd: Some(unit_price_nano_usd.to_string()),
+                    context_tier: Some(None),
+                    service_tier: Some(Some("priority".to_string())),
+                    modality: Some(None),
+                    cache_ttl: Some(None),
+                    match_json: Some(json!({})),
+                    priority: Some(200),
+                    enabled: Some(true),
+                    raw_json: Some(json!({ "fixture": true })),
+                },
+            )
+            .await
+            .expect("seed priority token rate");
+    }
+}
+
 async fn configure_test_extra_fields_whitelist(state: &monoize::app::AppState) {
     let test_fields = vec![
         "emit_usage".to_string(),
@@ -5203,6 +5235,7 @@ async fn setup_with_unknown_fields() -> TestContext {
     )
     .await;
     seed_test_server_tool_meter_rates(&state).await;
+    seed_test_priority_token_rates(&state).await;
 
     let router = monoize::app::build_app(state.clone());
 

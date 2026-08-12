@@ -154,6 +154,8 @@ pub async fn compact_response(
                     )
                     .await;
                     let usage = parse_usage_from_responses_object(&value);
+                    let response_service_tier =
+                        usage::response_service_tier(&value).map(str::to_string);
                     let charge = match usage.as_ref() {
                         Some(usage) => {
                             mark_channel_success(&state, &attempt).await;
@@ -164,6 +166,7 @@ pub async fn compact_response(
                                 &attempt,
                                 &logical_model,
                                 usage,
+                                response_service_tier.as_deref(),
                                 request_id.as_deref(),
                             )
                             .await

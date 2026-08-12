@@ -59,6 +59,29 @@ pub(crate) async fn record_stream_response_id(
     runtime_metrics.lock().await.response_id = Some(response_id.to_string());
 }
 
+pub(crate) fn response_service_tier(value: &Value) -> Option<&str> {
+    value
+        .get("service_tier")
+        .or_else(|| value.get("response").and_then(|v| v.get("service_tier")))
+        .or_else(|| value.get("message").and_then(|v| v.get("service_tier")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+}
+
+pub(crate) async fn record_stream_response_service_tier(
+    runtime_metrics: &Option<Arc<Mutex<StreamRuntimeMetrics>>>,
+    response: &Value,
+) {
+    let Some(service_tier) = response_service_tier(response) else {
+        return;
+    };
+    let Some(runtime_metrics) = runtime_metrics.as_ref() else {
+        return;
+    };
+    runtime_metrics.lock().await.response_service_tier = Some(service_tier.to_string());
+}
+
 pub(crate) async fn record_cumulative_stream_usage_snapshot(
     runtime_metrics: &Option<Arc<Mutex<StreamRuntimeMetrics>>>,
     usage: Option<urp::Usage>,

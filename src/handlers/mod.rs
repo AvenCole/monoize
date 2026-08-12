@@ -594,6 +594,8 @@ pub async fn create_embeddings(
                     )
                     .await;
                     let usage = parse_usage_from_embeddings_object(&value);
+                    let response_service_tier =
+                        usage::response_service_tier(&value).map(str::to_string);
                     let charge = match usage.as_ref() {
                         Some(usage_row) => {
                             mark_channel_success(&state, &attempt).await;
@@ -603,6 +605,7 @@ pub async fn create_embeddings(
                                 &attempt,
                                 &logical_model,
                                 usage_row,
+                                response_service_tier.as_deref(),
                                 request_id.as_deref(),
                             )
                             .await
@@ -973,6 +976,7 @@ pub(crate) struct StreamRuntimeMetrics {
     ttfb_ms: Option<u64>,
     usage: Option<urp::Usage>,
     response_id: Option<String>,
+    response_service_tier: Option<String>,
     terminal: StreamTerminalDiagnostics,
     pub(crate) estimated_output_tokens: u64,
     first_visible_output_ms: Option<u64>,

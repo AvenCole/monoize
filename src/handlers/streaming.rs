@@ -791,6 +791,7 @@ pub(super) async fn forward_stream_typed(
                         ttfb_ms: None,
                         usage: None,
                         response_id: None,
+                        response_service_tier: None,
                         terminal: StreamTerminalDiagnostics::default(),
                         estimated_output_tokens: 0,
                         first_visible_output_ms: None,
@@ -974,6 +975,7 @@ pub(super) async fn forward_stream_typed(
                             terminal_diagnostics,
                             visible_tps_basis,
                             response_id,
+                            response_service_tier,
                         ) = {
                             let guard = runtime_metrics.lock().await;
                             let actual_upstream_usage = guard.usage.clone();
@@ -1010,6 +1012,7 @@ pub(super) async fn forward_stream_typed(
                                 guard.terminal.clone(),
                                 guard.visible_tps_basis(),
                                 guard.response_id.clone(),
+                                guard.response_service_tier.clone(),
                             )
                         };
 
@@ -1189,6 +1192,7 @@ pub(super) async fn forward_stream_typed(
                             &model_for_log,
                             usage_row,
                             &settled_output,
+                            response_service_tier.as_deref(),
                             request_id_for_log.as_deref(),
                         )
                         .await

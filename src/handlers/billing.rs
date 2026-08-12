@@ -665,15 +665,6 @@ fn determine_context_tier(
     }
 }
 
-fn usage_service_tier(usage: &urp::Usage) -> Option<String> {
-    usage
-        .extra_body
-        .get("service_tier")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
 fn rate_matches_dimension(
     rate: &DbBillingRateRecord,
     modality: Option<&str>,
@@ -695,11 +686,22 @@ fn rate_matches_dimension(
     {
         return false;
     }
-    if let Some(rate_service_tier) = rate.service_tier.as_deref()
-        && Some(rate_service_tier) != service_tier
-        && rate_service_tier != "default"
-    {
-        return false;
+    match service_tier {
+        Some(service_tier) if service_tier != "default" => {
+            if rate.service_tier.as_deref() != Some(service_tier) {
+                return false;
+            }
+        }
+        None | Some("default") => {
+            if rate
+                .service_tier
+                .as_deref()
+                .is_some_and(|tier| tier != "default")
+            {
+                return false;
+            }
+        }
+        Some(_) => unreachable!(),
     }
     if let Some(rate_cache_ttl) = rate.cache_ttl.as_deref()
         && Some(rate_cache_ttl) != cache_ttl
@@ -920,8 +922,8 @@ fn add_token_line_for_usage_classes(
     )
     .ok_or_else(|| {
         format!(
-            "missing token rate for usage_class={}, modality={:?}, context_tier={:?}, cache_ttl={:?}",
-            usage_classes.join("|"), modality, context_tier, cache_ttl
+            "missing token rate for usage_class={}, modality={:?}, context_tier={:?}, service_tier={:?}, cache_ttl={:?}",
+            usage_classes.join("|"), modality, context_tier, service_tier, cache_ttl
         )
     })?;
     let unit_price = rate.unit_price_nano()?;
@@ -1256,9 +1258,55 @@ fn add_meter_lines(
     Ok(total)
 }
 
+fn ensure_settled_service_tier_rates(
+    rates: &[DbBillingRateRecord],
+    context_tier: Option<&str>,
+    service_tier: Option<&str>,
+    requested_usage_classes: &[String],
+) -> Result<(), String> {
+    let Some(service_tier) = service_tier.filter(|tier| *tier != "default") else {
+        return Ok(());
+    };
+
+    for usage_class in ["input_uncached", "output"] {
+        if find_rate(
+            rates,
+            "token",
+            usage_class,
+            None,
+            context_tier,
+            Some(service_tier),
+            None,
+        )
+        .is_none()
+        {
+            return Err(format!(
+                "missing token rate for usage_class={usage_class}, context_tier={context_tier:?}, service_tier={service_tier:?}"
+            ));
+        }
+    }
+
+    for usage_class in requested_usage_classes {
+        let has_meter = rates.iter().any(|rate| {
+            rate.rate_kind == "meter"
+                && rate.usage_class == *usage_class
+                && rate.modality.is_none()
+                && rate.cache_ttl.is_none()
+                && rate_matches_dimension(rate, None, context_tier, Some(service_tier), None)
+        });
+        if !has_meter {
+            return Err(format!(
+                "missing meter rate for usage_class={usage_class}, context_tier={context_tier:?}, service_tier={service_tier:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn calculate_rate_matrix_charge_components(
     usage: &urp::Usage,
     output: Option<&[urp::Node]>,
+    response_service_tier: Option<&str>,
     resolution: &BillingRateResolution,
     provider_multiplier: Multiplier,
     requested_usage_classes: &[String],
@@ -1266,9 +1314,18 @@ pub(super) fn calculate_rate_matrix_charge_components(
     let input_details = usage.input_details.as_ref();
     let output_details = usage.output_details.as_ref();
     let context_tier = determine_context_tier(usage, &resolution.rates)?;
-    let service_tier = usage_service_tier(usage);
+    let service_tier = response_service_tier
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .map(str::to_string);
     let context_tier_ref = context_tier.as_deref();
     let service_tier_ref = service_tier.as_deref();
+    ensure_settled_service_tier_rates(
+        &resolution.rates,
+        context_tier_ref,
+        service_tier_ref,
+        requested_usage_classes,
+    )?;
 
     let cached_tokens = input_details.map(|d| d.cache_read_tokens).unwrap_or(0);
     let cache_creation_tokens = input_details.map(|d| d.cache_creation_tokens).unwrap_or(0);
@@ -1522,10 +1579,20 @@ pub(super) async fn maybe_charge_usage(
     attempt: &MonoizeAttempt,
     logical_model: &str,
     usage: &urp::Usage,
+    response_service_tier: Option<&str>,
     request_id: Option<&str>,
 ) -> AppResult<ChargeComputation> {
-    maybe_charge_usage_with_output(state, auth, attempt, logical_model, usage, None, request_id)
-        .await
+    maybe_charge_usage_with_output(
+        state,
+        auth,
+        attempt,
+        logical_model,
+        usage,
+        None,
+        response_service_tier,
+        request_id,
+    )
+    .await
 }
 
 async fn maybe_charge_usage_with_output(
@@ -1535,6 +1602,7 @@ async fn maybe_charge_usage_with_output(
     logical_model: &str,
     usage: &urp::Usage,
     output: Option<&[urp::Node]>,
+    response_service_tier: Option<&str>,
     request_id: Option<&str>,
 ) -> AppResult<ChargeComputation> {
     let resolution = match attempt.billing_rate_resolution.clone() {
@@ -1569,6 +1637,7 @@ async fn maybe_charge_usage_with_output(
     let components = match calculate_rate_matrix_charge_components(
         usage,
         output,
+        response_service_tier,
         &resolution,
         attempt.model_multiplier,
         &attempt.server_tool_usage_classes,
@@ -1576,6 +1645,7 @@ async fn maybe_charge_usage_with_output(
         Ok(v) => v,
         Err(err) => {
             if err.contains("missing token rate")
+                || err.contains("missing meter rate")
                 || err.contains("requires")
                 || err.contains("authoritative usage required")
             {
@@ -1699,6 +1769,7 @@ pub(super) async fn maybe_charge_stream_usage(
     logical_model: &str,
     usage: &urp::Usage,
     output: &[urp::Node],
+    response_service_tier: Option<&str>,
     request_id: Option<&str>,
 ) -> AppResult<ChargeComputation> {
     maybe_charge_usage_with_output(
@@ -1708,6 +1779,7 @@ pub(super) async fn maybe_charge_stream_usage(
         logical_model,
         usage,
         Some(output),
+        response_service_tier,
         request_id,
     )
     .await
@@ -1728,6 +1800,12 @@ pub(super) async fn maybe_charge_response(
             "upstream response did not include billable usage",
         ));
     };
+    let response_service_tier = response
+        .extra_body
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty());
     maybe_charge_usage_with_output(
         state,
         auth,
@@ -1735,6 +1813,7 @@ pub(super) async fn maybe_charge_response(
         logical_model,
         usage,
         Some(response.output.as_slice()),
+        response_service_tier,
         request_id,
     )
     .await

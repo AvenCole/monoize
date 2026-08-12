@@ -164,7 +164,7 @@ C5. Monoize MUST accept downstream request bodies up to the configured HTTP body
 
 C6. Monoize runs as one application process with concurrent worker tasks. The application process is the only supported writer for Monoize business tables. Direct SQL writes and concurrent Monoize writer processes are outside the cache-coherence contract.
 
-C7. `MONOIZE_TRUSTED_PROXY_CIDRS` MUST be an optional comma-separated list of IPv4 or IPv6 CIDR networks. The default is the empty list. An invalid non-empty entry MUST make startup fail.
+C7. `MONOIZE_TRUSTED_PROXY_CIDRS` MUST be an optional comma-separated list of IPv4 or IPv6 CIDR networks. If the variable is absent, the effective list MUST be `127.0.0.0/8,::1/128`. If the variable is present, including with an empty value, the effective list MUST equal the configured entries. An invalid non-empty entry MUST make startup fail.
 
 C8. Monoize MUST derive one canonical client IP for each request:
 
@@ -1000,7 +1000,7 @@ PC8. Reasoning, non-stream and stream:
 - `_monoize_chat_reasoning_detail`, `_monoize_chat_reasoning_surface`, and every other `_monoize_` key are internal metadata. They MUST NOT appear as fields of an upstream `messages[]` object. A same-Chat encoder MUST consume `_monoize_chat_reasoning_detail` to reconstruct the raw `reasoning_details[]` entry, preserving its native fields, then omit the wrapper key.
 - Backward compatibility: if `reasoning` and `reasoning_details` are absent, Monoize MUST still accept legacy `reasoning_content` and `reasoning_opaque` from upstream chat outputs.
 
-PC9. For an upstream `type=chat_completion` request with `stream=true`, the Chat Completions encoder MUST set `stream_options.include_usage = true` when the outbound request body does not already contain that field. For `stream=false` or absent, it MUST NOT synthesize `stream_options`; non-streaming responses already carry usage in the response object.
+PC9. For an upstream `type=chat_completion` request with `stream=true`, the Chat Completions encoder MUST set `stream_options.include_usage = true`. It MUST overwrite an explicit `false` value. If `stream_options` is not an object, the encoder MUST replace it with an object that contains `include_usage = true`. For `stream=false` or absent, the encoder MUST NOT synthesize `stream_options`; non-streaming responses already carry usage in the response object.
 
 ### 7.4 Provider adapter: `type=messages`
 
@@ -1311,9 +1311,9 @@ XF6. When constructing an upstream request body from a URP v2 request, Monoize M
 
 XF6a. Default whitelists per provider type:
 
-- `chat_completion`: `audio`, `frequency_penalty`, `function_call`, `functions`, `logit_bias`, `logprobs`, `top_logprobs`, `max_completion_tokens`, `max_tokens`, `metadata`, `moderation`, `n`, `presence_penalty`, `prompt_cache_options`, `safety_identifier`, `seed`, `service_tier`, `stop`, `stream_options`, `store`, `web_search_options`, `parallel_tool_calls`, `debug`, `image_config`, `modalities`, `cache_control`, `top_k`, `top_a`, `min_p`, `repetition_penalty`, `prediction`, `prompt_cache_key`, `prompt_cache_retention`, `route`, `structured_outputs`, `verbosity`, `models`, `provider`, `plugins`, `session_id`, `stop_server_tools_when`, `trace`, `thinking`, `include_reasoning`, `user_id`.
+- `chat_completion`: `audio`, `frequency_penalty`, `function_call`, `functions`, `logit_bias`, `logprobs`, `top_logprobs`, `max_completion_tokens`, `max_tokens`, `metadata`, `moderation`, `n`, `presence_penalty`, `prompt_cache_options`, `safety_identifier`, `seed`, `service_tier`, `stop`, `stream_options`, `store`, `web_search_options`, `parallel_tool_calls`, `debug`, `image_config`, `modalities`, `cache_control`, `top_k`, `top_a`, `min_p`, `repetition_penalty`, `prediction`, `prompt_cache_key`, `prompt_cache_retention`, `route`, `structured_outputs`, `verbosity`, `provider`, `plugins`, `session_id`, `stop_server_tools_when`, `trace`, `thinking`, `include_reasoning`, `user_id`.
 - `responses`: `background`, `context_management`, `conversation`, `include`, `instructions`, `metadata`, `max_tool_calls`, `moderation`, `parallel_tool_calls`, `previous_response_id`, `prompt`, `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, `safety_identifier`, `service_tier`, `store`, `stream_options`, `text`, `top_logprobs`, `truncation`.
-- `messages`: `cache_control`, `container`, `fallbacks`, `max_tokens`, `metadata`, `output_config`, `service_tier`, `stop_sequences`, `top_k`, `inference_geo`.
+- `messages`: `cache_control`, `container`, `max_tokens`, `metadata`, `output_config`, `service_tier`, `stop_sequences`, `top_k`, `inference_geo`.
 - `gemini`: `generationConfig`, `safetySettings`, `cachedContent`, `labels`.
 
 XF6b. Each dashboard-managed provider MAY carry an optional `extra_fields_whitelist` override, JSON array of strings stored in the `monoize_providers` table. When present, the effective whitelist is the union of the default whitelist and the override list. When absent, only the default whitelist applies.
@@ -1323,6 +1323,8 @@ XF6c. If `extra_fields_whitelist` contains the single entry `"*"`, Monoize MUST 
 XF6d. Whitelist filtering applies only to top-level request `extra_body` keys. Node-local `extra_body`, `ToolResultContent.extra_body`, envelope-control nodes, and usage `extra_body` are not subject to this whitelist.
 
 XF6e. Whitelist filtering MUST occur after request-phase transforms and before upstream request encoding. The filter runs inside `encode_request_for_provider`, immediately before dispatching to the provider-specific encoder.
+
+XF6f. The default whitelists MUST exclude Chat Completions `models` and Messages `fallbacks`. An administrator MAY add either field through a provider `extra_fields_whitelist` override under XF6b.
 
 ### 7.7 Downstream adapter: `POST /v1/chat/completions`
 

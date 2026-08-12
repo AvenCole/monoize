@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 pub const CANONICAL_CLIENT_IP_HEADER: HeaderName = HeaderName::from_static("x-monoize-client-ip");
+const DEFAULT_TRUSTED_PROXY_CIDRS: &str = "127.0.0.0/8,::1/128";
 
 #[derive(Clone, Debug, Default)]
 pub struct TrustedProxyConfig {
@@ -15,11 +16,17 @@ pub struct TrustedProxyConfig {
 
 impl TrustedProxyConfig {
     pub fn from_env() -> Result<Self, String> {
-        Self::parse(
-            std::env::var("MONOIZE_TRUSTED_PROXY_CIDRS")
-                .unwrap_or_default()
-                .as_str(),
-        )
+        match std::env::var("MONOIZE_TRUSTED_PROXY_CIDRS") {
+            Ok(raw) => Self::from_configured_value(Some(&raw)),
+            Err(std::env::VarError::NotPresent) => Self::from_configured_value(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err("MONOIZE_TRUSTED_PROXY_CIDRS is not valid Unicode".to_string())
+            }
+        }
+    }
+
+    fn from_configured_value(raw: Option<&str>) -> Result<Self, String> {
+        Self::parse(raw.unwrap_or(DEFAULT_TRUSTED_PROXY_CIDRS))
     }
 
     pub fn parse(raw: &str) -> Result<Self, String> {
@@ -182,5 +189,33 @@ mod tests {
     #[test]
     fn malformed_trusted_proxy_configuration_fails() {
         assert!(TrustedProxyConfig::parse("not-a-cidr").is_err());
+    }
+
+    #[test]
+    fn default_trusts_loopback_reverse_proxies() {
+        let trusted = TrustedProxyConfig::from_configured_value(None).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+
+        assert_eq!(
+            canonical_client_ip("127.0.0.1".parse().unwrap(), &headers, &trusted),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            canonical_client_ip("::1".parse().unwrap(), &headers, &trusted),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn explicitly_empty_configuration_trusts_no_proxy() {
+        let trusted = TrustedProxyConfig::from_configured_value(Some("")).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+
+        assert_eq!(
+            canonical_client_ip("127.0.0.1".parse().unwrap(), &headers, &trusted),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
     }
 }

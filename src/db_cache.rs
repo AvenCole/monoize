@@ -1066,11 +1066,9 @@ impl RequestLogBatcher {
     ) -> Result<(), RequestLogAdmissionError> {
         reservation.claim(&self.admitted_bytes)?;
         let path = self.new_spool_path();
-        let result = {
-            let _spool_guard = self.flush_lock.lock().await;
-            let tmp = self.new_spool_temp_path();
-            write_spool_file(&*self.spool_dir, &tmp, &path, encoded).await
-        };
+        let _spool_guard = self.flush_lock.lock().await;
+        let tmp = self.new_spool_temp_path();
+        let result = write_spool_file(&*self.spool_dir, &tmp, &path, encoded).await;
         if let Err(error) = result {
             self.mark_spool_error(error.clone());
             return Err(RequestLogAdmissionError::Unavailable(error));
@@ -1095,14 +1093,18 @@ impl RequestLogBatcher {
             .ok_or(RequestLogAdmissionError::InvalidReservation)?;
         let mut retry_delay = REQUEST_LOG_RETRY_INITIAL_DELAY;
         loop {
-            let result = {
-                let _spool_guard = self.flush_lock.lock().await;
-                let tmp = self.new_spool_temp_path();
-                write_spool_file(&*self.spool_dir, &tmp, &path, encoded.clone()).await
-            };
+            let spool_guard = self.flush_lock.lock().await;
+            let tmp = self.new_spool_temp_path();
+            let result = write_spool_file(&*self.spool_dir, &tmp, &path, encoded.clone()).await;
             match result {
-                Ok(()) => break,
+                Ok(()) => {
+                    self.complete_durable_push(log, path, encoded_len, reservation)
+                        .await;
+                    drop(spool_guard);
+                    return Ok(());
+                }
                 Err(error) => {
+                    drop(spool_guard);
                     self.mark_spool_error(error.clone());
                     tracing::warn!(
                         request_id = log.request_id.as_deref().unwrap_or("<missing>"),
@@ -1115,9 +1117,6 @@ impl RequestLogBatcher {
                 }
             }
         }
-        self.complete_durable_push(log, path, encoded_len, reservation)
-            .await;
-        Ok(())
     }
 
     fn new_spool_path(&self) -> std::path::PathBuf {
@@ -1301,12 +1300,12 @@ impl RequestLogBatcher {
         for (entry, _) in entries {
             match tokio::fs::remove_file(&entry.path).await {
                 Ok(()) => {
-                    self.spool_bytes.fetch_sub(entry.bytes, Ordering::AcqRel);
-                    self.admitted_bytes.fetch_sub(entry.bytes, Ordering::AcqRel);
+                    atomic_saturating_sub(&self.spool_bytes, entry.bytes);
+                    atomic_saturating_sub(&self.admitted_bytes, entry.bytes);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    self.spool_bytes.fetch_sub(entry.bytes, Ordering::AcqRel);
-                    self.admitted_bytes.fetch_sub(entry.bytes, Ordering::AcqRel);
+                    atomic_saturating_sub(&self.spool_bytes, entry.bytes);
+                    atomic_saturating_sub(&self.admitted_bytes, entry.bytes);
                 }
                 Err(error) => {
                     tracing::warn!(path = %entry.path.display(), "remove committed request log spool file failed: {error}");
@@ -1330,6 +1329,12 @@ impl RequestLogBatcher {
             }
         })
     }
+}
+
+fn atomic_saturating_sub(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_sub(amount))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2231,6 +2236,16 @@ mod tests {
         ));
         assert_eq!(cache.len(), 1);
         assert!(cache.get("user-2").is_some());
+    }
+
+    #[test]
+    fn request_log_counter_release_does_not_wrap_below_zero() {
+        let counter = AtomicU64::new(10);
+
+        atomic_saturating_sub(&counter, 11);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        atomic_saturating_sub(&counter, 1);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
     }
 
     #[test]

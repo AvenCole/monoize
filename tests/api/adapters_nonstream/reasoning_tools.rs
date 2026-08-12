@@ -1,6 +1,6 @@
 
 #[tokio::test]
-async fn responses_nonstream_preserves_upstream_service_tier() {
+async fn responses_nonstream_bills_the_upstream_service_tier() {
     let ctx = setup().await;
     let (status, body) = json_post(
         &ctx,
@@ -15,6 +15,50 @@ async fn responses_nonstream_preserves_upstream_service_tier() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["service_tier"].as_str(), Some("priority"));
+
+    let user = ctx
+        .state
+        .user_store
+        .get_user_by_username("tenant-1")
+        .await
+        .expect("query user")
+        .expect("user exists");
+    let mut matched = None;
+    for _ in 0..20 {
+        ctx.state.user_store.flush_all_batchers().await;
+        let (logs, _, _) = ctx
+            .state
+            .user_store
+            .list_request_logs_by_user(
+                &user.id,
+                100,
+                0,
+                Some("gpt-5-mini"),
+                Some("success"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("list request logs");
+        matched = logs.into_iter().find(|log| {
+            log.model == "gpt-5-mini"
+                && log.billing.charge_nano_usd.as_deref() == Some("5000")
+        });
+        if matched.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let log = matched.expect("priority response must use priority token rates");
+    assert_eq!(
+        log.billing.breakdown.as_ref().and_then(|breakdown| {
+            breakdown["tier"]["service_tier"].as_str()
+        }),
+        Some("priority")
+    );
 }
 
 #[tokio::test]

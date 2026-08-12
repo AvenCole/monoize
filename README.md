@@ -203,7 +203,7 @@ Runtime bootstrap uses environment variables. Providers, Channels, models, routi
 | `DATABASE_URL` | unset | Fallback DSN when `MONOIZE_DATABASE_DSN` is unset |
 | `MONOIZE_METRICS_PATH` | `/metrics` | Prometheus metrics path |
 | `MONOIZE_HTTP_BODY_MAX_BYTES` | `52428800` | Forwarding request-body limit |
-| `MONOIZE_TRUSTED_PROXY_CIDRS` | empty | Trusted reverse-proxy networks |
+| `MONOIZE_TRUSTED_PROXY_CIDRS` | `127.0.0.0/8,::1/128` | Trusted reverse-proxy networks; an explicitly empty value disables trust |
 
 Monoize supports SQLite and PostgreSQL. One Monoize application process is the supported writer for its business tables.
 

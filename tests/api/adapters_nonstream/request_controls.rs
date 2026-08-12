@@ -73,6 +73,26 @@ async fn chat_request_controls_map_to_messages_upstream() {
 }
 
 #[tokio::test]
+async fn messages_default_whitelist_drops_fallback_models() {
+    let ctx = setup().await;
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/messages",
+        json!({
+            "model": "gpt-5-mini-msg",
+            "max_tokens": 64,
+            "messages": [{ "role": "user", "content": "no fallback" }],
+            "fallbacks": ["claude-opus-4-1", "openai/gpt-5.4"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let upstream = last_captured_body(&ctx, "messages");
+    assert!(upstream.get("fallbacks").is_none(), "{upstream}");
+}
+
+#[tokio::test]
 async fn chat_stop_shape_round_trips_same_family() {
     let ctx = setup().await;
     let (status, body) = json_post(
