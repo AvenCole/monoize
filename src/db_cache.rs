@@ -165,7 +165,7 @@ fn last_used_bulk_update(entries: &[(String, DateTime<Utc>)]) -> (String, Vec<se
 
 const REQUEST_LOG_INSERT_COLUMNS: usize = 42;
 const REQUEST_LOG_INSERT_CHUNK_ENTRIES: usize = 20;
-const REQUEST_LOG_MIN_ENTRY_BYTES: u64 = 1_024;
+const REQUEST_LOG_MIN_ENTRY_BYTES: u64 = 4_096;
 const REQUEST_LOG_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const REQUEST_LOG_RETRY_MAX_DELAY: Duration = Duration::from_millis(1_000);
 const REQUEST_LOG_RESERVATION_UNARMED: u8 = 0;
@@ -175,10 +175,6 @@ const REQUEST_LOG_RESERVATION_CLAIMED: u8 = 3;
 const REQUEST_LOG_RESERVATION_CONSUMED: u8 = 4;
 const REQUEST_LOG_RESERVATION_CANCELING: u8 = 5;
 const REQUEST_LOG_UNARMED_MARKER: &[u8] = b"monoize-request-log-reservation\n";
-const DEGRADED_REQUEST_ID_BYTES: usize = 128;
-const DEGRADED_MODEL_BYTES: usize = 64;
-const DEGRADED_STATUS_BYTES: usize = 32;
-const DEGRADED_ERROR_CODE: &str = "request_log_payload_truncated";
 const REQUEST_LOG_INSERT_PREFIX: &str = r#"INSERT INTO request_logs
        (id, request_id, user_id, api_key_id, model, provider_id, upstream_model, channel_id, is_stream,
         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, tool_prompt_tokens, reasoning_tokens,
@@ -293,66 +289,16 @@ impl SpoolRequestLog {
     }
 }
 
-#[derive(serde::Serialize)]
-struct CompactSpoolRequestLog {
-    id: String,
-    request_id: Option<String>,
-    user_id: String,
-    api_key_id: Option<String>,
-    model: String,
-    is_stream: bool,
-    status: String,
-    error_code: &'static str,
-    created_at: String,
-    created_at_unix_ms: i64,
-}
-
-fn bounded_spool_text(value: &str, max_bytes: usize) -> String {
-    value
-        .chars()
-        .take(max_bytes)
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':' | '/')
-            {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 fn encode_reserved_spool_entry(
     entry: &SpoolRequestLog,
     max_bytes: u64,
-) -> Result<(Arc<[u8]>, bool), RequestLogAdmissionError> {
+) -> Result<Arc<[u8]>, RequestLogAdmissionError> {
     let complete = serde_json::to_vec(entry)
         .map_err(|error| RequestLogAdmissionError::Unavailable(error.to_string()))?;
-    if u64::try_from(complete.len()).unwrap_or(u64::MAX) <= max_bytes {
-        return Ok((Arc::from(complete), false));
-    }
-
-    let compact = CompactSpoolRequestLog {
-        id: entry.id.clone(),
-        request_id: entry
-            .request_id
-            .as_deref()
-            .map(|value| bounded_spool_text(value, DEGRADED_REQUEST_ID_BYTES)),
-        user_id: entry.user_id.clone(),
-        api_key_id: entry.api_key_id.clone(),
-        model: bounded_spool_text(&entry.model, DEGRADED_MODEL_BYTES),
-        is_stream: entry.is_stream,
-        status: bounded_spool_text(&entry.status, DEGRADED_STATUS_BYTES),
-        error_code: DEGRADED_ERROR_CODE,
-        created_at: entry.created_at.clone(),
-        created_at_unix_ms: entry.created_at_unix_ms,
-    };
-    let compact = serde_json::to_vec(&compact)
-        .map_err(|error| RequestLogAdmissionError::Unavailable(error.to_string()))?;
-    if u64::try_from(compact.len()).unwrap_or(u64::MAX) > max_bytes {
+    if u64::try_from(complete.len()).unwrap_or(u64::MAX) > max_bytes {
         return Err(RequestLogAdmissionError::EntryTooLarge);
     }
-    Ok((Arc::from(compact), true))
+    Ok(Arc::from(complete))
 }
 
 fn request_log_insert_values(log: &SpoolRequestLog) -> Vec<sea_orm::Value> {
@@ -928,7 +874,7 @@ impl RequestLogBatcher {
             .clone()
             .ok_or(RequestLogAdmissionError::InvalidReservation)?;
         let entry = SpoolRequestLog::from_log(stable_id, &fallback_log);
-        let (encoded, degraded) = encode_reserved_spool_entry(&entry, reservation.inner.bytes)?;
+        let encoded = encode_reserved_spool_entry(&entry, reservation.inner.bytes)?;
         let encoded_len = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
         reservation.begin_arm(&self.admitted_bytes)?;
         let tmp = self.new_spool_admission_temp_path();
@@ -942,13 +888,6 @@ impl RequestLogBatcher {
                     .spool_error
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = None;
-                if degraded {
-                    tracing::warn!(
-                        request_id = fallback_log.request_id.as_deref().unwrap_or("<missing>"),
-                        encoded_len,
-                        "request-log fallback exceeded quota; armed compact fallback"
-                    );
-                }
                 Ok(())
             }
             Err(error) => {
@@ -1043,16 +982,8 @@ impl RequestLogBatcher {
             .clone()
             .ok_or(RequestLogAdmissionError::InvalidReservation)?;
         let entry = SpoolRequestLog::from_log(stable_id, &log);
-        let (encoded, degraded) = encode_reserved_spool_entry(&entry, reservation.inner.bytes)?;
+        let encoded = encode_reserved_spool_entry(&entry, reservation.inner.bytes)?;
         let encoded_len = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
-        if degraded {
-            tracing::warn!(
-                request_id = log.request_id.as_deref().unwrap_or("<missing>"),
-                encoded_len,
-                full_entry_limit = reservation.inner.bytes,
-                "request log spool entry exceeded quota; persisting compact terminal row"
-            );
-        }
         self.push_encoded_until_durable(log, encoded, encoded_len, reservation)
             .await
     }
@@ -2313,7 +2244,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_admission_rejects_entry_quota_below_compact_minimum() {
+    fn terminal_admission_rejects_entry_quota_below_minimum() {
         let temp = TempDir::new().unwrap();
         let batcher = reservation_batcher(
             &temp,
@@ -2334,7 +2265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_oversize_log_degrades_to_compact_terminal_row() {
+    async fn reserved_oversize_log_rejects_without_partial_terminal_row() {
         let temp = TempDir::new().unwrap();
         let batcher = reservation_batcher(
             &temp,
@@ -2348,10 +2279,10 @@ mod tests {
         let reservation = batcher.reserve_terminal_log().unwrap();
         arm_terminal(&batcher, &reservation, "oversize-fallback").await;
 
-        batcher
-            .push_reserved(log, reservation)
-            .await
-            .expect("reserved terminal log must degrade instead of failing");
+        assert!(matches!(
+            batcher.push_reserved(log, reservation).await,
+            Err(RequestLogAdmissionError::EntryTooLarge)
+        ));
 
         let path = std::fs::read_dir(temp.path())
             .unwrap()
@@ -2360,7 +2291,6 @@ mod tests {
             .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
             .unwrap();
         let encoded = std::fs::read(path).unwrap();
-        assert!(u64::try_from(encoded.len()).unwrap() <= REQUEST_LOG_MIN_ENTRY_BYTES);
         assert_eq!(
             batcher.spool_bytes.load(Ordering::Acquire),
             u64::try_from(encoded.len()).unwrap()
@@ -2370,14 +2300,17 @@ mod tests {
             u64::try_from(encoded.len()).unwrap()
         );
         let decoded: SpoolRequestLog = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.request_id.as_deref(), Some("oversize-fallback"));
+        assert_eq!(decoded.model, "model-1");
+        assert_eq!(decoded.status, "error");
         assert_eq!(
-            decoded.request_id,
-            Some(bounded_spool_text(&request_id, DEGRADED_REQUEST_ID_BYTES))
+            decoded.error_code.as_deref(),
+            Some("request_finalization_aborted")
         );
-        assert_eq!(decoded.model.len(), DEGRADED_MODEL_BYTES);
-        assert_eq!(decoded.status, "success");
-        assert_eq!(decoded.error_code.as_deref(), Some(DEGRADED_ERROR_CODE));
-        assert!(decoded.error_message.is_none());
+        assert_eq!(
+            decoded.error_message.as_deref(),
+            Some("request ended before terminal log persistence")
+        );
         assert!(decoded.usage_breakdown_json.is_none());
     }
 
@@ -2626,11 +2559,11 @@ mod tests {
             .unwrap();
         let final_path = reservation.inner.final_path.clone().unwrap();
         arm_terminal(&batcher, &reservation, "stable-terminal").await;
+        let mut log = terminal_request_log("stable-terminal");
+        log.usage_breakdown_json = Some(serde_json::json!({"input": 1, "output": 2}));
+        log.billing_breakdown_json = Some(serde_json::json!({"charge_nano_usd": "3"}));
 
-        batcher
-            .push_reserved(terminal_request_log("stable-terminal"), reservation)
-            .await
-            .unwrap();
+        batcher.push_reserved(log, reservation).await.unwrap();
 
         assert!(!marker.exists());
         assert!(final_path.exists());
@@ -2638,6 +2571,18 @@ mod tests {
             serde_json::from_slice(&std::fs::read(final_path).unwrap()).unwrap();
         assert_eq!(decoded.id, stable_id);
         assert_eq!(decoded.status, "success");
+        assert_eq!(decoded.input_tokens, Some(1));
+        assert_eq!(decoded.output_tokens, Some(2));
+        assert_eq!(decoded.charge_nano_usd.as_deref(), Some("3"));
+        assert_eq!(
+            decoded.usage_breakdown_json,
+            Some(serde_json::json!({"input": 1, "output": 2}))
+        );
+        assert_eq!(
+            decoded.billing_breakdown_json,
+            Some(serde_json::json!({"charge_nano_usd": "3"}))
+        );
+        assert!(decoded.error_code.is_none());
     }
 
     #[tokio::test]
