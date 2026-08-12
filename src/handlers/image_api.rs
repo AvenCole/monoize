@@ -587,7 +587,7 @@ async fn execute_stream_collected_image_typed(
         }
 
         let max_channel_attempts = (attempt.channel_max_retries + 1).max(1) as usize;
-        for channel_attempt in 0..max_channel_attempts {
+        'channel_attempts: for channel_attempt in 0..max_channel_attempts {
             if !execution_state.provider_budget_remaining(&attempt) {
                 break;
             }
@@ -725,8 +725,6 @@ async fn execute_stream_collected_image_typed(
                         started_at,
                     )
                     .await;
-                    mark_channel_success(state, &attempt).await;
-
                     let legacy = match typed_request_to_legacy(&req_attempt, max_multiplier) {
                         Ok(legacy) => legacy,
                         Err(err) => {
@@ -850,16 +848,30 @@ async fn execute_stream_collected_image_typed(
                         tokio::join!(decode_handle, transform_handle);
                     let decode_result = match decode_join {
                         Ok(result) => result,
-                        Err(join_error) => Err(AppError::new(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            if join_error.is_cancelled() {
-                                "task_cancelled"
-                            } else {
-                                "task_panic"
-                            },
-                            format!("image stream decoder task failed: {join_error}"),
-                        )
-                        .with_type("server_error")),
+                        Err(join_error) => {
+                            let err = AppError::new(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                if join_error.is_cancelled() {
+                                    "task_cancelled"
+                                } else {
+                                    "task_panic"
+                                },
+                                format!("image stream decoder task failed: {join_error}"),
+                            )
+                            .with_type("server_error");
+                            return Err(finish_image_stream_error(
+                                state,
+                                auth,
+                                &attempt,
+                                &logical_model,
+                                started_at,
+                                &request_id,
+                                &request_ip,
+                                req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                                tried_providers,
+                                err,
+                            ));
+                        }
                     };
                     let transform_result = match transform_join {
                         Ok(result) => result,
@@ -875,18 +887,28 @@ async fn execute_stream_collected_image_typed(
                         .with_type("server_error")),
                     };
                     if let Err(err) = decode_result {
-                        return Err(finish_image_stream_error(
+                        let same_channel_retryable = is_same_channel_retryable_app_error(&err);
+                        let passive_failure_class =
+                            same_channel_retryable.then(|| classify_retryable_app_failure(&err));
+                        record_upstream_attempt_failure(
                             state,
-                            auth,
                             &attempt,
-                            &logical_model,
-                            started_at,
-                            &request_id,
-                            &request_ip,
-                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                            tried_providers,
-                            err,
-                        ));
+                            attempt_number,
+                            &err,
+                            passive_failure_class,
+                            &mut tried_providers,
+                        )
+                        .await;
+                        last_failed_attempt = Some(attempt.clone());
+                        if same_channel_retryable
+                            && is_attempt_channel_healthy(state, &attempt).await
+                            && execution_state.provider_budget_remaining(&attempt)
+                            && channel_attempt + 1 < max_channel_attempts
+                        {
+                            maybe_sleep_before_channel_retry(&attempt).await;
+                            continue 'channel_attempts;
+                        }
+                        break 'channel_attempts;
                     }
                     if let Err(err) = transform_result {
                         return Err(finish_image_stream_error(
@@ -903,19 +925,28 @@ async fn execute_stream_collected_image_typed(
                         ));
                     }
                     if let Some(err) = stream_error {
-                        clear_channel_affinity(state, &attempt).await;
-                        return Err(finish_image_stream_error(
+                        let same_channel_retryable = is_same_channel_retryable_app_error(&err);
+                        let passive_failure_class =
+                            same_channel_retryable.then(|| classify_retryable_app_failure(&err));
+                        record_upstream_attempt_failure(
                             state,
-                            auth,
                             &attempt,
-                            &logical_model,
-                            started_at,
-                            &request_id,
-                            &request_ip,
-                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                            tried_providers,
-                            err,
-                        ));
+                            attempt_number,
+                            &err,
+                            passive_failure_class,
+                            &mut tried_providers,
+                        )
+                        .await;
+                        last_failed_attempt = Some(attempt.clone());
+                        if same_channel_retryable
+                            && is_attempt_channel_healthy(state, &attempt).await
+                            && execution_state.provider_budget_remaining(&attempt)
+                            && channel_attempt + 1 < max_channel_attempts
+                        {
+                            maybe_sleep_before_channel_retry(&attempt).await;
+                            continue 'channel_attempts;
+                        }
+                        break 'channel_attempts;
                     }
 
                     let resp = match final_response {
@@ -926,36 +957,87 @@ async fn execute_stream_collected_image_typed(
                                 "upstream_stream_error",
                                 "stream completed without terminal response",
                             );
-                            return Err(finish_image_stream_error(
+                            let same_channel_retryable = is_same_channel_retryable_app_error(&err);
+                            let passive_failure_class = same_channel_retryable
+                                .then(|| classify_retryable_app_failure(&err));
+                            record_upstream_attempt_failure(
                                 state,
-                                auth,
                                 &attempt,
-                                &logical_model,
-                                started_at,
-                                &request_id,
-                                &request_ip,
-                                req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                                tried_providers,
-                                err,
-                            ));
+                                attempt_number,
+                                &err,
+                                passive_failure_class,
+                                &mut tried_providers,
+                            )
+                            .await;
+                            last_failed_attempt = Some(attempt.clone());
+                            if same_channel_retryable
+                                && is_attempt_channel_healthy(state, &attempt).await
+                                && execution_state.provider_budget_remaining(&attempt)
+                                && channel_attempt + 1 < max_channel_attempts
+                            {
+                                maybe_sleep_before_channel_retry(&attempt).await;
+                                continue 'channel_attempts;
+                            }
+                            break 'channel_attempts;
                         }
                     };
 
                     if let Err(err) = validate_image_subrequest_response(&resp) {
-                        return Err(finish_image_stream_error(
+                        let same_channel_retryable = is_same_channel_retryable_app_error(&err);
+                        let passive_failure_class =
+                            same_channel_retryable.then(|| classify_retryable_app_failure(&err));
+                        record_upstream_attempt_failure(
                             state,
-                            auth,
                             &attempt,
-                            &logical_model,
-                            started_at,
-                            &request_id,
-                            &request_ip,
-                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                            tried_providers,
-                            err,
-                        ));
+                            attempt_number,
+                            &err,
+                            passive_failure_class,
+                            &mut tried_providers,
+                        )
+                        .await;
+                        last_failed_attempt = Some(attempt.clone());
+                        if same_channel_retryable
+                            && is_attempt_channel_healthy(state, &attempt).await
+                            && execution_state.provider_budget_remaining(&attempt)
+                            && channel_attempt + 1 < max_channel_attempts
+                        {
+                            maybe_sleep_before_channel_retry(&attempt).await;
+                            continue 'channel_attempts;
+                        }
+                        break 'channel_attempts;
                     }
 
+                    if resp.usage.is_none() {
+                        let err = AppError::new(
+                            StatusCode::BAD_GATEWAY,
+                            "upstream_usage_required",
+                            "upstream response did not include billable usage",
+                        );
+                        let same_channel_retryable = is_same_channel_retryable_app_error(&err);
+                        let passive_failure_class =
+                            same_channel_retryable.then(|| classify_retryable_app_failure(&err));
+                        record_upstream_attempt_failure(
+                            state,
+                            &attempt,
+                            attempt_number,
+                            &err,
+                            passive_failure_class,
+                            &mut tried_providers,
+                        )
+                        .await;
+                        last_failed_attempt = Some(attempt.clone());
+                        if same_channel_retryable
+                            && is_attempt_channel_healthy(state, &attempt).await
+                            && execution_state.provider_budget_remaining(&attempt)
+                            && channel_attempt + 1 < max_channel_attempts
+                        {
+                            maybe_sleep_before_channel_retry(&attempt).await;
+                            continue 'channel_attempts;
+                        }
+                        break 'channel_attempts;
+                    }
+
+                    mark_channel_success(state, &attempt).await;
                     refresh_channel_affinity(state, &attempt).await;
                     let charge = match maybe_charge_response(
                         state,
@@ -1005,61 +1087,29 @@ async fn execute_stream_collected_image_typed(
                     return Ok((resp, logical_model.clone()));
                 }
                 Err(err) => {
-                    let non_retryable = is_non_retryable_client_error(&err);
-                    let retryable = is_retryable_error(&err);
-                    let retryable_failure_class = classify_retryable_failure(&err);
+                    let same_channel_retryable = is_same_channel_retryable_error(&err);
+                    let passive_failure_class =
+                        same_channel_retryable.then(|| classify_retryable_failure(&err));
                     let app_err = upstream_error_to_app(err);
-                    if non_retryable {
-                        spawn_request_log_error(
-                            state,
-                            auth,
-                            &attempt,
-                            &logical_model,
-                            true,
-                            started_at,
-                            request_id.clone(),
-                            request_ip.clone(),
-                            &app_err,
-                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                            tried_providers,
-                        );
-                        return Err(app_err);
-                    }
-                    if retryable {
-                        clear_channel_affinity(state, &attempt).await;
-                        tried_providers.push(TriedProvider::from_app_error(
-                            attempt_number,
-                            &attempt,
-                            &app_err,
-                        ));
-                        mark_channel_retryable_failure(state, &attempt, retryable_failure_class)
-                            .await;
-                        last_failed_attempt = Some(attempt.clone());
-                        if !is_attempt_channel_healthy(state, &attempt).await {
-                            break;
-                        }
-                        if execution_state.provider_budget_remaining(&attempt) {
-                            if channel_attempt + 1 < max_channel_attempts {
-                                maybe_sleep_before_channel_retry(&attempt).await;
-                            }
-                            continue;
-                        }
-                        break;
-                    }
-                    spawn_request_log_error(
+                    record_upstream_attempt_failure(
                         state,
-                        auth,
                         &attempt,
-                        &logical_model,
-                        true,
-                        started_at,
-                        request_id.clone(),
-                        request_ip.clone(),
+                        attempt_number,
                         &app_err,
-                        req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                        tried_providers,
-                    );
-                    return Err(app_err);
+                        passive_failure_class,
+                        &mut tried_providers,
+                    )
+                    .await;
+                    last_failed_attempt = Some(attempt.clone());
+                    if same_channel_retryable
+                        && is_attempt_channel_healthy(state, &attempt).await
+                        && execution_state.provider_budget_remaining(&attempt)
+                        && channel_attempt + 1 < max_channel_attempts
+                    {
+                        maybe_sleep_before_channel_retry(&attempt).await;
+                        continue;
+                    }
+                    break;
                 }
             }
         }

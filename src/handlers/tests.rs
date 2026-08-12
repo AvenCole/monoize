@@ -2276,6 +2276,66 @@ fn passive_failure_window_prunes_only_timestamps_before_cutoff() {
     assert_eq!(timestamps.into_iter().collect::<Vec<_>>(), vec![70, 100]);
 }
 
+#[test]
+fn same_channel_retry_classification_covers_all_5xx_and_excludes_client_errors() {
+    for status in [
+        StatusCode::REQUEST_TIMEOUT,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::INSUFFICIENT_STORAGE,
+    ] {
+        let err = UpstreamCallError::new(
+            UpstreamErrorKind::Http,
+            Some(status),
+            "upstream failure".to_string(),
+        );
+        assert!(routing::is_same_channel_retryable_error(&err), "{status}");
+    }
+
+    for status in [
+        StatusCode::BAD_REQUEST,
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::UNPROCESSABLE_ENTITY,
+    ] {
+        let err = UpstreamCallError::new(
+            UpstreamErrorKind::Http,
+            Some(status),
+            "upstream rejection".to_string(),
+        );
+        assert!(!routing::is_same_channel_retryable_error(&err), "{status}");
+    }
+
+    let network = UpstreamCallError::new(
+        UpstreamErrorKind::Network,
+        None,
+        "connection reset".to_string(),
+    );
+    assert!(routing::is_same_channel_retryable_error(&network));
+
+    let decode_error = AppError::new(
+        StatusCode::BAD_GATEWAY,
+        "invalid_upstream_response",
+        "invalid response",
+    );
+    assert!(!routing::is_same_channel_retryable_app_error(&decode_error));
+
+    let embedded_server_error = AppError::new(
+        StatusCode::BAD_GATEWAY,
+        "upstream_chat_error",
+        "embedded server error",
+    )
+    .with_upstream_error(
+        Some(StatusCode::SERVICE_UNAVAILABLE),
+        Some("503".to_string()),
+        None,
+        None,
+    );
+    assert!(routing::is_same_channel_retryable_app_error(
+        &embedded_server_error
+    ));
+}
+
 #[tokio::test]
 async fn disabled_breaker_success_and_failure_do_not_insert_health_state() {
     let runtime = RuntimeConfig {

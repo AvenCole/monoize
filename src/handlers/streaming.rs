@@ -195,7 +195,7 @@ pub(super) async fn forward_stream_typed(
         ) || attempt.provider_type == ProviderType::Replicate;
         let max_channel_attempts = (attempt.channel_max_retries + 1).max(1) as usize;
 
-        for channel_attempt in 0..max_channel_attempts {
+        'channel_attempts: for channel_attempt in 0..max_channel_attempts {
             if !execution_state.provider_budget_remaining(&attempt) {
                 break;
             }
@@ -369,8 +369,6 @@ pub(super) async fn forward_stream_typed(
                             started_at,
                         )
                         .await;
-                        mark_channel_success(&state, &attempt).await;
-                        refresh_channel_affinity(&state, &attempt).await;
                         let mut resp = match decode_response_from_provider(
                             attempt.provider_type,
                             &value,
@@ -378,25 +376,62 @@ pub(super) async fn forward_stream_typed(
                         ) {
                             Ok(resp) => resp,
                             Err(err) => {
-                                if let Some(session) = capture.session.as_ref() {
-                                    session.persist_with_result(None, false).await;
-                                }
-                                spawn_stream_attempt_error(
+                                let same_channel_retryable =
+                                    is_same_channel_retryable_app_error(&err);
+                                let passive_failure_class = same_channel_retryable
+                                    .then(|| classify_retryable_app_failure(&err));
+                                record_upstream_attempt_failure(
                                     &state,
-                                    &auth,
                                     &attempt,
-                                    &logical_model,
-                                    started_at,
-                                    request_id.clone(),
-                                    request_ip.clone(),
-                                    None,
+                                    attempt_number,
                                     &err,
-                                    req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                                    tried_providers.clone(),
-                                );
-                                return Err(err);
+                                    passive_failure_class,
+                                    &mut tried_providers,
+                                )
+                                .await;
+                                last_failed_attempt = Some(attempt.clone());
+                                if same_channel_retryable
+                                    && is_attempt_channel_healthy(&state, &attempt).await
+                                    && execution_state.provider_budget_remaining(&attempt)
+                                    && channel_attempt + 1 < max_channel_attempts
+                                {
+                                    maybe_sleep_before_channel_retry(&attempt).await;
+                                    continue 'channel_attempts;
+                                }
+                                break 'channel_attempts;
                             }
                         };
+                        if resp.usage.is_none() {
+                            let err = AppError::new(
+                                StatusCode::BAD_GATEWAY,
+                                "upstream_usage_required",
+                                "upstream response did not include billable usage",
+                            );
+                            let same_channel_retryable = is_same_channel_retryable_app_error(&err);
+                            let passive_failure_class = same_channel_retryable
+                                .then(|| classify_retryable_app_failure(&err));
+                            record_upstream_attempt_failure(
+                                &state,
+                                &attempt,
+                                attempt_number,
+                                &err,
+                                passive_failure_class,
+                                &mut tried_providers,
+                            )
+                            .await;
+                            last_failed_attempt = Some(attempt.clone());
+                            if same_channel_retryable
+                                && is_attempt_channel_healthy(&state, &attempt).await
+                                && execution_state.provider_budget_remaining(&attempt)
+                                && channel_attempt + 1 < max_channel_attempts
+                            {
+                                maybe_sleep_before_channel_retry(&attempt).await;
+                                continue 'channel_attempts;
+                            }
+                            break 'channel_attempts;
+                        }
+                        mark_channel_success(&state, &attempt).await;
+                        refresh_channel_affinity(&state, &attempt).await;
                         // Wrap newly produced encrypted reasoning payloads in
                         // mz2 envelopes BEFORE response-phase transforms run.
                         // See `nonstream.rs` and PIPE-1d in
@@ -642,73 +677,29 @@ pub(super) async fn forward_stream_typed(
                                 ))
                                 .await;
                         }
-                        let non_retryable = is_non_retryable_client_error(&err);
-                        let retryable = is_retryable_error(&err);
-                        let retryable_failure_class = classify_retryable_failure(&err);
+                        let same_channel_retryable = is_same_channel_retryable_error(&err);
+                        let passive_failure_class =
+                            same_channel_retryable.then(|| classify_retryable_failure(&err));
                         let app_err = upstream_error_to_app(err);
-                        if non_retryable {
-                            let terminal_error = stream_terminal_error_from_app(&app_err);
-                            spawn_request_log_stream_terminal_error(
-                                &state,
-                                &auth,
-                                &attempt,
-                                &logical_model,
-                                started_at,
-                                request_id.clone(),
-                                request_ip.clone(),
-                                None,
-                                terminal_error,
-                                req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                                tried_providers,
-                            );
-                            if let Some(session) = capture.session.as_ref() {
-                                session.persist_with_result(None, true).await;
-                            }
-                            return Ok(prestream_error_stream(downstream, app_err));
-                        }
-                        if retryable {
-                            clear_channel_affinity(&state, &attempt).await;
-                            tried_providers.push(TriedProvider::from_app_error(
-                                attempt_number,
-                                &attempt,
-                                &app_err,
-                            ));
-                            mark_channel_retryable_failure(
-                                &state,
-                                &attempt,
-                                retryable_failure_class,
-                            )
-                            .await;
-                            last_failed_attempt = Some(attempt.clone());
-                            if !is_attempt_channel_healthy(&state, &attempt).await {
-                                break;
-                            }
-                            if execution_state.provider_budget_remaining(&attempt) {
-                                if channel_attempt + 1 < max_channel_attempts {
-                                    maybe_sleep_before_channel_retry(&attempt).await;
-                                }
-                                continue;
-                            }
-                            break;
-                        }
-                        let terminal_error = stream_terminal_error_from_app(&app_err);
-                        spawn_request_log_stream_terminal_error(
+                        record_upstream_attempt_failure(
                             &state,
-                            &auth,
                             &attempt,
-                            &logical_model,
-                            started_at,
-                            request_id.clone(),
-                            request_ip.clone(),
-                            None,
-                            terminal_error,
-                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                            tried_providers,
-                        );
-                        if let Some(session) = capture.session.as_ref() {
-                            session.persist_with_result(None, true).await;
+                            attempt_number,
+                            &app_err,
+                            passive_failure_class,
+                            &mut tried_providers,
+                        )
+                        .await;
+                        last_failed_attempt = Some(attempt.clone());
+                        if same_channel_retryable
+                            && is_attempt_channel_healthy(&state, &attempt).await
+                            && execution_state.provider_budget_remaining(&attempt)
+                            && channel_attempt + 1 < max_channel_attempts
+                        {
+                            maybe_sleep_before_channel_retry(&attempt).await;
+                            continue;
                         }
-                        return Ok(prestream_error_stream(downstream, app_err));
+                        break;
                     }
                 }
             }
@@ -1334,69 +1325,29 @@ pub(super) async fn forward_stream_typed(
                             ))
                             .await;
                     }
-                    let non_retryable = is_non_retryable_client_error(&err);
-                    let retryable = is_retryable_error(&err);
-                    let retryable_failure_class = classify_retryable_failure(&err);
+                    let same_channel_retryable = is_same_channel_retryable_error(&err);
+                    let passive_failure_class =
+                        same_channel_retryable.then(|| classify_retryable_failure(&err));
                     let app_err = upstream_error_to_app(err);
-                    if non_retryable {
-                        let terminal_error = stream_terminal_error_from_app(&app_err);
-                        spawn_request_log_stream_terminal_error(
-                            &state,
-                            &auth,
-                            &attempt,
-                            &logical_model,
-                            started_at,
-                            request_id.clone(),
-                            request_ip.clone(),
-                            None,
-                            terminal_error,
-                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                            tried_providers,
-                        );
-                        if let Some(session) = capture.session.as_ref() {
-                            session.persist_with_result(None, true).await;
-                        }
-                        return Ok(prestream_error_stream(downstream, app_err));
-                    }
-                    if retryable {
-                        clear_channel_affinity(&state, &attempt).await;
-                        tried_providers.push(TriedProvider::from_app_error(
-                            attempt_number,
-                            &attempt,
-                            &app_err,
-                        ));
-                        mark_channel_retryable_failure(&state, &attempt, retryable_failure_class)
-                            .await;
-                        last_failed_attempt = Some(attempt.clone());
-                        if !is_attempt_channel_healthy(&state, &attempt).await {
-                            break;
-                        }
-                        if execution_state.provider_budget_remaining(&attempt) {
-                            if channel_attempt + 1 < max_channel_attempts {
-                                maybe_sleep_before_channel_retry(&attempt).await;
-                            }
-                            continue;
-                        }
-                        break;
-                    }
-                    let terminal_error = stream_terminal_error_from_app(&app_err);
-                    spawn_request_log_stream_terminal_error(
+                    record_upstream_attempt_failure(
                         &state,
-                        &auth,
                         &attempt,
-                        &logical_model,
-                        started_at,
-                        request_id.clone(),
-                        request_ip.clone(),
-                        None,
-                        terminal_error,
-                        req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                        tried_providers,
-                    );
-                    if let Some(session) = capture.session.as_ref() {
-                        session.persist_with_result(None, true).await;
+                        attempt_number,
+                        &app_err,
+                        passive_failure_class,
+                        &mut tried_providers,
+                    )
+                    .await;
+                    last_failed_attempt = Some(attempt.clone());
+                    if same_channel_retryable
+                        && is_attempt_channel_healthy(&state, &attempt).await
+                        && execution_state.provider_budget_remaining(&attempt)
+                        && channel_attempt + 1 < max_channel_attempts
+                    {
+                        maybe_sleep_before_channel_retry(&attempt).await;
+                        continue;
                     }
-                    return Ok(prestream_error_stream(downstream, app_err));
+                    break;
                 }
             }
         }

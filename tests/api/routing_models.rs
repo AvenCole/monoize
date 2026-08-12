@@ -1,5 +1,58 @@
 use super::*;
 
+async fn start_http_error_upstream(
+    status: StatusCode,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    async fn fail(
+        axum::extract::State((status, hits)): axum::extract::State<(
+            StatusCode,
+            Arc<std::sync::atomic::AtomicUsize>,
+        )>,
+    ) -> impl IntoResponse {
+        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        (
+            status,
+            Json(json!({
+                "error": {
+                    "code": "first_provider_rejected",
+                    "message": "first provider rejected the request",
+                    "type": "upstream_error"
+                }
+            })),
+        )
+    }
+
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/v1/responses", post(fail))
+        .route("/v1/chat/completions", post(fail))
+        .with_state((status, hits.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (address, hits)
+}
+
+async fn set_test_provider_retry_and_priority(
+    state: &monoize::app::AppState,
+    provider_id: &str,
+    channel_max_retries: i32,
+    priority: i32,
+) {
+    let update = serde_json::from_value(json!({
+        "channel_max_retries": channel_max_retries,
+        "priority": priority
+    }))
+    .unwrap();
+    state
+        .monoize_store
+        .update_provider(provider_id, update)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn models_list_returns_union_sorted_and_unique() {
     let ctx = setup().await;
@@ -791,6 +844,142 @@ async fn image_generation_applies_api_key_model_redirects_before_model_limits() 
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["error"]["code"].as_str(), Some("upstream_error"));
+}
+
+#[tokio::test]
+async fn nonstream_http_client_error_fails_forward_without_same_channel_retry() {
+    let ctx = setup().await;
+    let model = "gpt-http-client-error-fail-forward";
+    seed_test_model_pricing(&ctx.state, &[model]).await;
+    let (first_address, first_hits) = start_http_error_upstream(StatusCode::UNAUTHORIZED).await;
+    let (second_address, _, second_bodies) = start_upstream().await;
+
+    let first = create_test_provider(
+        &ctx.state,
+        "http-client-error-first",
+        monoize::monoize_routing::MonoizeProviderType::Responses,
+        model,
+        &format!("http://{first_address}"),
+        "rejected-key",
+    )
+    .await;
+    set_test_provider_retry_and_priority(&ctx.state, &first.id, 3, -100).await;
+    let second = create_test_provider(
+        &ctx.state,
+        "http-client-error-second",
+        monoize::monoize_routing::MonoizeProviderType::Responses,
+        model,
+        &format!("http://{second_address}"),
+        "working-key",
+    )
+    .await;
+    set_test_provider_retry_and_priority(&ctx.state, &second.id, 0, -99).await;
+
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({"model": model, "input": "fall forward"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        first_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "401 must skip same-Channel retries"
+    );
+    assert_eq!(second_bodies.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn nonstream_invalid_upstream_response_fails_forward_without_same_channel_retry() {
+    let ctx = setup().await;
+    let model = "gpt-invalid-response-fail-forward";
+    seed_test_model_pricing(&ctx.state, &[model]).await;
+    let (first_address, first_hits) = start_http_error_upstream(StatusCode::OK).await;
+    let (second_address, _, second_bodies) = start_upstream().await;
+
+    let first = create_test_provider(
+        &ctx.state,
+        "invalid-response-first",
+        monoize::monoize_routing::MonoizeProviderType::ChatCompletion,
+        model,
+        &format!("http://{first_address}"),
+        "invalid-response-key",
+    )
+    .await;
+    set_test_provider_retry_and_priority(&ctx.state, &first.id, 3, -100).await;
+    let second = create_test_provider(
+        &ctx.state,
+        "invalid-response-second",
+        monoize::monoize_routing::MonoizeProviderType::Responses,
+        model,
+        &format!("http://{second_address}"),
+        "working-key",
+    )
+    .await;
+    set_test_provider_retry_and_priority(&ctx.state, &second.id, 0, -99).await;
+
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({"model": model, "input": "decode and fall forward"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        first_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "response-decoding failures must skip same-Channel retries"
+    );
+    assert_eq!(second_bodies.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn streaming_http_client_error_fails_forward_before_first_downstream_byte() {
+    let ctx = setup().await;
+    let model = "gpt-stream-http-client-error-fail-forward";
+    seed_test_model_pricing(&ctx.state, &[model]).await;
+    let (first_address, first_hits) = start_http_error_upstream(StatusCode::FORBIDDEN).await;
+    let (second_address, _, second_bodies) = start_upstream().await;
+
+    let first = create_test_provider(
+        &ctx.state,
+        "stream-http-client-error-first",
+        monoize::monoize_routing::MonoizeProviderType::Responses,
+        model,
+        &format!("http://{first_address}"),
+        "rejected-key",
+    )
+    .await;
+    set_test_provider_retry_and_priority(&ctx.state, &first.id, 3, -100).await;
+    let second = create_test_provider(
+        &ctx.state,
+        "stream-http-client-error-second",
+        monoize::monoize_routing::MonoizeProviderType::Responses,
+        model,
+        &format!("http://{second_address}"),
+        "working-key",
+    )
+    .await;
+    set_test_provider_retry_and_priority(&ctx.state, &second.id, 0, -99).await;
+
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({"model": model, "input": "fall forward", "stream": true}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("response.completed"), "{body}");
+    assert_eq!(
+        first_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "403 must skip same-Channel retries"
+    );
+    assert_eq!(second_bodies.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

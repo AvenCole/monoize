@@ -82,7 +82,7 @@ R-CH-8. If the channel becomes unhealthy (breaker trips) during intra-channel re
 
 R-CH-9. On successful attempt, router MUST return immediately.
 
-R-CH-10. If provider attempts are exhausted, router MUST continue to next provider (fail-forward).
+R-CH-10. If Provider attempts are exhausted before the first downstream byte, router MUST continue to the next Provider. An upstream HTTP status MUST NOT stop this fail-forward transition.
 
 R-CH-11. If all providers are exhausted, router MUST return `502 upstream_error`.
 
@@ -139,20 +139,21 @@ R-MDL-3. The available-model-name query used by `/v1/models` MUST return sorted 
 
 ## 5. Error Classification
 
-R-ERR-1. Non-retryable errors are:
+R-ERR-1. Every upstream HTTP, timeout, connection, response-decoding, or response-validation error before the first downstream byte MUST fail the current attempt. The router MUST continue routing until an attempt succeeds or all eligible attempts are exhausted.
 
-- HTTP `400`, `401`, `403`, `422`
+R-ERR-2. Same-Channel retry errors are:
 
-R-ERR-2. Retryable errors are:
-
+- HTTP `408`
 - HTTP `429`
 - HTTP `5xx`
 - timeout
 - connection refused/reset
 
-R-ERR-3. For non-retryable errors, router MUST stop immediately and return that error.
+R-ERR-3. For a same-Channel retry error, the router MAY retry that Channel within R-CH-3 through R-CH-8.
 
-R-ERR-4. For retryable errors, router MUST try next channel according to retry budget.
+R-ERR-4. For any other upstream error, the router MUST NOT retry the same Channel. The router MUST advance to the next eligible Channel or Provider.
+
+R-ERR-5. A Monoize authentication, authorization, balance, request-validation, request-encoding, transform, billing, or internal error MUST stop routing.
 
 ## 6. Streaming Constraint
 

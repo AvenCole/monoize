@@ -593,10 +593,10 @@ pub async fn create_embeddings(
                         started_at,
                     )
                     .await;
-                    mark_channel_success(&state, &attempt).await;
                     let usage = parse_usage_from_embeddings_object(&value);
                     let charge = match usage.as_ref() {
                         Some(usage_row) => {
+                            mark_channel_success(&state, &attempt).await;
                             match maybe_charge_usage(
                                 &state,
                                 &auth,
@@ -632,20 +632,28 @@ pub async fn create_embeddings(
                                 "upstream_usage_required",
                                 "upstream response did not include billable usage",
                             );
-                            spawn_request_log_error(
+                            let same_channel_retryable = is_same_channel_retryable_app_error(&err);
+                            let passive_failure_class = same_channel_retryable
+                                .then(|| classify_retryable_app_failure(&err));
+                            record_upstream_attempt_failure(
                                 &state,
-                                &auth,
                                 &attempt,
-                                &logical_model,
-                                false,
-                                started_at,
-                                request_id.clone(),
-                                request_ip.clone(),
+                                attempt_number,
                                 &err,
-                                None,
-                                tried_providers,
-                            );
-                            return Err(err);
+                                passive_failure_class,
+                                &mut tried_providers,
+                            )
+                            .await;
+                            last_failed_attempt = Some(attempt.clone());
+                            if same_channel_retryable
+                                && is_attempt_channel_healthy(&state, &attempt).await
+                                && execution_state.provider_budget_remaining(&attempt)
+                                && channel_attempt + 1 < max_channel_attempts
+                            {
+                                maybe_sleep_before_channel_retry(&attempt).await;
+                                continue;
+                            }
+                            break;
                         }
                     };
 
@@ -676,60 +684,29 @@ pub async fn create_embeddings(
                     return Ok(Json(value).into_response());
                 }
                 Err(err) => {
-                    let non_retryable = is_non_retryable_client_error(&err);
-                    let retryable = is_retryable_error(&err);
-                    let retryable_failure_class = classify_retryable_failure(&err);
+                    let same_channel_retryable = is_same_channel_retryable_error(&err);
+                    let passive_failure_class =
+                        same_channel_retryable.then(|| classify_retryable_failure(&err));
                     let app_err = upstream_error_to_app(err);
-                    if non_retryable {
-                        spawn_request_log_error(
-                            &state,
-                            &auth,
-                            &attempt,
-                            &logical_model,
-                            false,
-                            started_at,
-                            request_id.clone(),
-                            request_ip.clone(),
-                            &app_err,
-                            None,
-                            tried_providers,
-                        );
-                        return Err(app_err);
-                    }
-                    if retryable {
-                        tried_providers.push(TriedProvider::from_app_error(
-                            attempt_number,
-                            &attempt,
-                            &app_err,
-                        ));
-                        mark_channel_retryable_failure(&state, &attempt, retryable_failure_class)
-                            .await;
-                        last_failed_attempt = Some(attempt.clone());
-                        if !is_attempt_channel_healthy(&state, &attempt).await {
-                            break;
-                        }
-                        if execution_state.provider_budget_remaining(&attempt) {
-                            if channel_attempt + 1 < max_channel_attempts {
-                                maybe_sleep_before_channel_retry(&attempt).await;
-                            }
-                            continue;
-                        }
-                        break;
-                    }
-                    spawn_request_log_error(
+                    record_upstream_attempt_failure(
                         &state,
-                        &auth,
                         &attempt,
-                        &logical_model,
-                        false,
-                        started_at,
-                        request_id.clone(),
-                        request_ip.clone(),
+                        attempt_number,
                         &app_err,
-                        None,
-                        tried_providers,
-                    );
-                    return Err(app_err);
+                        passive_failure_class,
+                        &mut tried_providers,
+                    )
+                    .await;
+                    last_failed_attempt = Some(attempt.clone());
+                    if same_channel_retryable
+                        && is_attempt_channel_healthy(&state, &attempt).await
+                        && execution_state.provider_budget_remaining(&attempt)
+                        && channel_attempt + 1 < max_channel_attempts
+                    {
+                        maybe_sleep_before_channel_retry(&attempt).await;
+                        continue;
+                    }
+                    break;
                 }
             }
         }
@@ -893,8 +870,13 @@ impl TriedProvider {
             provider_id: attempt.provider_id.clone(),
             channel_id: attempt.channel_id.clone(),
             error: app_err.message.clone(),
-            upstream_status: app_err.upstream_status,
-            upstream_code: app_err.upstream_code.clone(),
+            upstream_status: Some(app_err.upstream_status.unwrap_or(app_err.status.as_u16())),
+            upstream_code: Some(
+                app_err
+                    .upstream_code
+                    .clone()
+                    .unwrap_or_else(|| app_err.code.clone()),
+            ),
             upstream_type: app_err.upstream_type.clone(),
             upstream_param: app_err.upstream_param.clone(),
         }

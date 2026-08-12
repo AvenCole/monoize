@@ -301,6 +301,8 @@ R1. Routing MUST follow `spec/database-provider-routing.spec.md`.
 
 R2. Dashboard-managed providers and channels MUST be evaluated in configured provider order with fail-forward semantics.
 
+R2a. Before the first downstream byte, every upstream HTTP, timeout, connection, response-decoding, or response-validation error MUST continue routing until an attempt succeeds or all eligible attempts are exhausted. The upstream HTTP status MUST NOT stop cross-Provider fail-forward.
+
 R3. Streaming fallback MAY occur only before first downstream byte is emitted.
 
 R4. If the dashboard provider list is empty, routing MUST fail with `502 upstream_error`.

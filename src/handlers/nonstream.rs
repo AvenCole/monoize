@@ -206,7 +206,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
         }
 
         let max_channel_attempts = (attempt.channel_max_retries + 1).max(1) as usize;
-        for channel_attempt in 0..max_channel_attempts {
+        'channel_attempts: for channel_attempt in 0..max_channel_attempts {
             if !execution_state.provider_budget_remaining(&attempt) {
                 break;
             }
@@ -392,7 +392,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     .await
                     {
                         Ok(resp) => Ok((None, Some(resp))),
-                        Err(err) => {
+                        Err(CollectedUpstreamError::Internal(err)) => {
                             return Err(finish_nonstream_error(
                                 state,
                                 auth,
@@ -408,6 +408,30 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                                 err,
                             )
                             .await);
+                        }
+                        Err(CollectedUpstreamError::Upstream(err)) => {
+                            let same_channel_retryable = is_same_channel_retryable_app_error(&err);
+                            let passive_failure_class = same_channel_retryable
+                                .then(|| classify_retryable_app_failure(&err));
+                            record_upstream_attempt_failure(
+                                state,
+                                &attempt,
+                                attempt_number,
+                                &err,
+                                passive_failure_class,
+                                &mut tried_providers,
+                            )
+                            .await;
+                            last_failed_attempt = Some(attempt.clone());
+                            if same_channel_retryable
+                                && is_attempt_channel_healthy(state, &attempt).await
+                                && execution_state.provider_budget_remaining(&attempt)
+                                && channel_attempt + 1 < max_channel_attempts
+                            {
+                                maybe_sleep_before_channel_retry(&attempt).await;
+                                continue 'channel_attempts;
+                            }
+                            break 'channel_attempts;
                         }
                     },
                     Err(err) => Err(err),
@@ -515,8 +539,6 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                         started_at,
                     )
                     .await;
-                    mark_channel_success(state, &attempt).await;
-                    refresh_channel_affinity(state, &attempt).await;
                     let mut resp = match collected_resp {
                         Some(resp) => resp,
                         None => match value.as_ref() {
@@ -527,21 +549,29 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                             ) {
                                 Ok(resp) => resp,
                                 Err(err) => {
-                                    return Err(finish_nonstream_error(
+                                    let same_channel_retryable =
+                                        is_same_channel_retryable_app_error(&err);
+                                    let passive_failure_class = same_channel_retryable
+                                        .then(|| classify_retryable_app_failure(&err));
+                                    record_upstream_attempt_failure(
                                         state,
-                                        auth,
                                         &attempt,
-                                        &logical_model,
-                                        started_at,
-                                        &request_id,
-                                        &request_ip,
-                                        req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                                        tried_providers,
-                                        &capture,
-                                        false,
-                                        err,
+                                        attempt_number,
+                                        &err,
+                                        passive_failure_class,
+                                        &mut tried_providers,
                                     )
-                                    .await);
+                                    .await;
+                                    last_failed_attempt = Some(attempt.clone());
+                                    if same_channel_retryable
+                                        && is_attempt_channel_healthy(state, &attempt).await
+                                        && execution_state.provider_budget_remaining(&attempt)
+                                        && channel_attempt + 1 < max_channel_attempts
+                                    {
+                                        maybe_sleep_before_channel_retry(&attempt).await;
+                                        continue 'channel_attempts;
+                                    }
+                                    break 'channel_attempts;
                                 }
                             },
                             None => {
@@ -569,6 +599,37 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                             }
                         },
                     };
+                    if resp.usage.is_none() {
+                        let err = AppError::new(
+                            StatusCode::BAD_GATEWAY,
+                            "upstream_usage_required",
+                            "upstream response did not include billable usage",
+                        );
+                        let same_channel_retryable = is_same_channel_retryable_app_error(&err);
+                        let passive_failure_class =
+                            same_channel_retryable.then(|| classify_retryable_app_failure(&err));
+                        record_upstream_attempt_failure(
+                            state,
+                            &attempt,
+                            attempt_number,
+                            &err,
+                            passive_failure_class,
+                            &mut tried_providers,
+                        )
+                        .await;
+                        last_failed_attempt = Some(attempt.clone());
+                        if same_channel_retryable
+                            && is_attempt_channel_healthy(state, &attempt).await
+                            && execution_state.provider_budget_remaining(&attempt)
+                            && channel_attempt + 1 < max_channel_attempts
+                        {
+                            maybe_sleep_before_channel_retry(&attempt).await;
+                            continue 'channel_attempts;
+                        }
+                        break 'channel_attempts;
+                    }
+                    mark_channel_success(state, &attempt).await;
+                    refresh_channel_affinity(state, &attempt).await;
                     if attempt.provider_type == ProviderType::Responses {
                         refresh_response_id_affinity(
                             state,
@@ -771,67 +832,29 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                             ))
                             .await;
                     }
-                    let non_retryable = is_non_retryable_client_error(&err);
-                    let retryable = is_retryable_error(&err);
-                    let retryable_failure_class = classify_retryable_failure(&err);
+                    let same_channel_retryable = is_same_channel_retryable_error(&err);
+                    let passive_failure_class =
+                        same_channel_retryable.then(|| classify_retryable_failure(&err));
                     let app_err = upstream_error_to_app(err);
-                    if non_retryable {
-                        spawn_request_log_error(
-                            state,
-                            auth,
-                            &attempt,
-                            &logical_model,
-                            false,
-                            started_at,
-                            request_id.clone(),
-                            request_ip.clone(),
-                            &app_err,
-                            req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                            tried_providers,
-                        );
-                        if let Some(session) = capture.session.as_ref() {
-                            session.persist_with_result(None, true).await;
-                        }
-                        return Err(app_err);
-                    }
-                    if retryable {
-                        clear_channel_affinity(state, &attempt).await;
-                        tried_providers.push(TriedProvider::from_app_error(
-                            attempt_number,
-                            &attempt,
-                            &app_err,
-                        ));
-                        mark_channel_retryable_failure(state, &attempt, retryable_failure_class)
-                            .await;
-                        last_failed_attempt = Some(attempt.clone());
-                        if !is_attempt_channel_healthy(state, &attempt).await {
-                            break;
-                        }
-                        if execution_state.provider_budget_remaining(&attempt) {
-                            if channel_attempt + 1 < max_channel_attempts {
-                                maybe_sleep_before_channel_retry(&attempt).await;
-                            }
-                            continue;
-                        }
-                        break;
-                    }
-                    spawn_request_log_error(
+                    record_upstream_attempt_failure(
                         state,
-                        auth,
                         &attempt,
-                        &logical_model,
-                        false,
-                        started_at,
-                        request_id.clone(),
-                        request_ip.clone(),
+                        attempt_number,
                         &app_err,
-                        req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                        tried_providers,
-                    );
-                    if let Some(session) = capture.session.as_ref() {
-                        session.persist_with_result(None, true).await;
+                        passive_failure_class,
+                        &mut tried_providers,
+                    )
+                    .await;
+                    last_failed_attempt = Some(attempt.clone());
+                    if same_channel_retryable
+                        && is_attempt_channel_healthy(state, &attempt).await
+                        && execution_state.provider_budget_remaining(&attempt)
+                        && channel_attempt + 1 < max_channel_attempts
+                    {
+                        maybe_sleep_before_channel_retry(&attempt).await;
+                        continue;
                     }
-                    return Err(app_err);
+                    break;
                 }
             }
         }
@@ -878,6 +901,11 @@ fn supports_nonstream_upstream_stream_collection(provider_type: ProviderType) ->
     )
 }
 
+enum CollectedUpstreamError {
+    Internal(AppError),
+    Upstream(AppError),
+}
+
 async fn collect_streamed_upstream_response(
     req_attempt: &urp::UrpRequest,
     max_multiplier: Option<Multiplier>,
@@ -886,8 +914,9 @@ async fn collect_streamed_upstream_response(
     started_at: std::time::Instant,
     logical_model: &str,
     stream_idle_timeout_ms: u64,
-) -> AppResult<urp::UrpResponse> {
-    let legacy = typed_request_to_legacy(req_attempt, max_multiplier)?;
+) -> Result<urp::UrpResponse, CollectedUpstreamError> {
+    let legacy = typed_request_to_legacy(req_attempt, max_multiplier)
+        .map_err(CollectedUpstreamError::Internal)?;
     let pending_request_envelope_extra =
         req_attempt
             .input
@@ -960,22 +989,25 @@ async fn collect_streamed_upstream_response(
             _ => {}
         }
     }
-    decode_handle.await.map_err(|e| {
-        AppError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "task_panic",
-            e.to_string(),
-        )
-    })??;
+    decode_handle
+        .await
+        .map_err(|e| {
+            CollectedUpstreamError::Internal(AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "task_panic",
+                e.to_string(),
+            ))
+        })?
+        .map_err(CollectedUpstreamError::Upstream)?;
     if let Some(err) = stream_error {
-        return Err(err);
+        return Err(CollectedUpstreamError::Upstream(err));
     }
     final_response.ok_or_else(|| {
-        AppError::new(
+        CollectedUpstreamError::Upstream(AppError::new(
             StatusCode::BAD_GATEWAY,
             "upstream_stream_error",
             "stream completed without terminal response",
-        )
+        ))
     })
 }
 

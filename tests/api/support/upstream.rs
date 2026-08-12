@@ -4946,7 +4946,7 @@ async fn create_test_provider(
     logical_model: &str,
     base_url: &str,
     api_key: &str,
-) {
+) -> monoize::monoize_routing::MonoizeProvider {
     let mut models = HashMap::new();
     models.insert(
         logical_model.to_string(),
@@ -5000,7 +5000,7 @@ async fn create_test_provider(
             priority: None,
         })
         .await
-        .unwrap();
+        .unwrap()
 }
 
 async fn seed_test_model_pricing(state: &monoize::app::AppState, model_ids: &[&str]) {
@@ -5252,7 +5252,11 @@ async fn mock_nonstream_usage_can_be_explicitly_omitted_for_negative_billing_tes
 
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     let error: Value = serde_json::from_str(&body).expect("error response JSON");
-    assert_eq!(error["error"]["code"], json!("upstream_usage_required"));
+    assert_eq!(error["error"]["code"], json!("upstream_error"));
+    assert_eq!(
+        error["error"]["upstream_code"],
+        json!("upstream_usage_required")
+    );
 }
 
 async fn json_post(ctx: &TestContext, path: &str, body: Value) -> (StatusCode, String) {

@@ -214,7 +214,7 @@ RL16b. Each token line item MUST include `usage_class`, `unit`, `unit_price_nano
 
 RL16c. Each meter line item MUST include `usage_class`, `unit`, `unit_price_nano`, `quantity`, `charge_nano`, and whether the quantity was authoritative when that can be represented.
 
-RL17. When a request triggers waterfall fail-forward (one or more provider/channel attempts fail with retryable errors before a final result), `tried_providers_json` MUST record each failed attempt as `{ provider_id, channel_id, error }`. The array MUST be ordered chronologically (first attempt first). When no fallback occurred, the field MUST be null.
+RL17. When a request triggers waterfall fail-forward, `tried_providers_json` MUST record each failed upstream attempt. This rule applies to every upstream error class. Each entry MUST contain `{ provider_id, channel_id, error }`. The array MUST be ordered chronologically. When no upstream attempt failed, the field MUST be null.
 
 RL18. Successful active probe connectivity tests that can incur upstream token cost MUST be persisted as request logs with `request_kind = "active_probe_connectivity"`. Failed active probe connectivity tests MUST NOT be persisted as request logs.
 

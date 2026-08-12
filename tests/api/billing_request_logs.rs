@@ -606,7 +606,7 @@ async fn chat_upstream_error_is_logged_and_not_billed() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
     ctx.state.user_store.flush_all_batchers().await;
 
     let user = ctx
@@ -638,7 +638,7 @@ async fn chat_upstream_error_is_logged_and_not_billed() {
             .expect("list request logs");
         matched = logs
             .into_iter()
-            .find(|log| log.status == "error" && log.error.http_status == Some(422));
+            .find(|log| log.status == "error" && log.error.http_status == Some(502));
         if matched.is_some() {
             break;
         }

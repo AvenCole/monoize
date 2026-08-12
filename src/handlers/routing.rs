@@ -866,28 +866,25 @@ pub(super) fn build_exhausted_upstream_error(model: &str, tried: &[TriedProvider
     err
 }
 
-pub(super) fn is_non_retryable_client_error(err: &UpstreamCallError) -> bool {
-    matches!(
-        err.status,
-        Some(StatusCode::BAD_REQUEST)
-            | Some(StatusCode::UNAUTHORIZED)
-            | Some(StatusCode::FORBIDDEN)
-            | Some(StatusCode::UNPROCESSABLE_ENTITY)
-    )
+fn status_allows_same_channel_retry(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
 }
 
-pub(super) fn is_retryable_error(err: &UpstreamCallError) -> bool {
+pub(super) fn is_same_channel_retryable_error(err: &UpstreamCallError) -> bool {
     if matches!(err.kind, UpstreamErrorKind::Network) {
         return true;
     }
-    matches!(
-        err.status,
-        Some(StatusCode::TOO_MANY_REQUESTS)
-            | Some(StatusCode::INTERNAL_SERVER_ERROR)
-            | Some(StatusCode::BAD_GATEWAY)
-            | Some(StatusCode::SERVICE_UNAVAILABLE)
-            | Some(StatusCode::GATEWAY_TIMEOUT)
-    )
+    err.status.is_some_and(status_allows_same_channel_retry)
+}
+
+pub(super) fn is_same_channel_retryable_app_error(err: &AppError) -> bool {
+    // `status` is Monoize's wrapper status. Only an actual upstream status may
+    // authorize another request to the same Channel.
+    err.upstream_status
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .is_some_and(status_allows_same_channel_retry)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -901,6 +898,33 @@ pub(super) fn classify_retryable_failure(err: &UpstreamCallError) -> RetryableFa
         return RetryableFailureClass::RateLimited;
     }
     RetryableFailureClass::Transient
+}
+
+pub(super) fn classify_retryable_app_failure(err: &AppError) -> RetryableFailureClass {
+    if err.upstream_status == Some(StatusCode::TOO_MANY_REQUESTS.as_u16()) {
+        return RetryableFailureClass::RateLimited;
+    }
+    RetryableFailureClass::Transient
+}
+
+pub(super) async fn record_upstream_attempt_failure(
+    state: &AppState,
+    attempt: &MonoizeAttempt,
+    attempt_number: u32,
+    app_err: &AppError,
+    passive_failure_class: Option<RetryableFailureClass>,
+    tried_providers: &mut Vec<TriedProvider>,
+) {
+    tried_providers.push(TriedProvider::from_app_error(
+        attempt_number,
+        attempt,
+        app_err,
+    ));
+    let Some(failure_class) = passive_failure_class else {
+        return;
+    };
+    clear_channel_affinity(state, attempt).await;
+    mark_channel_retryable_failure(state, attempt, failure_class).await;
 }
 
 pub(super) fn prune_passive_failure_timestamps(

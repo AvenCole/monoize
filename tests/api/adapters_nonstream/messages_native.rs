@@ -94,7 +94,7 @@ async fn messages_nonstream_error_uses_anthropic_envelope_and_request_id() {
         .unwrap();
 
     let resp = ctx.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         resp.headers()
             .get("request-id")
@@ -105,9 +105,11 @@ async fn messages_nonstream_error_uses_anthropic_envelope_and_request_id() {
     let body: Value = serde_json::from_slice(&body).expect("Anthropic error JSON");
     assert_eq!(body["type"], json!("error"));
     assert_eq!(body["error"]["type"], json!("invalid_request_error"));
-    assert_eq!(
-        body["error"]["message"],
-        json!("upstream status 422 Unprocessable Entity: invalid request")
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("upstream status 422 Unprocessable Entity: invalid request")),
+        "final exhausted error must retain the upstream detail: {body}"
     );
     assert_eq!(
         body["error"]["upstream_code"],

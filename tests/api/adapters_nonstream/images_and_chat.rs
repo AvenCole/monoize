@@ -73,7 +73,7 @@ async fn chat_nonstream_openrouter_errors_do_not_become_successful_completions()
             "{mode} must not be rewritten as a successful completion: {body}"
         );
         let error: Value = serde_json::from_str(&body).expect("error response JSON");
-        assert_eq!(error["error"]["code"], json!("upstream_chat_error"));
+        assert_eq!(error["error"]["code"], json!("upstream_error"));
         assert_eq!(error["error"]["upstream_code"], json!(expected_code));
         assert_eq!(
             error["error"]["upstream_type"],

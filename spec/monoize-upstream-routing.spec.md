@@ -188,14 +188,18 @@ RTA-4. Execute provider with intra-provider retry:
 
 RTA-5. Error policy per attempt:
 
-- non-retryable client errors (`400`, `401`, `403`, `422`) MUST stop immediately. For non-streaming downstream requests, Monoize MUST return an HTTP error response to downstream. For streaming downstream requests, Monoize MUST return the protocol-specific stream error defined by `spec/unified_responses_proxy.spec.md` FP4e.
-- retryable errors (`429`, `5xx`, timeout, connection refused) MUST advance to next channel attempt
+- Every upstream HTTP, timeout, connection, response-decoding, or response-validation error that occurs before the first downstream byte MUST end the current attempt. Monoize MUST continue routing until an attempt succeeds or all eligible attempts are exhausted.
+- HTTP `408`, HTTP `429`, HTTP `5xx`, timeout, and connection errors MAY retry the same Channel. Same-Channel retries MUST remain within RTA-4 limits.
+- Other upstream errors, including HTTP `400`, `401`, `403`, and `422`, MUST NOT retry the same Channel. They MUST still advance to the next eligible Channel or Provider.
+- A Monoize authentication, authorization, balance, request-validation, request-encoding, transform, billing, or internal error MUST stop routing. Monoize MUST NOT classify such an error as an upstream attempt failure.
 
-RTA-6. On retryable attempt failure, channel passive health state MUST be updated.
+RTA-6. On an HTTP `408`, HTTP `429`, HTTP `5xx`, timeout, or connection failure, Channel passive health state MUST be updated.
+
+RTA-6b. Other upstream failures MUST NOT update Channel passive health state.
 
 RTA-6a. If `provider.circuit_breaker_enabled == false`, retryable attempt failures MUST NOT trip passive health state and MUST NOT mark the channel unhealthy.
 
-RTA-7. If all attempts in provider fail, router MUST continue with next provider.
+RTA-7. If all attempts in Provider fail before the first downstream byte, router MUST continue with the next Provider. The status code of an upstream failure MUST NOT stop cross-Provider fail-forward.
 
 RTA-8. If all providers are exhausted for a non-streaming downstream request, return `502` with message indicating no available upstream provider for requested model. If all providers are exhausted before the first downstream byte for a streaming downstream request, return the protocol-specific stream error defined by `spec/unified_responses_proxy.spec.md` FP4e with `error.code = "upstream_error"` unless a final upstream error code is available.
 
@@ -261,7 +265,7 @@ AFF-7d. A successful request that used the bound target through AFF-7 or AFF-7a 
 
 AFF-8. If the bound Provider+Channel is stale, affinity-disabled, disabled, zero weight, unhealthy, group-ineligible, multiplier-ineligible, or does not support the logical model, the binding MUST be cleared and normal waterfall routing MUST begin from the first provider.
 
-AFF-9. Retryable failures (`429`, `5xx`, timeout, and connection errors) MUST clear affinity. Non-retryable client errors MUST NOT clear affinity by themselves.
+AFF-9. HTTP `408`, HTTP `429`, HTTP `5xx`, timeout, and connection failures MUST clear affinity. Other upstream errors MUST NOT clear affinity by themselves. A later successful fallback attempt MAY replace the binding.
 
 AFF-10. A successful non-stream request MUST write or refresh affinity after success only when the successful Channel's effective `affinity_enabled` is true.
 
