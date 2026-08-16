@@ -259,25 +259,22 @@ pub async fn create_response(
 
     if req.stream.unwrap_or(false) {
         let downstream = DownstreamProtocol::Responses;
-        match forward_stream_typed(
-            state.clone(),
-            auth.clone(),
-            req,
-            max_multiplier,
+        let stream = deferred_forward_event_stream(
             downstream,
-            request_id.clone(),
-            request_ip.clone(),
-            capture.clone(),
-        )
-        .await
-        {
-            Ok(stream) => {
-                return Ok(Sse::new(stream)
-                    .keep_alive(api_stream_keep_alive())
-                    .into_response());
-            }
-            Err(err) => return Err(err),
-        }
+            forward_stream_typed(
+                state.clone(),
+                auth.clone(),
+                req,
+                max_multiplier,
+                downstream,
+                request_id.clone(),
+                request_ip.clone(),
+                capture.clone(),
+            ),
+        );
+        return Ok(Sse::new(stream)
+            .keep_alive(api_stream_keep_alive())
+            .into_response());
     }
 
     let value = forward_nonstream_typed(
@@ -323,25 +320,22 @@ pub async fn create_chat_completions(
     };
     if req.stream.unwrap_or(false) {
         let downstream = DownstreamProtocol::ChatCompletions;
-        match forward_stream_typed(
-            state.clone(),
-            auth.clone(),
-            req,
-            max_multiplier,
+        let stream = deferred_forward_event_stream(
             downstream,
-            request_id.clone(),
-            request_ip.clone(),
-            capture.clone(),
-        )
-        .await
-        {
-            Ok(stream) => {
-                return Ok(Sse::new(stream)
-                    .keep_alive(api_stream_keep_alive())
-                    .into_response());
-            }
-            Err(err) => return Err(err),
-        }
+            forward_stream_typed(
+                state.clone(),
+                auth.clone(),
+                req,
+                max_multiplier,
+                downstream,
+                request_id.clone(),
+                request_ip.clone(),
+                capture.clone(),
+            ),
+        );
+        return Ok(Sse::new(stream)
+            .keep_alive(api_stream_keep_alive())
+            .into_response());
     }
     let value = forward_nonstream_typed(
         &state,
@@ -398,25 +392,22 @@ async fn create_messages_inner(
     };
     if req.stream.unwrap_or(false) {
         let downstream = DownstreamProtocol::AnthropicMessages;
-        match forward_stream_typed(
-            state.clone(),
-            auth.clone(),
-            req,
-            max_multiplier,
+        let stream = deferred_forward_event_stream(
             downstream,
-            request_id.clone(),
-            request_ip.clone(),
-            capture.clone(),
-        )
-        .await
-        {
-            Ok(stream) => {
-                return Ok(Sse::new(stream)
-                    .keep_alive(messages_stream_keep_alive())
-                    .into_response());
-            }
-            Err(err) => return Err(err),
-        }
+            forward_stream_typed(
+                state.clone(),
+                auth.clone(),
+                req,
+                max_multiplier,
+                downstream,
+                request_id.clone(),
+                request_ip.clone(),
+                capture.clone(),
+            ),
+        );
+        return Ok(Sse::new(stream)
+            .keep_alive(messages_stream_keep_alive())
+            .into_response());
     }
     let value = forward_nonstream_typed(
         &state,

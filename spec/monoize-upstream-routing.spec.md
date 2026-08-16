@@ -205,9 +205,9 @@ RTA-8. If all providers are exhausted for a non-streaming downstream request, re
 
 ## 5. Streaming-specific Rule
 
-STRM-1. If downstream streaming has already emitted any bytes, router MUST NOT switch provider/channel for that request.
+STRM-1. If downstream streaming has emitted a protocol data or error event, router MUST NOT switch provider/channel for that request. An SSE comment or protocol keep-alive event emitted before the first protocol data or error event does not disable fallback.
 
-STRM-2. Provider/channel fallback is allowed only before first downstream byte is emitted.
+STRM-2. Provider/channel fallback is allowed only before the first downstream protocol data or error event is emitted.
 
 STRM-3. A streaming request MUST write or refresh affinity only after the upstream stream completes without terminal error.
 

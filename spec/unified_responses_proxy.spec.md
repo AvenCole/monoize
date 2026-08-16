@@ -217,6 +217,10 @@ FP4f. The synthetic stream error in FP4e MUST finalize the request log with `sta
 
 FP4g. After request-log admission succeeds, every local request-transform, upstream-encode, upstream-decode, response-transform, stream-task, and billing error MUST schedule exactly one terminal request-log row before the forwarding handler returns or its response-stream task exits. A `?` propagation or task-join error MUST NOT bypass terminal scheduling.
 
+FP4h. For a request with `stream=true`, Monoize MUST complete authentication, JSON request decoding, model redirection, and API-key model authorization before it returns the downstream response. After those steps succeed, Monoize MUST return the HTTP `200` SSE response without waiting for suffix resolution, route construction, balance validation, durable request-log admission, request transforms, upstream request encoding, or the first upstream HTTP response headers. The forwarding future MUST execute as part of the downstream response stream so the endpoint's existing 15-second SSE keep-alive can emit while upstream initialization is pending. Durable request-log admission MUST still succeed before any upstream dispatch as required by `spec/request-logs.spec.md` RL1j.
+
+FP4h-1. An SSE comment or protocol keep-alive event emitted while upstream initialization is pending is transport-only. It MUST NOT count as the first downstream application payload for provider/channel fail-forward eligibility. The first protocol data or error event commits the downstream application stream.
+
 FP5. **Decode upstream response:**
 
 - for non-streaming calls, decode the upstream response into `UrpResponseV2`;

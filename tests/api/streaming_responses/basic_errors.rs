@@ -1,5 +1,38 @@
 
 #[tokio::test]
+async fn responses_streaming_returns_sse_before_delayed_upstream_headers() {
+    let ctx = setup().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, ctx.auth_header.clone())
+        .body(Body::from(
+            json!({
+                "model": "gpt-5-mini",
+                "input": "delayed upstream headers",
+                "stream": true,
+                "force_upstream_delay_ms": 800
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let response = tokio::time::timeout(
+        Duration::from_millis(200),
+        ctx.router.clone().oneshot(req),
+    )
+    .await
+    .expect("streaming handler must return before upstream headers")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let text = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    assert!(text.contains("event: response.completed"), "{text}");
+}
+
+#[tokio::test]
 async fn responses_streaming_completed_preserves_service_tier() {
     let ctx = setup().await;
     let req = Request::builder()

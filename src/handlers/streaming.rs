@@ -136,6 +136,24 @@ fn prestream_error_stream(downstream: DownstreamProtocol, err: AppError) -> Forw
     receiver_event_stream(rx)
 }
 
+pub(super) fn deferred_forward_event_stream<F, S>(
+    downstream: DownstreamProtocol,
+    forwarding: F,
+) -> futures_util::stream::BoxStream<'static, Result<Event, std::convert::Infallible>>
+where
+    F: std::future::Future<Output = AppResult<S>> + Send + 'static,
+    S: futures_util::Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static,
+{
+    futures_util::stream::once(async move {
+        match forwarding.await {
+            Ok(stream) => stream.boxed(),
+            Err(err) => prestream_error_stream(downstream, err).boxed(),
+        }
+    })
+    .flatten()
+    .boxed()
+}
+
 pub(super) async fn forward_stream_typed(
     state: AppState,
     auth: crate::auth::AuthResult,
@@ -1395,6 +1413,28 @@ pub(super) async fn forward_stream_typed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_forwarding_allows_sse_keep_alive_before_upstream_headers() {
+        let forwarding = std::future::pending::<AppResult<ForwardEventStream>>();
+        let stream = deferred_forward_event_stream(DownstreamProtocol::Responses, forwarding);
+        let response = Sse::new(stream)
+            .keep_alive(
+                KeepAlive::new()
+                    .interval(std::time::Duration::from_millis(1))
+                    .text("heartbeat"),
+            )
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body().into_data_stream();
+        let chunk = tokio::time::timeout(std::time::Duration::from_millis(100), body.next())
+            .await
+            .expect("keep-alive must not wait for upstream headers")
+            .expect("SSE body remains open")
+            .expect("SSE keep-alive frame is valid");
+        assert_eq!(chunk.as_ref(), b": heartbeat\n\n");
+    }
 
     #[tokio::test]
     async fn decoded_terminal_output_is_retained_before_forwarding() {
