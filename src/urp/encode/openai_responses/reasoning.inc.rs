@@ -190,6 +190,9 @@ fn sanitize_request_input_item(item: &mut Value) {
                 }
             }
         }
+        Some("function_call" | "custom_tool_call") => {
+            obj.remove("status");
+        }
         _ => {}
     }
 }

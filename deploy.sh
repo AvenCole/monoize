@@ -313,9 +313,13 @@ case "${1:-deploy}" in
         exit 0
         ;;
     deploy)
+        ARM_WATCHDOG=0
+        ;;
+    deploy-watchdog)
+        ARM_WATCHDOG=1
         ;;
     *)
-        fail "Unknown subcommand: ${1}. Supported: deploy, cancel-watchdog"
+        fail "Unknown subcommand: ${1}. Supported: deploy, deploy-watchdog, cancel-watchdog"
         ;;
 esac
 
@@ -355,9 +359,9 @@ if ! pm2 restart "$PM2_NAME"; then
 fi
 pm2 save || warn "PM2 save failed (non-fatal)"
 
-if [ -n "$BACKUP" ]; then
+if [ "$ARM_WATCHDOG" -eq 1 ] && [ -n "$BACKUP" ]; then
     arm_watchdog "$BACKUP"
-else
+elif [ "$ARM_WATCHDOG" -eq 1 ]; then
     warn "No previous binary found; rollback watchdog not armed."
 fi
 

@@ -655,6 +655,61 @@ mod tests {
         assert!(input[1].get("source").is_none());
         assert_eq!(input[2]["type"], json!("function_call"));
         assert_eq!(input[2]["call_id"], json!("call_1"));
+        assert!(input[2].get("status").is_none());
+    }
+
+    #[test]
+    fn encode_request_omits_output_status_from_tool_call_history() {
+        let mut function_extra = empty_map();
+        function_extra.insert("status".to_string(), json!("completed"));
+        let mut custom_extra = empty_map();
+        custom_extra.insert("status".to_string(), json!("completed"));
+        let req = UrpRequest {
+            model: "gpt-5.6-sol".to_string(),
+            input: items_to_nodes(vec![Item::Message {
+                id: None,
+                role: Role::Assistant,
+                parts: vec![
+                    Part::ToolCall {
+                        id: Some("fc_1".to_string()),
+                        tool_type: ToolCallType::Function,
+                        call_id: "call_1".to_string(),
+                        name: "lookup".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_body: function_extra,
+                    },
+                    Part::ToolCall {
+                        id: Some("ctc_1".to_string()),
+                        tool_type: ToolCallType::Custom,
+                        call_id: "call_2".to_string(),
+                        name: "shell".to_string(),
+                        arguments: "echo ok".to_string(),
+                        extra_body: custom_extra,
+                    },
+                ],
+                extra_body: empty_map(),
+            }]),
+            stream: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            stop: None,
+            verbosity: None,
+            response_format: None,
+            user: None,
+            extra_body: empty_map(),
+        };
+
+        let encoded = encode_request(&req, "gpt-5.6-sol");
+        let input = encoded["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], json!("function_call"));
+        assert_eq!(input[1]["type"], json!("custom_tool_call"));
+        assert!(input.iter().all(|item| item.get("status").is_none()));
     }
 
     #[test]

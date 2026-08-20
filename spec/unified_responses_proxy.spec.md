@@ -618,6 +618,8 @@ ENC2. Each `Reasoning` node that carries a meaningful reasoning payload under PR
 
 ENC3. Each function `ToolCall` node MUST encode as one top-level Responses `function_call` item. Each custom `ToolCall` node MUST encode as one top-level Responses `custom_tool_call` item. Their correlated `ToolResult` nodes MUST encode as `function_call_output` and `custom_tool_call_output` respectively.
 
+ENC3a. When encoding an upstream Responses create request, Monoize MUST omit `status` from every `function_call` and `custom_tool_call` item in `input[]`. This rule applies when `status` came from a downstream Responses item and when the encoder synthesized `status` for a response object. Output-side Responses objects and stream events MAY contain `status` as required by their output schema.
+
 ENC4. Each maximal run of adjacent ordinary nodes that are not `Reasoning`, not `ToolCall`, and not `ProviderItem`, and that share the same `role`, MAY encode as one Responses `message` item.
 
 ENC5. A change in `Text.phase` inside a Responses message run MUST force a new Responses `message` item boundary.

@@ -17,13 +17,15 @@ D1. Running `./deploy.sh` with no subcommand MUST execute the following steps in
 5. Restart PM2 process `monoize`.
 6. Save PM2 state.
 
+D1a. The default deploy workflow MUST NOT arm a rollback watchdog.
+
 D2. Before step D1.4 completes, the script MUST cancel any previously armed deployment watchdog state recorded under `/opt/monoize/.deploy-watchdog/`.
 
 D2a. If step D1.5 fails and a backup path from D1.3 exists, the script MUST synchronously restore that backup binary to `/opt/monoize/monoize`, attempt to restart PM2 process `monoize` using the restored binary, and then exit with failure.
 
 ## 2. Watchdog arming behavior
 
-D3. After a deploy completes step D1.6 and a backup path from D1.3 exists, the script MUST arm a rollback watchdog with a timeout of exactly 300 seconds. Production execution MUST NOT accept an environment override for this timeout.
+D3. Running `./deploy.sh deploy-watchdog` MUST execute D1.1 through D1.6. After step D1.6 completes, if a backup path from D1.3 exists, the script MUST arm a rollback watchdog with a timeout of exactly 300 seconds. Production execution MUST NOT accept an environment override for this timeout.
 
 D3a. A repository-local test MAY select a timeout from 1 through 30 seconds only when all of the following inputs are present and valid:
 

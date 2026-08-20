@@ -135,7 +135,7 @@ test_watchdog_survives_caller_session_and_rolls_back() {
         DEPLOY_SCRIPT="$fixture_root/deploy.sh" \
         setsid bash -c '
             printf "%s\n" "$BASHPID" > "$CALLER_PID_FILE"
-            "$DEPLOY_SCRIPT" > "${CALLER_READY_FILE}.output" 2>&1
+            "$DEPLOY_SCRIPT" deploy-watchdog > "${CALLER_READY_FILE}.output" 2>&1
             : > "$CALLER_READY_FILE"
             while :; do sleep 1; done
         ' &
@@ -179,7 +179,7 @@ test_watchdog_survives_caller_session_and_rolls_back() {
 test_cancel_kills_watchdog_and_timer() {
     setup_fixture
     local fixture_root="$FIXTURE_ROOT"
-    run_fixture_deploy "$fixture_root" 3 > "$fixture_root/deploy.output"
+    run_fixture_deploy "$fixture_root" 3 deploy-watchdog > "$fixture_root/deploy.output"
 
     local watchdog_pid timer_pid
     watchdog_pid="$(<"$fixture_root/deploy/.deploy-watchdog/current_pid")"
@@ -256,7 +256,22 @@ test_short_timeout_requires_explicit_test_mode() {
     printf 'ok - short timeout requires explicit test mode\n'
 }
 
+test_default_deploy_does_not_arm_watchdog() {
+    setup_fixture
+    local fixture_root="$FIXTURE_ROOT"
+    run_fixture_deploy "$fixture_root" 3 > "$fixture_root/deploy.output"
+
+    wait_for_empty_directory "$fixture_root/deploy/.deploy-watchdog" \
+        || fail "default deploy left watchdog state"
+    [ "$(<"$fixture_root/deploy/monoize")" = "new-binary" ] \
+        || fail "default deploy did not install the new binary"
+    [ "$(grep -c '^restart monoize$' "$fixture_root/pm2.log")" -eq 1 ] \
+        || fail "default deploy did not restart PM2 exactly once"
+    printf 'ok - default deploy does not arm watchdog\n'
+}
+
 test_watchdog_survives_caller_session_and_rolls_back
 test_cancel_kills_watchdog_and_timer
 test_stale_reused_pid_is_not_signalled
 test_short_timeout_requires_explicit_test_mode
+test_default_deploy_does_not_arm_watchdog
