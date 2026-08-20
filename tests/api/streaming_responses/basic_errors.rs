@@ -420,10 +420,8 @@ async fn responses_streaming_reencodes_greedy_merged_items_with_canonical_sse_bo
         })
         .expect("reasoning output_item.added");
     assert!(
-        reasoning_added.1["item"]["encrypted_content"]
-            .as_str()
-            .is_some_and(|value| value.starts_with("mz2.")),
-        "reasoning output_item.added must wrap encrypted_content for downstream: {text}"
+        reasoning_added.1["item"].get("encrypted_content").is_none(),
+        "reasoning output_item.added must omit provisional encrypted_content: {text}"
     );
     assert!(text.contains("event: response.content_part.added"));
     assert!(text.contains(
@@ -431,4 +429,66 @@ async fn responses_streaming_reencodes_greedy_merged_items_with_canonical_sse_bo
     ));
     assert!(!text.contains("\"part\":{\"text\":\"\",\"type\":\"reasoning\"}"));
     assert!(!text.contains("event: response.content_part.added\ndata: {\"content_index\":2"));
+}
+
+#[tokio::test]
+async fn responses_streaming_discards_provisional_encrypted_reasoning_snapshot() {
+    let ctx = setup().await;
+    let (status, text) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5-mini",
+            "input": "stream tool",
+            "tools": [{
+                "type": "function",
+                "name": "tool_a",
+                "parameters": { "type": "object", "additionalProperties": true }
+            }],
+            "stream": true,
+            "stream_mode": "reasoning_text_tool"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    let frames = parse_responses_sse_json(&text);
+    let reasoning_added = frames
+        .iter()
+        .find(|(event, payload)| {
+            event == "response.output_item.added"
+                && payload["item"]["type"].as_str() == Some("reasoning")
+        })
+        .expect("reasoning output_item.added");
+    assert!(reasoning_added.1["item"].get("encrypted_content").is_none());
+
+    let reasoning_done = frames
+        .iter()
+        .find(|(event, payload)| {
+            event == "response.output_item.done"
+                && payload["item"]["type"].as_str() == Some("reasoning")
+        })
+        .expect("reasoning output_item.done");
+    let done_envelope = monoize::urp::parse_reasoning_envelope(
+        &reasoning_done.1["item"]["encrypted_content"],
+    )
+    .expect("completed reasoning envelope");
+    assert_eq!(done_envelope.item_id.as_deref(), Some("rs_mock"));
+    assert_eq!(done_envelope.payload, json!("mock_sig"));
+
+    let completed = frames
+        .iter()
+        .find(|(event, _)| event == "response.completed")
+        .expect("response.completed");
+    let terminal_reasoning = completed.1["response"]["output"]
+        .as_array()
+        .expect("terminal output")
+        .iter()
+        .find(|item| item["type"].as_str() == Some("reasoning"))
+        .expect("terminal reasoning item");
+    let terminal_envelope =
+        monoize::urp::parse_reasoning_envelope(&terminal_reasoning["encrypted_content"])
+            .expect("terminal reasoning envelope");
+    assert_eq!(terminal_envelope.item_id.as_deref(), Some("rs_mock"));
+    assert_eq!(terminal_envelope.payload, json!("mock_sig"));
 }

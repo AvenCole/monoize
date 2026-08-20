@@ -345,6 +345,24 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_added_snapshot_discards_provisional_encrypted_content() {
+        let item = json!({
+            "type": "reasoning",
+            "id": "rs_provisional",
+            "encrypted_content": "provisional_sig",
+            "future_item_field": true
+        });
+        let mut slot = AccumulatedReasoningSlot::default();
+
+        merge_reasoning_item_snapshot(&mut slot, &item, false);
+
+        assert!(slot.encrypted.is_none());
+        let extra_body = item_extra_body_from_value(&item);
+        assert!(!extra_body.contains_key("encrypted_content"));
+        assert_eq!(extra_body.get("future_item_field"), Some(&json!(true)));
+    }
+
+    #[test]
     fn reasoning_done_snapshots_replace_delta_accumulation() {
         let mut slot = AccumulatedReasoningSlot::default();
         append_reasoning_summary_delta(&mut slot, Some(0), "provisional summary");
@@ -358,13 +376,15 @@ mod tests {
                 "summary": [{
                     "type": "summary_text",
                     "text": "item summary"
-                }]
+                }],
+                "encrypted_content": "final_sig"
             }),
             true,
         );
 
         assert!(slot.summary_parts.is_empty());
         assert_eq!(slot.summary_text().as_deref(), Some("item summary"));
+        assert_eq!(slot.encrypted, Some(json!("final_sig")));
     }
 
     #[test]
@@ -1044,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_output_item_added_control_extra_preserves_item_id() {
+    fn reasoning_output_item_added_control_extra_keeps_id_and_discards_encrypted_content() {
         let mut state = ResponsesStreamIndexState::default();
 
         let events = map_responses_event_to_urp_events_with_state(
@@ -1069,8 +1089,16 @@ mod tests {
                 extra_body,
                 ..
             } if extra_body.get("id") == Some(&json!("rs_original"))
-                && extra_body.get("encrypted_content") == Some(&json!("opaque_payload"))
+                && !extra_body.contains_key("encrypted_content")
         )));
+        assert!(events.iter().all(|event| match event {
+            UrpStreamEvent::NodeStart { extra_body, .. }
+            | UrpStreamEvent::NodeDelta { extra_body, .. }
+            | UrpStreamEvent::NodeDone { extra_body, .. } => {
+                !extra_body.contains_key("encrypted_content")
+            }
+            _ => true,
+        }));
     }
 
     #[test]

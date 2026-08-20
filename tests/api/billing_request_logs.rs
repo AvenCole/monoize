@@ -665,7 +665,7 @@ async fn chat_upstream_error_is_logged_and_not_billed() {
 
     let log = matched.expect("error request log should be inserted");
     assert_eq!(log.billing.charge_nano_usd, None);
-    assert_eq!(log.error.code.as_deref(), Some("upstream_error"));
+    assert_eq!(log.error.code.as_deref(), Some("rate_limit"));
     assert!(
         log.error
             .message

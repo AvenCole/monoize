@@ -1014,7 +1014,7 @@ async fn exhausted_upstream_error_preserves_last_upstream_error_fields() {
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     let v: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["error"]["code"].as_str(), Some("upstream_error"));
+    assert_eq!(v["error"]["code"].as_str(), Some("forced_daily_limit"));
     assert_eq!(v["error"]["upstream_status"].as_u64(), Some(429));
     assert_eq!(
         v["error"]["upstream_code"].as_str(),

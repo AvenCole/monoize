@@ -525,7 +525,7 @@ SER-7. The transform MUST be a no-op on `UrpData::Request`. Request-side strippi
 
 SER-8. The transform MUST behave identically whether the encrypted payload it observes is an `mz2.` envelope string or a raw upstream encrypted reasoning value. PIPE-1d guarantees that when `reasoning_envelope_enabled = true`, only the envelope form is observable; this transform MUST NOT depend on that guarantee for correctness.
 
-SER-9. The motivating use case for SER-1 through SER-8 is downstream SSE clients that cannot tolerate single SSE `data:` lines exceeding their per-line buffer. Removing `encrypted_content` shrinks the per-line payload of `response.completed` and `response.output_item.added` events without changing other observable response semantics.
+SER-9. The motivating use case for SER-1 through SER-8 is downstream SSE clients that cannot tolerate single SSE `data:` lines exceeding their per-line buffer. Removing `encrypted_content` shrinks the per-line payload of `response.output_item.done` and `response.completed` events without changing other observable response semantics.
 
 ### 4.8 Response image transforms on flat ordinary nodes and stream state
 
@@ -704,7 +704,7 @@ PIPE-1. Non-stream and stream requests MUST execute in this order:
 16. apply API-key response-phase transforms; and
 17. encode URP v2 to the downstream wire response using the original requested logical model name.
 
-PIPE-1d. Step 7 of PIPE-1 MUST run before any request-phase transform observes `request.input`. Step 13 of PIPE-1 MUST run before any response-phase transform observes `response.output` or canonical URP v2 stream events. The runtime MUST NOT expose unwrapped raw encrypted reasoning payloads to request-phase transforms, and MUST NOT expose un-enveloped encrypted reasoning payloads to response-phase transforms.
+PIPE-1d. Step 7 of PIPE-1 MUST run before any request-phase transform observes `request.input`. Step 13 of PIPE-1 MUST run before any response-phase transform observes `response.output` or canonical URP v2 stream events. The runtime MUST NOT expose unwrapped raw encrypted reasoning payloads to request-phase transforms, and MUST NOT expose un-enveloped encrypted reasoning payloads to response-phase transforms. The Responses stream decoder MUST discard provisional `response.output_item.added.item.encrypted_content` under SACC-5a before a response-phase transform can observe it.
 
 PIPE-1a. For streaming requests that satisfy STR-9, the runtime MAY call the upstream non-stream endpoint for that attempt, decode to `UrpResponseV2`, apply response transforms, and emit synthesized downstream stream events. The postcondition is that transformed content remains visible on the stream path even when upstream native streaming is bypassed.
 

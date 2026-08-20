@@ -604,7 +604,7 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                             .data(json!({
                                 "type": "response.output_item.added",
                                 "output_index": 0,
-                                "item": { "type": "reasoning", "id": "rs_mock", "summary": [{ "type": "summary_text", "text": "" }], "content": [], "encrypted_content": "mock_sig" }
+                                "item": { "type": "reasoning", "id": "rs_mock", "summary": [{ "type": "summary_text", "text": "" }], "content": [], "encrypted_content": "provisional_sig" }
                             }).to_string())),
                         Ok::<_, Infallible>(Event::default()
                             .event("response.reasoning_summary_part.added")
@@ -5285,7 +5285,10 @@ async fn mock_nonstream_usage_can_be_explicitly_omitted_for_negative_billing_tes
 
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     let error: Value = serde_json::from_str(&body).expect("error response JSON");
-    assert_eq!(error["error"]["code"], json!("upstream_error"));
+    assert_eq!(
+        error["error"]["code"],
+        json!("upstream_usage_required")
+    );
     assert_eq!(
         error["error"]["upstream_code"],
         json!("upstream_usage_required")

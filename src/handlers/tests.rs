@@ -2254,6 +2254,29 @@ async fn execute_nonstream_typed_keeps_bad_gateway_when_groups_filter_every_chan
 }
 
 #[test]
+fn exhausted_upstream_error_preserves_final_machine_code() {
+    let tried = vec![TriedProvider {
+        attempt_number: 1,
+        provider_id: "provider-a".to_string(),
+        channel_id: "channel-a".to_string(),
+        error: "encrypted content could not be verified".to_string(),
+        upstream_status: Some(StatusCode::BAD_REQUEST.as_u16()),
+        upstream_code: Some("thinking_signature_invalid".to_string()),
+        upstream_type: Some("invalid_request_error".to_string()),
+        upstream_param: None,
+    }];
+
+    let err = build_exhausted_upstream_error("gpt-5.6-sol", &tried);
+
+    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(err.code, "thinking_signature_invalid");
+    assert_eq!(
+        err.upstream_code.as_deref(),
+        Some("thinking_signature_invalid")
+    );
+}
+
+#[test]
 fn apply_model_redirects_to_model_uses_first_match_wins() {
     let mut model = "claude-opus-4-6-20250610".to_string();
     apply_model_redirects_to_model(

@@ -852,9 +852,14 @@ pub(super) fn build_exhausted_error_message(model: &str, tried: &[TriedProvider]
 }
 
 pub(super) fn build_exhausted_upstream_error(model: &str, tried: &[TriedProvider]) -> AppError {
+    let code = tried
+        .last()
+        .and_then(|attempt| attempt.upstream_code.as_deref())
+        .filter(|code| !code.is_empty())
+        .unwrap_or("upstream_error");
     let mut err = AppError::new(
         StatusCode::BAD_GATEWAY,
-        "upstream_error",
+        code,
         build_exhausted_error_message(model, tried),
     );
     if let Some(last) = tried.last() {

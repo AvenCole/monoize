@@ -36,6 +36,34 @@ async fn responses_upstream_requests_include_encrypted_reasoning_content() {
 }
 
 #[tokio::test]
+async fn responses_nonstream_preserves_thinking_signature_invalid_after_route_exhaustion() {
+    let ctx = setup().await;
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5-mini",
+            "input": "replay invalid encrypted reasoning",
+            "force_upstream_error_status": 400,
+            "force_upstream_error_code": "thinking_signature_invalid",
+            "force_upstream_error_message": "encrypted content could not be verified"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    let error: Value = serde_json::from_str(&body).expect("error response JSON");
+    assert_eq!(
+        error["error"]["code"],
+        json!("thinking_signature_invalid")
+    );
+    assert_eq!(
+        error["error"]["upstream_code"],
+        json!("thinking_signature_invalid")
+    );
+}
+
+#[tokio::test]
 async fn responses_upstream_request_does_not_default_reasoning_summary() {
     let ctx = setup().await;
     let (status, body) = json_post(

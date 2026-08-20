@@ -153,7 +153,8 @@ fn merge_reasoning_item_snapshot(
             slot.summary = summary;
         }
     }
-    if !encrypted.is_empty() && (overwrite_terminal_fields || slot.encrypted.is_none()) {
+    // Added-item encrypted snapshots can differ from the completed token and are not replayable.
+    if overwrite_terminal_fields && !encrypted.is_empty() {
         slot.encrypted = Some(Value::String(encrypted));
     }
 }
@@ -415,6 +416,7 @@ fn item_extra_body_from_value(item: &Value) -> HashMap<String, Value> {
             "output",
             "name",
             "arguments",
+            "encrypted_content",
         ],
     );
     if let Some(native_body) = native_image_generation_call_body(item) {

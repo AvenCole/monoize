@@ -459,6 +459,8 @@ SACC-4a. When a source protocol emits a later non-empty full-field done snapshot
 
 SACC-5. If a streamed `Reasoning.encrypted` payload is emitted incrementally and each delta `encrypted` value is a string, terminal `Reasoning.encrypted` is the ordered concatenation of those string fragments.
 
+SACC-5a. A Responses `response.output_item.added.item.encrypted_content` value is a provisional full-item snapshot, not an incremental encrypted delta. A Responses stream decoder MUST NOT copy that value into a `NodeStart`, `NodeDelta`, control node, `NodeDone`, or `ResponseDone.output` reasoning field. A non-empty `encrypted_content` value from `response.output_item.done.item` or `response.completed.response.output[]` MAY establish terminal `Reasoning.encrypted` for that item. If neither completed source nor an explicit encrypted delta governed by SACC-5 supplies a non-empty value, terminal `Reasoning.encrypted` MUST remain absent.
+
 SACC-6. If a provider supplies a non-string `Reasoning.encrypted` payload, the decoder MUST emit that value only in `NodeDone.node` and `ResponseDone.output`, or in exactly one `NodeDelta`. The decoder MUST NOT split a non-string JSON value across several deltas.
 
 SACC-7. For `NodeDelta::Reasoning.source`, the terminal `Reasoning.source` value is the most recent non-empty `source` value seen for that `node_index`.

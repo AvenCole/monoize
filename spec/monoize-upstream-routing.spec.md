@@ -201,7 +201,7 @@ RTA-6a. If `provider.circuit_breaker_enabled == false`, retryable attempt failur
 
 RTA-7. If all attempts in Provider fail before the first downstream byte, router MUST continue with the next Provider. The status code of an upstream failure MUST NOT stop cross-Provider fail-forward.
 
-RTA-8. If all providers are exhausted for a non-streaming downstream request, return `502` with message indicating no available upstream provider for requested model. If all providers are exhausted before the first downstream byte for a streaming downstream request, return the protocol-specific stream error defined by `spec/unified_responses_proxy.spec.md` FP4e with `error.code = "upstream_error"` unless a final upstream error code is available.
+RTA-8. If all providers are exhausted for a non-streaming downstream request, return `502` with a message that identifies the exhausted model. If the final failed attempt has a non-empty upstream error code, the downstream error `code` and request-log `error_code` MUST equal that upstream code. Otherwise they MUST equal `upstream_error`. The diagnostic `upstream_code` field MUST remain present when an upstream code exists. If all providers are exhausted before the first downstream byte for a streaming downstream request, return the protocol-specific stream error defined by `spec/unified_responses_proxy.spec.md` FP4e with `error.code = "upstream_error"` unless a final upstream error code is available. This rule preserves fail-forward behavior and does not authorize a same-Channel retry for HTTP `400`, `401`, `403`, or `422`.
 
 ## 5. Streaming-specific Rule
 
