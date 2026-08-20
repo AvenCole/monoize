@@ -407,6 +407,7 @@ mod tests {
             output[1]["type"],
             Value::String("function_call".to_string())
         );
+        assert_eq!(output[1]["status"], json!("completed"));
         assert_eq!(output[2]["type"], Value::String("message".to_string()));
         assert_eq!(
             output[2]["phase"],
@@ -659,11 +660,11 @@ mod tests {
     }
 
     #[test]
-    fn encode_request_omits_output_status_from_tool_call_history() {
+    fn encode_request_preserves_function_status_and_omits_custom_status() {
         let mut function_extra = empty_map();
-        function_extra.insert("status".to_string(), json!("completed"));
+        function_extra.insert("status".to_string(), json!("in_progress"));
         let mut custom_extra = empty_map();
-        custom_extra.insert("status".to_string(), json!("completed"));
+        custom_extra.insert("status".to_string(), json!("in_progress"));
         let req = UrpRequest {
             model: "gpt-5.6-sol".to_string(),
             input: items_to_nodes(vec![Item::Message {
@@ -708,8 +709,9 @@ mod tests {
         let input = encoded["input"].as_array().expect("input array");
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["type"], json!("function_call"));
+        assert_eq!(input[0]["status"], json!("in_progress"));
         assert_eq!(input[1]["type"], json!("custom_tool_call"));
-        assert!(input.iter().all(|item| item.get("status").is_none()));
+        assert!(input[1].get("status").is_none());
     }
 
     #[test]

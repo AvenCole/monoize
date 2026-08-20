@@ -190,7 +190,7 @@ fn sanitize_request_input_item(item: &mut Value) {
                 }
             }
         }
-        Some("function_call" | "custom_tool_call") => {
+        Some("custom_tool_call") => {
             obj.remove("status");
         }
         _ => {}
@@ -203,7 +203,7 @@ fn sanitize_request_input_items(input_items: &mut [Value]) {
     }
 }
 
-fn encode_tool_call_item(part: &Part) -> Option<Value> {
+fn encode_tool_call_item(part: &Part, synthesize_completed_status: bool) -> Option<Value> {
     match part {
         Part::ToolCall {
             id,
@@ -238,7 +238,9 @@ fn encode_tool_call_item(part: &Part) -> Option<Value> {
                         .unwrap_or_else(|| format!("ctc_urp_{}", uuid::Uuid::new_v4().simple())),
                 }),
             );
-            obj.insert("status".to_string(), Value::String("completed".to_string()));
+            if synthesize_completed_status {
+                obj.insert("status".to_string(), Value::String("completed".to_string()));
+            }
             obj.insert("call_id".to_string(), Value::String(call_id.clone()));
             obj.insert("name".to_string(), Value::String(name.clone()));
             obj.insert(

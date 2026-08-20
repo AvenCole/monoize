@@ -164,7 +164,7 @@ pub fn encode_response(resp: &UrpResponse, logical_model: &str) -> Value {
                         continue;
                     }
 
-                    if let Some(tool_call_item) = encode_tool_call_item(part) {
+                    if let Some(tool_call_item) = encode_tool_call_item(part, true) {
                         output.push(tool_call_item);
                         continue;
                     }
@@ -337,8 +337,8 @@ fn encode_message_to_input_items(item: &Item, out: &mut Vec<Value>) {
 
                 flush_pending_message_item(&mut pending_message, out);
 
-                if let Some(mut item) =
-                    encode_reasoning_request_item(part).or_else(|| encode_tool_call_item(part))
+                if let Some(mut item) = encode_reasoning_request_item(part)
+                    .or_else(|| encode_tool_call_item(part, false))
                 {
                     sanitize_reasoning_request_item(&mut item);
                     out.push(item);

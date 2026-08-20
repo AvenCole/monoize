@@ -73,6 +73,73 @@ async fn responses_structured_instructions_replay_exactly_without_input_duplicat
 }
 
 #[tokio::test]
+async fn responses_tool_call_status_matches_create_input_schema() {
+    let ctx = setup().await;
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5-mini",
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": "fc_explicit",
+                    "call_id": "call_explicit",
+                    "name": "lookup",
+                    "arguments": "{}",
+                    "status": "in_progress"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_explicit",
+                    "output": "ok"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_absent",
+                    "call_id": "call_absent",
+                    "name": "lookup",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_absent",
+                    "output": "ok"
+                },
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_explicit",
+                    "call_id": "call_custom",
+                    "name": "shell",
+                    "input": "echo ok",
+                    "status": "in_progress"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_custom",
+                    "output": "ok"
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let upstream = last_captured_body(&ctx, "responses");
+    let input = upstream["input"].as_array().expect("Responses input array");
+    let find_call = |call_id: &str| {
+        input
+            .iter()
+            .find(|item| item["call_id"] == json!(call_id))
+            .unwrap_or_else(|| panic!("missing upstream call {call_id}: {upstream}"))
+    };
+
+    assert_eq!(find_call("call_explicit")["status"], json!("in_progress"));
+    assert!(find_call("call_absent").get("status").is_none());
+    assert!(find_call("call_custom").get("status").is_none());
+}
+
+#[tokio::test]
 async fn messages_nonstream_from_gemini_upstream_text() {
     let ctx = setup().await;
     let (status, body) = json_post(
