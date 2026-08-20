@@ -1,6 +1,8 @@
 use super::*;
 use crate::transforms::split_sse_frames::DEFAULT_MAX_FRAME_LENGTH;
 use crate::urp::ImageSource;
+use std::io::Write;
+use xxhash_rust::xxh3::Xxh3;
 
 #[allow(clippy::result_large_err)]
 pub(super) fn decode_urp_request(
@@ -397,21 +399,80 @@ pub(crate) fn short_xxh3_hex(input: &str) -> String {
     format!("{:016x}", xxhash_rust::xxh3::xxh3_64(input.as_bytes()))
 }
 
-fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> &str {
-    if input.len() <= max_bytes {
-        return input;
+const AFFINITY_PREFIX_NODE_LIMIT: usize = 8;
+const AFFINITY_PREFIX_BYTE_LIMIT: usize = 16 * 1024;
+
+struct BoundedHashWriter {
+    hasher: Xxh3,
+    remaining: usize,
+    limit_reached: bool,
+}
+
+impl BoundedHashWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            hasher: Xxh3::new(),
+            remaining: limit,
+            limit_reached: false,
+        }
     }
-    let mut end = max_bytes;
-    while !input.is_char_boundary(end) {
-        end -= 1;
+
+    fn digest(&self) -> u64 {
+        self.hasher.digest()
     }
-    &input[..end]
+}
+
+impl Write for BoundedHashWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let accepted = self.remaining.min(buf.len());
+        if accepted > 0 {
+            self.hasher.update(&buf[..accepted]);
+            self.remaining -= accepted;
+        }
+        if accepted < buf.len() {
+            self.limit_reached = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "affinity prefix byte limit reached",
+            ));
+        }
+        Ok(accepted)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn affinity_prefix_hash(req: &urp::UrpRequest) -> String {
-    let prefix_nodes: Vec<&urp::Node> = req.input.iter().take(8).collect();
-    let material = serde_json::to_string(&prefix_nodes).unwrap_or_default();
-    short_xxh3_hex(truncate_utf8_bytes(&material, 16 * 1024))
+    let mut writer = BoundedHashWriter::new(AFFINITY_PREFIX_BYTE_LIMIT);
+    let result = (|| -> std::io::Result<()> {
+        writer.write_all(b"[")?;
+        for (index, node) in req
+            .input
+            .iter()
+            .take(AFFINITY_PREFIX_NODE_LIMIT)
+            .enumerate()
+        {
+            if index > 0 {
+                writer.write_all(b",")?;
+            }
+            if let Err(error) = serde_json::to_writer(&mut writer, node) {
+                if writer.limit_reached {
+                    return Ok(());
+                }
+                return Err(std::io::Error::other(error));
+            }
+        }
+        writer.write_all(b"]")
+    })();
+    if result.is_err() && !writer.limit_reached {
+        return short_xxh3_hex("");
+    }
+    format!("{:016x}", writer.digest())
 }
 
 pub(super) fn build_routing_stub(
@@ -1077,6 +1138,66 @@ mod tests {
         }
         assert!(!EXTRA_WHITELIST_CHAT_COMPLETION.contains(&"models"));
         assert!(!EXTRA_WHITELIST_ANTHROPIC.contains(&"fallbacks"));
+    }
+
+    #[test]
+    fn affinity_prefix_hash_matches_bounded_normalized_json() {
+        let request = urp::decode::openai_responses::decode_request(&json!({
+            "model": "gpt-5.6-sol",
+            "input": "x".repeat(AFFINITY_PREFIX_BYTE_LIMIT * 4),
+        }))
+        .expect("decode request");
+        let material = serde_json::to_string(
+            &request
+                .input
+                .iter()
+                .take(AFFINITY_PREFIX_NODE_LIMIT)
+                .collect::<Vec<_>>(),
+        )
+        .expect("serialize normalized input");
+        let bounded_material = &material.as_bytes()[..AFFINITY_PREFIX_BYTE_LIMIT];
+
+        assert_eq!(
+            affinity_prefix_hash(&request),
+            format!("{:016x}", xxhash_rust::xxh3::xxh3_64(bounded_material))
+        );
+    }
+
+    #[test]
+    fn affinity_prefix_hash_ignores_nodes_after_the_eighth() {
+        let base_nodes = (0..8)
+            .map(|index| {
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": format!("prefix-{index}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut first_nodes = base_nodes.clone();
+        first_nodes.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": "first suffix",
+        }));
+        let mut second_nodes = base_nodes;
+        second_nodes.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": "second suffix",
+        }));
+        let first = urp::decode::openai_responses::decode_request(&json!({
+            "model": "gpt-5.6-sol",
+            "input": first_nodes,
+        }))
+        .expect("decode first request");
+        let second = urp::decode::openai_responses::decode_request(&json!({
+            "model": "gpt-5.6-sol",
+            "input": second_nodes,
+        }))
+        .expect("decode second request");
+
+        assert_eq!(affinity_prefix_hash(&first), affinity_prefix_hash(&second));
     }
 
     #[test]

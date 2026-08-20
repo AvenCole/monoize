@@ -244,7 +244,7 @@ AFF-3. The affinity cache key MUST include:
 
 AFF-4. Explicit stable metadata fields are Responses `previous_response_id`, session, conversation, thread, and user-like fields from request metadata or extra body. `previous_response_id` takes precedence over other explicit fields. Per-request ids, including downstream `request_id`, MUST NOT be used as affinity keys.
 
-AFF-5. The fallback input-prefix hash MUST hash normalized request input only. It MUST consider at most the first 8 input nodes and at most 16384 bytes of normalized JSON/text material. Raw affinity material MUST NOT be persisted.
+AFF-5. The fallback input-prefix hash MUST hash normalized request input only. It MUST consider at most the first 8 input nodes and at most the first 16384 bytes of their normalized JSON/text material. The implementation MUST stop serialization when it reaches the byte limit. It MUST NOT serialize or allocate material after that limit. Raw affinity material MUST NOT be persisted.
 
 AFF-6. The affinity value MUST contain `(provider_id, channel_id, bound_at, last_used_at, expires_at)`.
 
