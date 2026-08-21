@@ -6,7 +6,7 @@ fn encode_reasoning_request_item(part: &Part) -> Option<Value> {
     encode_reasoning_item_inner(part, true)
 }
 
-fn encode_reasoning_item_inner(part: &Part, require_stable_id_for_encrypted: bool) -> Option<Value> {
+fn encode_reasoning_item_inner(part: &Part, request_item: bool) -> Option<Value> {
     match part {
         Part::Reasoning {
             id,
@@ -16,7 +16,7 @@ fn encode_reasoning_item_inner(part: &Part, require_stable_id_for_encrypted: boo
             source,
             extra_body,
         } => {
-            if require_stable_id_for_encrypted
+            if request_item
                 && extra_body
                     .get(REASONING_DOWNSTREAM_ONLY_PRESENTATION_EXTRA_KEY)
                     .and_then(Value::as_bool)
@@ -24,7 +24,7 @@ fn encode_reasoning_item_inner(part: &Part, require_stable_id_for_encrypted: boo
             {
                 return None;
             }
-            if !require_stable_id_for_encrypted
+            if !request_item
                 && !reasoning_payload_is_meaningful(content, summary, encrypted)
             {
                 return None;
@@ -36,19 +36,9 @@ fn encode_reasoning_item_inner(part: &Part, require_stable_id_for_encrypted: boo
                     .and_then(Value::as_str)
                     .map(|s| s.to_string())
             });
-            let encrypted_len = encrypted
-                .as_ref()
-                .map(|value| match value {
-                    Value::String(s) => s.len(),
-                    other => other.to_string().len(),
-                })
-                .unwrap_or(0);
-            if require_stable_id_for_encrypted && encrypted_len > 0 && stable_id.is_none() {
-                return None;
-            }
             if let Some(id) = stable_id {
                 obj.insert("id".to_string(), Value::String(id));
-            } else if !require_stable_id_for_encrypted {
+            } else if !request_item {
                 obj.insert(
                     "id".to_string(),
                     Value::String(format!("rs_{}", uuid::Uuid::new_v4().simple())),
@@ -75,13 +65,13 @@ fn encode_reasoning_item_inner(part: &Part, require_stable_id_for_encrypted: boo
                         "text": content
                     })]),
                 );
-            } else if !require_stable_id_for_encrypted {
+            } else if !request_item {
                 obj.insert("content".to_string(), Value::Array(Vec::new()));
             }
             if let Some(encrypted) = encrypted {
                 obj.insert("encrypted_content".to_string(), encrypted.clone());
             }
-            if !require_stable_id_for_encrypted
+            if !request_item
                 && let Some(source) = source.as_ref().filter(|source| !source.is_empty())
             {
                 obj.insert("source".to_string(), Value::String(source.clone()));
@@ -204,7 +194,7 @@ fn sanitize_request_input_items(input_items: &mut [Value]) {
     }
 }
 
-fn encode_tool_call_item(part: &Part, synthesize_completed_status: bool) -> Option<Value> {
+fn encode_tool_call_item(part: &Part, output_item: bool) -> Option<Value> {
     match part {
         Part::ToolCall {
             id,
@@ -225,21 +215,35 @@ fn encode_tool_call_item(part: &Part, synthesize_completed_status: bool) -> Opti
                     .to_string(),
                 ),
             );
-            obj.insert(
-                "id".to_string(),
-                Value::String(match tool_type {
-                    ToolCallType::Function => normalize_openai_function_call_item_id(
-                        id.as_deref()
-                            .or_else(|| extra_body.get("id").and_then(Value::as_str)),
-                    ),
-                    ToolCallType::Custom => id
-                        .as_deref()
-                        .or_else(|| extra_body.get("id").and_then(Value::as_str))
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("ctc_urp_{}", uuid::Uuid::new_v4().simple())),
-                }),
-            );
-            if synthesize_completed_status {
+            let item_id = id
+                .as_deref()
+                .or_else(|| extra_body.get("id").and_then(Value::as_str));
+            if let Some(item_id) = item_id {
+                obj.insert(
+                    "id".to_string(),
+                    Value::String(if output_item {
+                        match tool_type {
+                            ToolCallType::Function => {
+                                normalize_openai_function_call_item_id(Some(item_id))
+                            }
+                            ToolCallType::Custom => item_id.to_string(),
+                        }
+                    } else {
+                        item_id.to_string()
+                    }),
+                );
+            } else if output_item {
+                obj.insert(
+                    "id".to_string(),
+                    Value::String(match tool_type {
+                        ToolCallType::Function => normalize_openai_function_call_item_id(None),
+                        ToolCallType::Custom => {
+                            format!("ctc_urp_{}", uuid::Uuid::new_v4().simple())
+                        }
+                    }),
+                );
+            }
+            if output_item {
                 obj.insert("status".to_string(), Value::String("completed".to_string()));
             }
             obj.insert("call_id".to_string(), Value::String(call_id.clone()));

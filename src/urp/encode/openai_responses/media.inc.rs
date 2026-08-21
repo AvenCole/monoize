@@ -715,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_request_drops_encrypted_reasoning_without_stable_item_id() {
+    fn encode_request_preserves_encrypted_reasoning_without_item_id() {
         let req = UrpRequest {
             model: "gpt-5.4".to_string(),
             input: items_to_nodes(vec![Item::Message {
@@ -754,19 +754,80 @@ mod tests {
 
         let encoded = encode_request(&req, "gpt-5.4");
         let input = encoded["input"].as_array().expect("input array");
-        assert!(
-            input
-                .iter()
-                .all(|item| item.get("type").and_then(Value::as_str) != Some("reasoning")),
-            "encrypted reasoning replay without a stable item id must not be sent upstream"
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], json!("reasoning"));
+        assert_eq!(
+            input[0]["encrypted_content"],
+            json!("encrypted_without_bound_item_id")
         );
-        assert!(
-            input.iter().any(|item| {
-                item.get("type").and_then(Value::as_str) == Some("message")
-                    && item.get("role").and_then(Value::as_str) == Some("assistant")
-            }),
-            "dropping the unsafe reasoning item must not drop adjacent assistant text"
-        );
+        assert!(input[0].get("id").is_none());
+        assert_eq!(input[1]["type"], json!("message"));
+        assert_eq!(input[1]["role"], json!("assistant"));
+        assert!(input[1].get("id").is_none());
+    }
+
+    #[test]
+    fn same_responses_request_preserves_typed_item_id_presence() {
+        let decoded = decode_responses::decode_request(&json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [],
+                    "encrypted_content": "ciphertext_without_item_id"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_without_item_id",
+                    "name": "lookup",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_without_item_id",
+                    "output": "ok"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "continue" }]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_exact",
+                    "call_id": "call_with_item_id",
+                    "name": "lookup",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "fco_exact",
+                    "call_id": "call_with_item_id",
+                    "output": "ok"
+                },
+                {
+                    "type": "message",
+                    "id": "msg_exact",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "finish" }]
+                }
+            ]
+        }))
+        .expect("decode Responses request");
+
+        let encoded = encode_request(&decoded, "gpt-5.6-sol");
+        let input = encoded["input"].as_array().expect("input array");
+        for index in 0..4 {
+            assert!(
+                input[index].get("id").is_none(),
+                "item {index} acquired a synthetic id: {}",
+                input[index]
+            );
+        }
+        assert_eq!(input[4]["id"], json!("fc_exact"));
+        assert_eq!(input[5]["id"], json!("fco_exact"));
+        assert_eq!(input[6]["id"], json!("msg_exact"));
     }
 
     #[test]

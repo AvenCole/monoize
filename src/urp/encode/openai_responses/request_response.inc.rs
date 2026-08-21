@@ -5,6 +5,7 @@ fn encode_tool_result_item(
     content: &[ToolResultContent],
     _is_error: bool,
     extra_body: &HashMap<String, Value>,
+    output_item: bool,
     out: &mut Vec<Value>,
 ) {
     let mut tool_content = Vec::new();
@@ -62,12 +63,16 @@ fn encode_tool_result_item(
     if let Some(id) = id {
         obj.insert(
             "id".to_string(),
-            Value::String(match tool_type {
-                ToolCallType::Function => normalize_openai_function_output_id(Some(id)),
-                ToolCallType::Custom => id.to_string(),
+            Value::String(if output_item {
+                match tool_type {
+                    ToolCallType::Function => normalize_openai_function_output_id(Some(id)),
+                    ToolCallType::Custom => id.to_string(),
+                }
+            } else {
+                id.to_string()
             }),
         );
-    } else {
+    } else if output_item {
         obj.insert(
             "id".to_string(),
             Value::String(match tool_type {

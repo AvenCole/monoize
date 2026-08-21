@@ -71,6 +71,58 @@ async fn responses_nonstream_preserves_thinking_signature_invalid_after_route_ex
 }
 
 #[tokio::test]
+async fn responses_replay_does_not_invent_typed_input_item_ids() {
+    let ctx = setup().await;
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5-mini",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [],
+                    "encrypted_content": "complete_opaque_snapshot"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_replay",
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"monoize\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_replay",
+                    "output": "found"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "continue" }]
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let upstream = last_captured_body(&ctx, "responses");
+    let input = upstream["input"].as_array().expect("upstream input array");
+    assert_eq!(input.len(), 4, "{upstream}");
+    for (index, item) in input.iter().enumerate() {
+        assert!(
+            item.get("id").is_none(),
+            "upstream item {index} acquired a synthetic id: {item}"
+        );
+    }
+    assert_eq!(input[0]["encrypted_content"], json!("complete_opaque_snapshot"));
+    assert_eq!(input[1]["call_id"], json!("call_replay"));
+    assert_eq!(input[2]["call_id"], json!("call_replay"));
+    assert_eq!(input[3]["content"][0]["text"], json!("continue"));
+}
+
+#[tokio::test]
 async fn responses_upstream_request_does_not_default_reasoning_summary() {
     let ctx = setup().await;
     let (status, body) = json_post(

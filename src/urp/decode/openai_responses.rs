@@ -509,8 +509,7 @@ fn decode_input_item_nodes(obj: &Map<String, Value>, out: &mut Vec<Node>) {
                 id: obj
                     .get("id")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| Some(crate::urp::synthetic_tool_call_id())),
+                    .map(|s| s.to_string()),
                 tool_type,
                 call_id,
                 name,
@@ -540,13 +539,12 @@ fn decode_input_item_nodes(obj: &Map<String, Value>, out: &mut Vec<Node>) {
                 id: obj
                     .get("id")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| Some(crate::urp::synthetic_tool_result_id())),
+                    .map(|s| s.to_string()),
                 tool_type,
                 call_id,
                 is_error: false,
                 content,
-                extra_body: split_extra(obj, &["type", "call_id", "output"]),
+                extra_body: split_extra(obj, &["type", "id", "call_id", "output"]),
             });
         }
         "reasoning" => {

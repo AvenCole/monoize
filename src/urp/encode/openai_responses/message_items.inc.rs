@@ -64,6 +64,7 @@ fn can_use_responses_instructions(item: &Item) -> bool {
 fn flush_pending_message_item(
     pending: &mut Option<PendingResponsesMessageItem>,
     out: &mut Vec<Value>,
+    output_item: bool,
 ) {
     let Some(pending_item) = pending.take() else {
         return;
@@ -74,11 +75,24 @@ fn flush_pending_message_item(
 
     let mut obj = Map::new();
     obj.insert("type".to_string(), Value::String("message".to_string()));
-    obj.insert(
-        "id".to_string(),
-        Value::String(normalize_openai_message_id(pending_item.id.as_deref())),
-    );
-    obj.insert("status".to_string(), Value::String("completed".to_string()));
+    if let Some(id) = pending_item.id {
+        obj.insert(
+            "id".to_string(),
+            Value::String(if output_item {
+                normalize_openai_message_id(Some(&id))
+            } else {
+                id
+            }),
+        );
+    } else if output_item {
+        obj.insert(
+            "id".to_string(),
+            Value::String(normalize_openai_message_id(None)),
+        );
+    }
+    if output_item {
+        obj.insert("status".to_string(), Value::String("completed".to_string()));
+    }
     obj.insert(
         "role".to_string(),
         Value::String(role_to_str(pending_item.role).to_string()),
@@ -94,6 +108,7 @@ fn flush_pending_message_item(
 fn append_content_part_to_pending(
     pending: &mut Option<PendingResponsesMessageItem>,
     out: &mut Vec<Value>,
+    output_item: bool,
     role: Role,
     phase: Option<&str>,
     message_extra: &HashMap<String, Value>,
@@ -106,7 +121,7 @@ fn append_content_part_to_pending(
             || existing.extra_body != *message_extra
     });
     if should_flush {
-        flush_pending_message_item(pending, out);
+        flush_pending_message_item(pending, out, output_item);
     }
 
     let entry = pending.get_or_insert_with(|| PendingResponsesMessageItem {

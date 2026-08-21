@@ -141,7 +141,7 @@ pub fn encode_response(resp: &UrpResponse, logical_model: &str) -> Value {
                 let mut pending_message: Option<PendingResponsesMessageItem> = None;
                 for part in parts {
                     if let Some(image_generation_call) = encode_image_generation_call_part(part) {
-                        flush_pending_message_item(&mut pending_message, &mut output);
+                        flush_pending_message_item(&mut pending_message, &mut output, true);
                         output.push(image_generation_call);
                         continue;
                     }
@@ -149,6 +149,7 @@ pub fn encode_response(resp: &UrpResponse, logical_model: &str) -> Value {
                         append_content_part_to_pending(
                             &mut pending_message,
                             &mut output,
+                            true,
                             *role,
                             text_part_phase(part),
                             &message_extra,
@@ -157,7 +158,7 @@ pub fn encode_response(resp: &UrpResponse, logical_model: &str) -> Value {
                         continue;
                     }
 
-                    flush_pending_message_item(&mut pending_message, &mut output);
+                    flush_pending_message_item(&mut pending_message, &mut output, true);
 
                     if let Some(reasoning_item) = encode_reasoning_item(part) {
                         output.push(reasoning_item);
@@ -187,7 +188,7 @@ pub fn encode_response(resp: &UrpResponse, logical_model: &str) -> Value {
                         }
                     }
                 }
-                flush_pending_message_item(&mut pending_message, &mut output);
+                flush_pending_message_item(&mut pending_message, &mut output, true);
             }
             Item::ToolResult {
                 id,
@@ -203,6 +204,7 @@ pub fn encode_response(resp: &UrpResponse, logical_model: &str) -> Value {
                 content,
                 *is_error,
                 extra_body,
+                true,
                 &mut output,
             ),
         }
@@ -319,7 +321,7 @@ fn encode_message_to_input_items(item: &Item, out: &mut Vec<Value>) {
 
             for part in parts {
                 if let Some(image_generation_call) = encode_image_generation_call_part(part) {
-                    flush_pending_message_item(&mut pending_message, out);
+                    flush_pending_message_item(&mut pending_message, out, false);
                     out.push(image_generation_call);
                     continue;
                 }
@@ -327,6 +329,7 @@ fn encode_message_to_input_items(item: &Item, out: &mut Vec<Value>) {
                     append_content_part_to_pending(
                         &mut pending_message,
                         out,
+                        false,
                         *role,
                         text_part_phase(part),
                         &message_extra,
@@ -335,7 +338,7 @@ fn encode_message_to_input_items(item: &Item, out: &mut Vec<Value>) {
                     continue;
                 }
 
-                flush_pending_message_item(&mut pending_message, out);
+                flush_pending_message_item(&mut pending_message, out, false);
 
                 if let Some(mut item) = encode_reasoning_request_item(part)
                     .or_else(|| encode_tool_call_item(part, false))
@@ -362,7 +365,7 @@ fn encode_message_to_input_items(item: &Item, out: &mut Vec<Value>) {
                     out.push(item);
                 }
             }
-            flush_pending_message_item(&mut pending_message, out);
+            flush_pending_message_item(&mut pending_message, out, false);
         }
         Item::ToolResult {
             id,
@@ -378,6 +381,7 @@ fn encode_message_to_input_items(item: &Item, out: &mut Vec<Value>) {
             content,
             *is_error,
             extra_body,
+            false,
             out,
         ),
     }
