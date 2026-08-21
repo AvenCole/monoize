@@ -143,7 +143,7 @@ async fn responses_nonstream_maps_messages_thinking_to_reasoning_summary() {
 }
 
 #[tokio::test]
-async fn responses_reasoning_input_roundtrips_to_responses_upstream() {
+async fn responses_reasoning_input_omits_output_only_fields_upstream() {
     let ctx = setup().await;
     let (status, body) = json_post(
         &ctx,
@@ -195,7 +195,7 @@ async fn responses_reasoning_input_roundtrips_to_responses_upstream() {
     );
     assert!(reasoning_item.get("text").is_none());
     assert!(reasoning_item.get("source").is_none());
-    assert_eq!(reasoning_item["status"].as_str(), Some("completed"));
+    assert!(reasoning_item.get("status").is_none());
     let message_item = input
         .iter()
         .find(|item| {

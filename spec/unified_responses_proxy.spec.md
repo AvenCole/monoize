@@ -719,12 +719,13 @@ PR4b.2. Responses `instructions` normalization:
 - A cross-family encoder MUST consume the derived semantic nodes using their normalized roles. It MUST encode every text, image, or file node that the target protocol supports and MUST NOT discard supported instruction content merely because its source was the Responses `instructions` field.
 - If no retained Responses-instructions provenance exists, a Responses encoder MAY promote the first otherwise promotable system or developer text message to string `instructions` under the existing request reconstruction rule.
 
-PR4c. When encoding URP v2 `Reasoning` nodes into upstream `POST /v1/responses` request `input[]` items with `type="reasoning"`, Monoize MUST preserve summary, raw reasoning content, encrypted content, status, and item id as distinct fields.
+PR4c. When encoding URP v2 `Reasoning` nodes into upstream `POST /v1/responses` request `input[]` items with `type="reasoning"`, Monoize MUST preserve summary, raw reasoning content, encrypted content, and item id as distinct fields.
 
 - If the URP reasoning node carries summary text, Monoize MUST encode `summary` as an array containing one `{ "type": "summary_text", "text": <summary> }` object.
 - If the URP reasoning node carries raw reasoning content, Monoize MUST encode `content` as an array containing `{ "type": "reasoning_text", "text": <content> }`. Monoize MUST NOT convert raw content into summary text.
 - If the source item explicitly carried an empty `summary` or `content` array, a same-Responses replay MUST preserve that empty array. An encoder MUST NOT invent summary text from raw content.
 - Monoize MUST NOT forward URP-internal metadata or non-schema fields such as `source`, `started_at`, or transform markers on an upstream Responses reasoning item.
+- A reasoning item `status` is output lifecycle metadata. Monoize MUST preserve it on downstream response items and streaming lifecycle events, but MUST omit it when the item is replayed in an upstream `POST /v1/responses` request `input[]` array.
 - Monoize MUST NOT encode a legacy top-level `text` field. Raw reasoning text uses `content[].type = "reasoning_text"`.
 
 PR4c.1. When decoding downstream Responses `input[]`, Monoize MUST decode an item with `type = "reasoning"` into one URP v2 `Reasoning` node using the same field mapping as non-streaming Responses `output[]` reasoning items:
