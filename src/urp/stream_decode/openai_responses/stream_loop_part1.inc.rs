@@ -165,7 +165,7 @@ pub(crate) async fn stream_responses_to_urp_events(
         )
         .await;
 
-        if ev.event == "error" {
+        if matches!(ev.event.as_str(), "error" | "response.failed") {
             let (code, message, extra_body, terminal_error) =
                 responses_stream_error_parts(&ev.event, data_val);
             let _ = tx

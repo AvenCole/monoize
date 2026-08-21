@@ -898,7 +898,7 @@ async fn responses_streaming_response_failed_is_logged_as_error_and_not_billed()
                 "model":"gpt-5-mini",
                 "input":"stream",
                 "stream": true,
-                "stream_mode": "error_then_failed"
+                "stream_mode": "failed_only"
             })
             .to_string(),
         ))
@@ -911,6 +911,18 @@ async fn responses_streaming_response_failed_is_logged_as_error_and_not_billed()
     assert!(
         text.contains("event: response.failed"),
         "downstream should preserve response.failed: {text}"
+    );
+    assert!(
+        text.contains("invalid_request_error"),
+        "failed error type must survive: {text}"
+    );
+    assert!(
+        text.contains("\"param\":\"input\""),
+        "failed error param must survive: {text}"
+    );
+    assert!(
+        !text.contains("resp_should_not_be_consumed"),
+        "upstream events after response.failed must not be consumed: {text}"
     );
 
     let user = ctx
@@ -954,6 +966,7 @@ async fn responses_streaming_response_failed_is_logged_as_error_and_not_billed()
     let log = matched.expect("response.failed request log should be inserted");
     assert_eq!(log.status, "error");
     assert_eq!(log.billing.charge_nano_usd, None);
+    assert_eq!(log.billing.breakdown, None);
     assert_eq!(log.tokens.input, None);
     assert_eq!(log.tokens.output, None);
     assert_eq!(log.error.http_status, Some(400));

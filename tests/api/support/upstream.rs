@@ -2120,6 +2120,50 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                 ]);
                 return Sse::new(stream).into_response();
             }
+            if body.get("stream_mode").and_then(|v| v.as_str()) == Some("failed_only") {
+                let stream = futures_util::stream::iter(vec![
+                    Ok::<_, Infallible>(
+                        Event::default().event("response.failed").data(
+                            json!({
+                                "type": "response.failed",
+                                "response": {
+                                    "id": "resp_failed_only",
+                                    "object": "response",
+                                    "created_at": 0,
+                                    "model": model,
+                                    "status": "failed",
+                                    "output": [],
+                                    "error": {
+                                        "type": "invalid_request_error",
+                                        "code": "context_length_exceeded",
+                                        "message": "mock context length exceeded",
+                                        "param": "input"
+                                    }
+                                }
+                            })
+                            .to_string(),
+                        ),
+                    ),
+                    Ok::<_, Infallible>(
+                        Event::default().event("response.completed").data(
+                            json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "resp_should_not_be_consumed",
+                                    "object": "response",
+                                    "created_at": 0,
+                                    "model": model,
+                                    "status": "completed",
+                                    "output": []
+                                }
+                            })
+                            .to_string(),
+                        ),
+                    ),
+                    Ok::<_, Infallible>(Event::default().data("[DONE]")),
+                ]);
+                return Sse::new(stream).into_response();
+            }
 
             let mut events = Vec::new();
             if reasoning_enabled {

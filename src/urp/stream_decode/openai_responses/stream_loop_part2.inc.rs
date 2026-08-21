@@ -326,7 +326,7 @@ fn responses_stream_error_parts(
     let mut extra_body = split_known_fields(error_value, &["code", "message"]);
     extra_body.extend(split_known_fields(
         data_val,
-        &["code", "message", "error", "response"],
+        &["code", "message", "type", "error", "response"],
     ));
     (code, message, extra_body, terminal_error)
 }
