@@ -466,6 +466,7 @@ async fn responses_streaming_preserves_distinct_encrypted_reasoning_snapshots() 
         &reasoning_added.1["item"]["encrypted_content"],
     )
     .expect("added reasoning envelope");
+    assert_eq!(reasoning_added.1["item"]["status"], json!("in_progress"));
     assert_eq!(added_envelope.item_id.as_deref(), Some("rs_mock"));
     assert_eq!(added_envelope.payload, json!("added_snapshot_sig"));
 
@@ -480,6 +481,7 @@ async fn responses_streaming_preserves_distinct_encrypted_reasoning_snapshots() 
         &reasoning_done.1["item"]["encrypted_content"],
     )
     .expect("completed reasoning envelope");
+    assert_eq!(reasoning_done.1["item"]["status"], json!("completed"));
     assert_eq!(done_envelope.item_id.as_deref(), Some("rs_mock"));
     assert_eq!(done_envelope.payload, json!("mock_sig"));
     assert_ne!(
@@ -507,5 +509,9 @@ async fn responses_streaming_preserves_distinct_encrypted_reasoning_snapshots() 
         terminal_reasoning["encrypted_content"],
         reasoning_done.1["item"]["encrypted_content"],
         "response.completed must reuse the complete terminal snapshot"
+    );
+    assert_eq!(
+        terminal_reasoning["status"], reasoning_done.1["item"]["status"],
+        "response.completed must preserve the done item's terminal status"
     );
 }

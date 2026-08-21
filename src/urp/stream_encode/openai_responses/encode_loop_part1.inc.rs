@@ -1475,6 +1475,12 @@ pub(crate) async fn encode_urp_stream_as_responses(
                     .and_then(Value::as_str)
                     .unwrap_or("completed")
                     .to_string();
+                if terminal_status == "completed" {
+                    reconcile_completed_response_output_statuses(
+                        &mut completed_response,
+                        &completed_output_items,
+                    );
+                }
                 if terminal_status == "completed" && completed_response.get("completed_at").is_none()
                 {
                     completed_response["completed_at"] = json!(now_ts());
@@ -2807,6 +2813,37 @@ fn responses_output_items_semantically_match(left: &Value, right: &Value) -> boo
         }
         Some("reasoning") => responses_reasoning_items_semantically_match(left, right),
         _ => false,
+    }
+}
+
+fn reconcile_completed_response_output_statuses(
+    response: &mut Value,
+    completed_output_items: &[(usize, Value)],
+) {
+    let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (terminal_position, terminal_item) in output.iter_mut().enumerate() {
+        let matching_done_item = completed_output_items
+            .iter()
+            .find(|(_, done_item)| {
+                responses_output_items_semantically_match(done_item, terminal_item)
+            })
+            .or_else(|| {
+                completed_output_items.iter().find(|(output_index, done_item)| {
+                    *output_index == terminal_position
+                        && done_item.get("type").and_then(Value::as_str)
+                            == terminal_item.get("type").and_then(Value::as_str)
+                })
+            })
+            .map(|(_, item)| item);
+        let Some(done_status) = matching_done_item.and_then(|item| item.get("status")).cloned()
+        else {
+            continue;
+        };
+        if let Some(obj) = terminal_item.as_object_mut() {
+            obj.insert("status".to_string(), done_status);
+        }
     }
 }
 
