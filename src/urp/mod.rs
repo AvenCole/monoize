@@ -205,6 +205,45 @@ fn wrap_reasoning_extra_body_encrypted_content(
     }
 }
 
+fn chat_encrypted_reasoning_detail_mut(
+    extra_body: &mut HashMap<String, Value>,
+) -> Option<&mut serde_json::Map<String, Value>> {
+    let detail = extra_body
+        .get_mut(CHAT_REASONING_DETAIL_EXTRA_KEY)?
+        .as_object_mut()?;
+    (detail.get("type").and_then(Value::as_str) == Some("reasoning.encrypted")).then_some(detail)
+}
+
+fn wrap_chat_reasoning_detail_envelope(
+    extra_body: &mut HashMap<String, Value>,
+    canonical_encrypted: Option<&Value>,
+    fallback_item_id: Option<&str>,
+    provider_type: &str,
+    model: &str,
+) {
+    let Some(detail) = chat_encrypted_reasoning_detail_mut(extra_body) else {
+        return;
+    };
+    if let Some(canonical_encrypted) = canonical_encrypted {
+        detail.insert("data".to_string(), canonical_encrypted.clone());
+        return;
+    }
+    let item_id = detail
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| fallback_item_id.map(str::to_string));
+    let Some(payload) = detail.remove("data") else {
+        return;
+    };
+    let mut encrypted = Some(payload);
+    wrap_reasoning_payload(&mut encrypted, item_id.as_deref(), provider_type, model);
+    if let Some(encrypted) = encrypted {
+        detail.insert("data".to_string(), encrypted);
+    }
+}
+
 fn extra_body_is_reasoning_item(extra_body: &HashMap<String, Value>) -> bool {
     extra_body.contains_key("encrypted_content")
         || extra_body.get("type").and_then(Value::as_str) == Some("reasoning")
@@ -219,6 +258,13 @@ fn wrap_reasoning_node_envelope(node: &mut Node, provider_type: &str, model: &st
     } = node
     {
         wrap_reasoning_payload(encrypted, id.as_deref(), provider_type, model);
+        wrap_chat_reasoning_detail_envelope(
+            extra_body,
+            encrypted.as_ref(),
+            id.as_deref(),
+            provider_type,
+            model,
+        );
         wrap_reasoning_extra_body_encrypted_content(
             extra_body,
             id.as_deref(),
@@ -248,12 +294,21 @@ pub fn wrap_reasoning_envelope_in_stream_event(
             header: NodeHeader::Reasoning { id },
             extra_body,
             ..
-        } => wrap_reasoning_extra_body_encrypted_content(
-            extra_body,
-            id.as_deref(),
-            provider_type,
-            model,
-        ),
+        } => {
+            wrap_reasoning_extra_body_encrypted_content(
+                extra_body,
+                id.as_deref(),
+                provider_type,
+                model,
+            );
+            wrap_chat_reasoning_detail_envelope(
+                extra_body,
+                None,
+                id.as_deref(),
+                provider_type,
+                model,
+            );
+        }
         UrpStreamEvent::NodeStart {
             header: NodeHeader::NextDownstreamEnvelopeExtra,
             extra_body,
@@ -280,8 +335,23 @@ pub fn wrap_reasoning_envelope_in_stream_event(
             let item_id = extra_body
                 .get("reasoning_item_id")
                 .and_then(Value::as_str)
-                .or_else(|| extra_body.get("item_id").and_then(Value::as_str));
-            wrap_reasoning_payload(encrypted, item_id, provider_type, model);
+                .or_else(|| extra_body.get("item_id").and_then(Value::as_str))
+                .or_else(|| {
+                    extra_body
+                        .get(CHAT_REASONING_DETAIL_EXTRA_KEY)
+                        .and_then(Value::as_object)
+                        .and_then(|detail| detail.get("id"))
+                        .and_then(Value::as_str)
+                })
+                .map(str::to_string);
+            wrap_reasoning_payload(encrypted, item_id.as_deref(), provider_type, model);
+            wrap_chat_reasoning_detail_envelope(
+                extra_body,
+                encrypted.as_ref(),
+                item_id.as_deref(),
+                provider_type,
+                model,
+            );
         }
         UrpStreamEvent::NodeDone { node, .. } => {
             wrap_reasoning_node_envelope(node, provider_type, model);
@@ -306,6 +376,192 @@ pub fn wrap_reasoning_envelope_in_stream_event(
             }
         }
         _ => {}
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ReasoningEnvelopeStreamState {
+    pending_fragments: HashMap<u32, PendingReasoningEnvelopeFragments>,
+}
+
+#[derive(Debug, Default)]
+struct PendingReasoningEnvelopeFragments {
+    values: Vec<Value>,
+    item_id: Option<String>,
+    source: Option<String>,
+    extra_body: HashMap<String, Value>,
+}
+
+impl PendingReasoningEnvelopeFragments {
+    fn push(&mut self, value: Value, source: Option<&String>, extra_body: &HashMap<String, Value>) {
+        self.values.push(value);
+        if let Some(source) = source.filter(|source| !source.is_empty()) {
+            self.source = Some(source.clone());
+        }
+        if let Some(item_id) = extra_body
+            .get("reasoning_item_id")
+            .or_else(|| extra_body.get("item_id"))
+            .or_else(|| extra_body.get("id"))
+            .and_then(Value::as_str)
+            .filter(|item_id| !item_id.is_empty())
+        {
+            self.item_id = Some(item_id.to_string());
+        }
+        self.extra_body.extend(extra_body.clone());
+    }
+
+    fn complete_value(&self) -> Option<Value> {
+        if self.values.is_empty() {
+            return None;
+        }
+        if self.values.iter().all(Value::is_string) {
+            let mut complete = String::new();
+            for value in &self.values {
+                complete.push_str(value.as_str().expect("checked string fragment"));
+            }
+            return (!complete.is_empty()).then_some(Value::String(complete));
+        }
+        (self.values.len() == 1).then(|| self.values[0].clone())
+    }
+}
+
+fn encrypted_value_is_non_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(value) => !value.is_empty(),
+        _ => true,
+    }
+}
+
+fn stream_delta_uses_encrypted_fragments(
+    provider_type: &str,
+    extra_body: &HashMap<String, Value>,
+) -> bool {
+    match provider_type {
+        "messages" => true,
+        "chat_completion" => {
+            extra_body
+                .get(CHAT_REASONING_DETAIL_EXTRA_KEY)
+                .and_then(Value::as_object)
+                .and_then(|detail| detail.get("type"))
+                .and_then(Value::as_str)
+                != Some("reasoning.encrypted")
+        }
+        _ => false,
+    }
+}
+
+impl ReasoningEnvelopeStreamState {
+    pub fn wrap_event(
+        &mut self,
+        mut event: UrpStreamEvent,
+        provider_type: &str,
+        model: &str,
+    ) -> Vec<UrpStreamEvent> {
+        if let UrpStreamEvent::NodeDelta {
+            node_index,
+            delta:
+                NodeDelta::Reasoning {
+                    content,
+                    encrypted,
+                    summary,
+                    source,
+                },
+            usage,
+            extra_body,
+        } = &mut event
+            && stream_delta_uses_encrypted_fragments(provider_type, extra_body)
+            && let Some(value) = encrypted.take().filter(encrypted_value_is_non_empty)
+        {
+            let has_non_encrypted_payload = content
+                .as_deref()
+                .is_some_and(|content| !content.is_empty())
+                || summary
+                    .as_deref()
+                    .is_some_and(|summary| !summary.is_empty());
+            self.pending_fragments.entry(*node_index).or_default().push(
+                value,
+                source.as_ref(),
+                extra_body,
+            );
+            if !has_non_encrypted_payload && usage.is_none() {
+                return Vec::new();
+            }
+            return vec![event];
+        }
+
+        if let UrpStreamEvent::NodeDone {
+            node_index,
+            node,
+            usage: _,
+            extra_body: _,
+        } = &mut event
+            && let Some(pending) = self.pending_fragments.remove(node_index)
+        {
+            let (node_item_id, terminal_encrypted, terminal_source) = match node {
+                Node::Reasoning {
+                    id,
+                    encrypted,
+                    source,
+                    ..
+                } => (id.clone(), encrypted.clone(), source.clone()),
+                _ => (None, None, None),
+            };
+            let complete = terminal_encrypted
+                .filter(encrypted_value_is_non_empty)
+                .or_else(|| pending.complete_value());
+            if let Some(complete) = complete {
+                let item_id = node_item_id.or(pending.item_id);
+                let mut wrapped = Some(complete);
+                wrap_reasoning_payload(&mut wrapped, item_id.as_deref(), provider_type, model);
+                if let Some(wrapped) = wrapped {
+                    if let Node::Reasoning {
+                        encrypted,
+                        extra_body,
+                        ..
+                    } = node
+                    {
+                        *encrypted = Some(wrapped.clone());
+                        wrap_chat_reasoning_detail_envelope(
+                            extra_body,
+                            Some(&wrapped),
+                            item_id.as_deref(),
+                            provider_type,
+                            model,
+                        );
+                    }
+                    let mut delta_extra = pending.extra_body;
+                    if let Some(item_id) = item_id {
+                        delta_extra
+                            .entry("reasoning_item_id".to_string())
+                            .or_insert(Value::String(item_id));
+                    }
+                    return vec![
+                        UrpStreamEvent::NodeDelta {
+                            node_index: *node_index,
+                            delta: NodeDelta::Reasoning {
+                                content: None,
+                                encrypted: Some(wrapped),
+                                summary: None,
+                                source: terminal_source.or(pending.source),
+                            },
+                            usage: None,
+                            extra_body: delta_extra,
+                        },
+                        event,
+                    ];
+                }
+            }
+        }
+
+        if matches!(
+            &event,
+            UrpStreamEvent::ResponseDone { .. } | UrpStreamEvent::Error { .. }
+        ) {
+            self.pending_fragments.clear();
+        }
+        wrap_reasoning_envelope_in_stream_event(&mut event, provider_type, model);
+        vec![event]
     }
 }
 
@@ -1529,6 +1785,176 @@ mod tests {
         };
         let envelope = parse_reasoning_envelope(&encrypted).expect("mz2 envelope");
         assert_eq!(envelope.item_id.as_deref(), Some("rs_original"));
+        assert_eq!(envelope.payload, serde_json::json!("opaque_payload"));
+    }
+
+    #[test]
+    fn messages_stream_wraps_the_complete_signature_once_after_fragment_assembly() {
+        let mut state = ReasoningEnvelopeStreamState::default();
+        for fragment in ["sig-a", "sig-b"] {
+            let events = state.wrap_event(
+                UrpStreamEvent::NodeDelta {
+                    node_index: 0,
+                    delta: NodeDelta::Reasoning {
+                        content: None,
+                        encrypted: Some(serde_json::json!(fragment)),
+                        summary: None,
+                        source: None,
+                    },
+                    usage: None,
+                    extra_body: HashMap::new(),
+                },
+                "messages",
+                "claude-test",
+            );
+            assert!(events.is_empty(), "raw signature fragments stay buffered");
+        }
+
+        let events = state.wrap_event(
+            UrpStreamEvent::NodeDone {
+                node_index: 0,
+                node: Node::Reasoning {
+                    id: Some("rs_original".to_string()),
+                    content: None,
+                    encrypted: Some(serde_json::json!("sig-asig-b")),
+                    summary: None,
+                    source: None,
+                    extra_body: HashMap::new(),
+                },
+                usage: None,
+                extra_body: HashMap::new(),
+            },
+            "messages",
+            "claude-test",
+        );
+        assert_eq!(events.len(), 2);
+        let UrpStreamEvent::NodeDelta {
+            delta:
+                NodeDelta::Reasoning {
+                    encrypted: Some(delta_encrypted),
+                    ..
+                },
+            ..
+        } = &events[0]
+        else {
+            panic!("expected one complete encrypted delta");
+        };
+        let UrpStreamEvent::NodeDone {
+            node:
+                Node::Reasoning {
+                    encrypted: Some(done_encrypted),
+                    ..
+                },
+            ..
+        } = &events[1]
+        else {
+            panic!("expected completed reasoning node");
+        };
+        assert_eq!(delta_encrypted, done_encrypted);
+        let envelope = parse_reasoning_envelope(delta_encrypted).expect("one mz2 envelope");
+        assert_eq!(envelope.item_id.as_deref(), Some("rs_original"));
+        assert_eq!(envelope.payload, serde_json::json!("sig-asig-b"));
+    }
+
+    #[test]
+    fn fragment_assembly_uses_the_complete_terminal_opaque_value_atomically() {
+        let mut state = ReasoningEnvelopeStreamState::default();
+        assert!(
+            state
+                .wrap_event(
+                    UrpStreamEvent::NodeDelta {
+                        node_index: 0,
+                        delta: NodeDelta::Reasoning {
+                            content: None,
+                            encrypted: Some(serde_json::json!("stream-fragment")),
+                            summary: None,
+                            source: None,
+                        },
+                        usage: None,
+                        extra_body: HashMap::new(),
+                    },
+                    "chat_completion",
+                    "chat-test",
+                )
+                .is_empty()
+        );
+        let events = state.wrap_event(
+            UrpStreamEvent::NodeDone {
+                node_index: 0,
+                node: Node::Reasoning {
+                    id: None,
+                    content: None,
+                    encrypted: Some(serde_json::json!("different-terminal-snapshot")),
+                    summary: None,
+                    source: None,
+                    extra_body: HashMap::new(),
+                },
+                usage: None,
+                extra_body: HashMap::new(),
+            },
+            "chat_completion",
+            "chat-test",
+        );
+        let UrpStreamEvent::NodeDelta {
+            delta:
+                NodeDelta::Reasoning {
+                    encrypted: Some(encrypted),
+                    ..
+                },
+            ..
+        } = &events[0]
+        else {
+            panic!("expected complete encrypted delta");
+        };
+        let envelope = parse_reasoning_envelope(encrypted).expect("mz2 envelope");
+        assert_eq!(
+            envelope.payload,
+            serde_json::json!("different-terminal-snapshot")
+        );
+    }
+
+    #[test]
+    fn chat_encrypted_detail_wraps_typed_and_raw_surfaces_with_one_value() {
+        let detail = serde_json::json!({
+            "type": "reasoning.encrypted",
+            "data": "opaque_payload",
+            "id": "enc_1",
+            "format": "openrouter",
+            "index": 0
+        });
+        let mut state = ReasoningEnvelopeStreamState::default();
+        let events = state.wrap_event(
+            UrpStreamEvent::NodeDelta {
+                node_index: 0,
+                delta: NodeDelta::Reasoning {
+                    content: None,
+                    encrypted: Some(serde_json::json!("opaque_payload")),
+                    summary: None,
+                    source: Some("openrouter".to_string()),
+                },
+                usage: None,
+                extra_body: HashMap::from([(CHAT_REASONING_DETAIL_EXTRA_KEY.to_string(), detail)]),
+            },
+            "chat_completion",
+            "chat-test",
+        );
+        assert_eq!(events.len(), 1);
+        let UrpStreamEvent::NodeDelta {
+            delta:
+                NodeDelta::Reasoning {
+                    encrypted: Some(encrypted),
+                    ..
+                },
+            extra_body,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected encrypted reasoning detail");
+        };
+        let raw_data = &extra_body[CHAT_REASONING_DETAIL_EXTRA_KEY]["data"];
+        assert_eq!(raw_data, encrypted);
+        let envelope = parse_reasoning_envelope(encrypted).expect("mz2 envelope");
+        assert_eq!(envelope.item_id.as_deref(), Some("enc_1"));
         assert_eq!(envelope.payload, serde_json::json!("opaque_payload"));
     }
 

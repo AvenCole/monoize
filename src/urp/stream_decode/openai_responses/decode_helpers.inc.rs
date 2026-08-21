@@ -345,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_added_snapshot_keeps_encrypted_content_out_of_accumulator() {
+    fn reasoning_added_snapshot_stays_out_of_terminal_accumulator_and_in_event_state() {
         let item = json!({
             "type": "reasoning",
             "id": "rs_snapshot",
@@ -358,7 +358,7 @@ mod tests {
 
         assert!(slot.encrypted.is_none());
         let extra_body = item_extra_body_from_value(&item);
-        assert!(!extra_body.contains_key("encrypted_content"));
+        assert_eq!(extra_body.get("encrypted_content"), Some(&json!("added_snapshot_sig")));
         assert_eq!(extra_body.get("future_item_field"), Some(&json!(true)));
     }
 
@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_output_item_added_control_extra_keeps_id_and_discards_encrypted_content() {
+    fn reasoning_output_item_added_control_extra_preserves_complete_snapshot() {
         let mut state = ResponsesStreamIndexState::default();
 
         let events = map_responses_event_to_urp_events_with_state(
@@ -1089,16 +1089,8 @@ mod tests {
                 extra_body,
                 ..
             } if extra_body.get("id") == Some(&json!("rs_original"))
-                && !extra_body.contains_key("encrypted_content")
+                && extra_body.get("encrypted_content") == Some(&json!("opaque_payload"))
         )));
-        assert!(events.iter().all(|event| match event {
-            UrpStreamEvent::NodeStart { extra_body, .. }
-            | UrpStreamEvent::NodeDelta { extra_body, .. }
-            | UrpStreamEvent::NodeDone { extra_body, .. } => {
-                !extra_body.contains_key("encrypted_content")
-            }
-            _ => true,
-        }));
     }
 
     #[test]

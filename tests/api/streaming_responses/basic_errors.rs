@@ -419,10 +419,12 @@ async fn responses_streaming_reencodes_greedy_merged_items_with_canonical_sse_bo
                 && payload["item"]["type"].as_str() == Some("reasoning")
         })
         .expect("reasoning output_item.added");
-    assert!(
-        reasoning_added.1["item"].get("encrypted_content").is_none(),
-        "reasoning output_item.added must omit encrypted_content: {text}"
-    );
+    let added_envelope = monoize::urp::parse_reasoning_envelope(
+        &reasoning_added.1["item"]["encrypted_content"],
+    )
+    .expect("added reasoning envelope");
+    assert_eq!(added_envelope.item_id.as_deref(), Some("rs_mock"));
+    assert_eq!(added_envelope.payload, json!("added_snapshot_sig"));
     assert!(text.contains("event: response.content_part.added"));
     assert!(text.contains(
         "\"part\":{\"annotations\":[],\"logprobs\":[],\"text\":\"\",\"type\":\"output_text\"}"
@@ -432,7 +434,7 @@ async fn responses_streaming_reencodes_greedy_merged_items_with_canonical_sse_bo
 }
 
 #[tokio::test]
-async fn responses_streaming_emits_encrypted_reasoning_only_at_terminal_item_state() {
+async fn responses_streaming_preserves_distinct_encrypted_reasoning_snapshots() {
     let ctx = setup().await;
     let (status, text) = json_post(
         &ctx,
@@ -451,10 +453,6 @@ async fn responses_streaming_emits_encrypted_reasoning_only_at_terminal_item_sta
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    assert!(
-        !text.contains("added_snapshot_sig"),
-        "the added-event encrypted snapshot must not reach any downstream frame: {text}"
-    );
 
     let frames = parse_responses_sse_json(&text);
     let reasoning_added = frames
@@ -464,7 +462,12 @@ async fn responses_streaming_emits_encrypted_reasoning_only_at_terminal_item_sta
                 && payload["item"]["type"].as_str() == Some("reasoning")
         })
         .expect("reasoning output_item.added");
-    assert!(reasoning_added.1["item"].get("encrypted_content").is_none());
+    let added_envelope = monoize::urp::parse_reasoning_envelope(
+        &reasoning_added.1["item"]["encrypted_content"],
+    )
+    .expect("added reasoning envelope");
+    assert_eq!(added_envelope.item_id.as_deref(), Some("rs_mock"));
+    assert_eq!(added_envelope.payload, json!("added_snapshot_sig"));
 
     let reasoning_done = frames
         .iter()
@@ -479,6 +482,11 @@ async fn responses_streaming_emits_encrypted_reasoning_only_at_terminal_item_sta
     .expect("completed reasoning envelope");
     assert_eq!(done_envelope.item_id.as_deref(), Some("rs_mock"));
     assert_eq!(done_envelope.payload, json!("mock_sig"));
+    assert_ne!(
+        reasoning_added.1["item"]["encrypted_content"],
+        reasoning_done.1["item"]["encrypted_content"],
+        "added and done snapshots must remain separate complete values"
+    );
 
     let completed = frames
         .iter()
@@ -495,4 +503,9 @@ async fn responses_streaming_emits_encrypted_reasoning_only_at_terminal_item_sta
             .expect("terminal reasoning envelope");
     assert_eq!(terminal_envelope.item_id.as_deref(), Some("rs_mock"));
     assert_eq!(terminal_envelope.payload, json!("mock_sig"));
+    assert_eq!(
+        terminal_reasoning["encrypted_content"],
+        reasoning_done.1["item"]["encrypted_content"],
+        "response.completed must reuse the complete terminal snapshot"
+    );
 }

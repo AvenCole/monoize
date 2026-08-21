@@ -1242,6 +1242,17 @@ fn snapshot_suffix<'a>(streamed: &str, snapshot: &'a str) -> Option<&'a str> {
         .filter(|suffix| !suffix.is_empty())
 }
 
+fn apply_terminal_opaque_snapshot(current: &mut String, snapshot: &str) -> Option<String> {
+    if let Some(suffix) = snapshot_suffix(current, snapshot) {
+        return Some(suffix.to_string());
+    }
+    if current != snapshot {
+        current.clear();
+        current.push_str(snapshot);
+    }
+    None
+}
+
 fn reasoning_detail_raw(node: &Node) -> Option<&Map<String, Value>> {
     let Node::Reasoning { extra_body, .. } = node else {
         return None;
@@ -1289,6 +1300,9 @@ fn reasoning_detail_matches(existing: &Node, terminal: &Map<String, Value>) -> b
     let Some(payload_key) = terminal_type.and_then(reasoning_detail_payload_key) else {
         return false;
     };
+    if payload_key == "data" {
+        return true;
+    }
     match (existing.get(payload_key), terminal.get(payload_key)) {
         (Some(Value::String(existing)), Some(Value::String(terminal))) => {
             existing.starts_with(terminal) || terminal.starts_with(existing)
@@ -1305,6 +1319,9 @@ fn reasoning_detail_completion(
     let existing_raw = reasoning_detail_raw(existing)?;
     let detail_type = terminal.get("type").and_then(Value::as_str)?;
     let payload_key = reasoning_detail_payload_key(detail_type)?;
+    if payload_key == "data" {
+        return None;
+    }
     let mut merged_raw = existing_raw.clone();
     for (key, value) in terminal {
         if !crate::urp::decode::is_internal_extra_key(key) {
@@ -1345,21 +1362,6 @@ fn reasoning_detail_completion(
                 Value::String(suffix.to_string()),
             )
         }
-        "data" => match (existing_raw.get("data"), merged_raw.get("data")) {
-            (Some(Value::String(existing)), Some(Value::String(terminal))) => {
-                let suffix = snapshot_suffix(existing, terminal)?;
-                (
-                    None,
-                    Some(Value::String(suffix.to_string())),
-                    None,
-                    Value::String(suffix.to_string()),
-                )
-            }
-            (None, Some(terminal)) if !terminal.is_null() => {
-                (None, Some(terminal.clone()), None, terminal.clone())
-            }
-            _ => return None,
-        },
         _ => return None,
     };
 
@@ -1668,22 +1670,23 @@ async fn process_terminal_message_snapshot(
             .get("reasoning_opaque")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-            && let Some(suffix) = snapshot_suffix(reasoning_sig, snapshot)
         {
-            process_reasoning_encrypted_delta(
-                tx,
-                response_id,
-                model,
-                Some(&Value::String(suffix.to_string())),
-                None,
-                response_started,
-                reasoning_node_index,
-                next_node_index,
-                reasoning_sig,
-                reasoning_source,
-                delta_extra,
-            )
-            .await?;
+            if let Some(suffix) = apply_terminal_opaque_snapshot(reasoning_sig, snapshot) {
+                process_reasoning_encrypted_delta(
+                    tx,
+                    response_id,
+                    model,
+                    Some(&Value::String(suffix.to_string())),
+                    None,
+                    response_started,
+                    reasoning_node_index,
+                    next_node_index,
+                    reasoning_sig,
+                    reasoning_source,
+                    delta_extra,
+                )
+                .await?;
+            }
         }
     }
 
@@ -2270,6 +2273,78 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn terminal_encrypted_reasoning_detail_replaces_the_opaque_value_atomically() {
+        let initial = json!({
+            "type": "reasoning.encrypted",
+            "data": "stream_snapshot",
+            "id": "enc_1",
+            "format": "openrouter",
+            "index": 0
+        });
+        let terminal = json!({
+            "type": "reasoning.encrypted",
+            "data": "terminal_snapshot",
+            "id": "enc_1",
+            "format": "openrouter",
+            "index": 0
+        });
+        let node = chat_reasoning_node_from_detail(initial.as_object().expect("initial detail"))
+            .expect("initial reasoning node");
+        let mut nodes = vec![(0, node)];
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut response_started = true;
+        let mut next_node_index = 1;
+        let mut delta_extra = Map::new();
+
+        process_terminal_reasoning_details(
+            &tx,
+            "resp_test",
+            "gpt-5.4",
+            &[terminal.clone()],
+            &mut response_started,
+            &mut next_node_index,
+            &mut nodes,
+            &mut delta_extra,
+        )
+        .await
+        .expect("terminal reasoning detail");
+
+        let Node::Reasoning {
+            encrypted,
+            extra_body,
+            ..
+        } = &nodes[0].1
+        else {
+            panic!("expected reasoning node");
+        };
+        assert_eq!(encrypted.as_ref(), Some(&json!("terminal_snapshot")));
+        assert_eq!(
+            extra_body.get(CHAT_REASONING_DETAIL_EXTRA_KEY),
+            Some(&terminal)
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an opaque full snapshot must not become a suffix delta"
+        );
+    }
+
+    #[test]
+    fn legacy_terminal_opaque_snapshot_appends_only_true_fragments() {
+        let mut current = "sig-a".to_string();
+        assert_eq!(
+            apply_terminal_opaque_snapshot(&mut current, "sig-asig-b"),
+            Some("sig-b".to_string())
+        );
+        assert_eq!(current, "sig-a");
+
+        assert_eq!(
+            apply_terminal_opaque_snapshot(&mut current, "different-complete-snapshot"),
+            None
+        );
+        assert_eq!(current, "different-complete-snapshot");
     }
 
     #[tokio::test]

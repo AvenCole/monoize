@@ -153,8 +153,8 @@ fn merge_reasoning_item_snapshot(
             slot.summary = summary;
         }
     }
-    // Lifecycle snapshots can carry distinct opaque values. Retain only the terminal value so
-    // downstream snapshot aggregators cannot splice them.
+    // The added snapshot travels in item-level event state. The terminal accumulator accepts
+    // only a complete done snapshot, so no encrypted snapshot is treated as a string delta.
     if overwrite_terminal_fields && !encrypted.is_empty() {
         slot.encrypted = Some(Value::String(encrypted));
     }
@@ -417,7 +417,6 @@ fn item_extra_body_from_value(item: &Value) -> HashMap<String, Value> {
             "output",
             "name",
             "arguments",
-            "encrypted_content",
         ],
     );
     if let Some(native_body) = native_image_generation_call_body(item) {

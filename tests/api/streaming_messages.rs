@@ -1209,12 +1209,15 @@ async fn messages_stream_passthrough_preserves_chunked_deltas_and_suppresses_ups
         .filter(|event| event["delta"]["type"].as_str() == Some("signature_delta"))
         .filter_map(|event| event["delta"]["signature"].as_str())
         .collect();
-    assert_eq!(signature_deltas.len(), 2);
-    assert!(
-        signature_deltas
-            .iter()
-            .all(|signature| signature.starts_with("mz2.")),
-        "signature chunks should preserve frame granularity while carrying reasoning envelopes: {text}"
+    let complete_signature = signature_deltas.concat();
+    let signature_envelope = monoize::urp::parse_reasoning_envelope(&json!(complete_signature))
+        .expect("signature frames must concatenate to one mz2 envelope");
+    assert_eq!(signature_envelope.provider_type, "messages");
+    assert_eq!(signature_envelope.payload, json!("sig-asig-b"));
+    assert_eq!(
+        signature_deltas.len(),
+        1,
+        "without frame-size splitting, two upstream raw fragments must become one complete envelope: {text}"
     );
 
     let text_deltas: Vec<&str> = payloads
@@ -2229,10 +2232,11 @@ async fn messages_stream_signature_delta_carries_sigil_from_responses_upstream()
         !combined.is_empty(),
         "expected at least one signature_delta carrying the upstream encrypted reasoning payload"
     );
-    assert!(
-        combined.starts_with("mz2."),
-        "signature emitted to downstream MUST carry an mz2 envelope so history round-trip preserves item and model metadata; got `{combined}`"
-    );
+    let envelope = monoize::urp::parse_reasoning_envelope(&json!(combined))
+        .expect("signature frames must concatenate to one mz2 envelope");
+    assert_eq!(envelope.provider_type, "responses");
+    assert_eq!(envelope.item_id.as_deref(), Some("rs_mock"));
+    assert_eq!(envelope.payload, json!("mock_sig"));
     assert_eq!(
         start_signature.as_deref(),
         Some(""),

@@ -89,14 +89,81 @@ async fn chat_streaming_preserves_encrypted_reasoning_from_chat_upstream() {
         text.contains("\"type\":\"reasoning.encrypted\""),
         "chat stream should preserve encrypted reasoning detail from chat upstream: {text}"
     );
-    assert!(
-        text.contains("\"data\":\"mock_sig\""),
-        "same-Chat streaming should replay the native encrypted detail: {text}"
-    );
-    assert!(
-        !text.contains("\"data\":\"mz2."),
-        "same-Chat streaming must not replace the native detail with an envelope: {text}"
-    );
+    let encrypted_data = parse_sse_frames(&text)
+        .into_iter()
+        .filter_map(|(_, data)| (data != "[DONE]").then_some(data))
+        .filter_map(|data| serde_json::from_str::<Value>(&data).ok())
+        .flat_map(|payload| {
+            payload["choices"][0]["delta"]["reasoning_details"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .find_map(|detail| {
+            (detail["type"].as_str() == Some("reasoning.encrypted")).then(|| detail["data"].clone())
+        })
+        .expect("encrypted reasoning detail data");
+    let envelope = monoize::urp::parse_reasoning_envelope(&encrypted_data)
+        .expect("same-Chat encrypted detail must carry one mz2 envelope");
+    assert_eq!(envelope.provider_type, "chat_completion");
+    assert_eq!(envelope.model, "gpt-5-mini-chat");
+    assert_eq!(envelope.payload, json!("mock_sig"));
+}
+
+#[tokio::test]
+async fn chat_streaming_wraps_legacy_opaque_fragments_once_and_uses_terminal_snapshot_atomically() {
+    let ctx = setup().await;
+    for (stream_mode, expected_payload) in [
+        ("chat_reasoning_opaque_fragments", "sig-asig-b"),
+        (
+            "chat_reasoning_opaque_terminal_replace",
+            "terminal-complete",
+        ),
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, ctx.auth_header.clone())
+            .body(Body::from(
+                json!({
+                    "model": "gpt-5-mini-chat",
+                    "messages": [{ "role": "user", "content": "stream legacy opaque reasoning" }],
+                    "stream": true,
+                    "stream_mode": stream_mode
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = ctx.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        let encrypted_frames = parse_sse_frames(&text)
+            .into_iter()
+            .filter_map(|(_, data)| (data != "[DONE]").then_some(data))
+            .filter_map(|data| serde_json::from_str::<Value>(&data).ok())
+            .flat_map(|payload| {
+                payload["choices"][0]["delta"]["reasoning_details"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter(|detail| detail["type"].as_str() == Some("reasoning.encrypted"))
+            .filter_map(|detail| detail["data"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        let combined = encrypted_frames.concat();
+        let envelope = monoize::urp::parse_reasoning_envelope(&json!(combined))
+            .expect("legacy opaque frames must concatenate to one mz2 envelope");
+        assert_eq!(envelope.provider_type, "chat_completion");
+        assert_eq!(envelope.model, "gpt-5-mini-chat");
+        assert_eq!(envelope.payload, json!(expected_payload));
+        assert_eq!(
+            encrypted_frames.len(),
+            1,
+            "without frame-size splitting, one canonical node must emit one envelope: {text}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -150,6 +217,17 @@ async fn chat_streaming_reasoning_details_preserve_raw_entries_and_arrival_order
         }
     }
 
+    for detail in &mut details {
+        if detail["type"].as_str() != Some("reasoning.encrypted") {
+            continue;
+        }
+        let envelope = monoize::urp::parse_reasoning_envelope(&detail["data"])
+            .expect("encrypted detail mz2 envelope");
+        assert_eq!(envelope.provider_type, "chat_completion");
+        assert_eq!(envelope.model, "gpt-5-mini-chat");
+        assert_eq!(envelope.item_id.as_deref(), detail["id"].as_str());
+        detail["data"] = envelope.payload;
+    }
     assert_eq!(
         details,
         vec![
@@ -168,7 +246,6 @@ async fn chat_streaming_reasoning_details_preserve_raw_entries_and_arrival_order
         "detail/content arrival order must survive: {text}"
     );
     assert_eq!(count_done_sentinels(&text), 1, "{text}");
-    assert!(!text.contains("mz2."), "no synthetic envelope: {text}");
 }
 
 #[tokio::test]

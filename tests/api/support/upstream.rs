@@ -2860,6 +2860,67 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                 return Sse::new(futures_util::stream::iter(chunks)).into_response();
             }
 
+            if matches!(
+                stream_mode,
+                Some("chat_reasoning_opaque_fragments" | "chat_reasoning_opaque_terminal_replace")
+            ) {
+                let terminal_message = (stream_mode == Some("chat_reasoning_opaque_terminal_replace"))
+                    .then(|| {
+                        json!({
+                            "role": "assistant",
+                            "content": "answer",
+                            "reasoning_opaque": "terminal-complete"
+                        })
+                    });
+                let chunks: Vec<Result<Event, Infallible>> = vec![
+                    Ok(Event::default().data(
+                        json!({
+                            "id": "chatcmpl_opaque",
+                            "object": "chat.completion.chunk",
+                            "created": 123,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "role": "assistant", "reasoning_opaque": "sig-a" },
+                                "finish_reason": Value::Null
+                            }]
+                        })
+                        .to_string(),
+                    )),
+                    Ok(Event::default().data(
+                        json!({
+                            "id": "chatcmpl_opaque",
+                            "object": "chat.completion.chunk",
+                            "created": 123,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "reasoning_opaque": "sig-b" },
+                                "finish_reason": Value::Null
+                            }]
+                        })
+                        .to_string(),
+                    )),
+                    Ok(Event::default().data(
+                        json!({
+                            "id": "chatcmpl_opaque",
+                            "object": "chat.completion.chunk",
+                            "created": 123,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "message": terminal_message,
+                                "finish_reason": "stop"
+                            }]
+                        })
+                        .to_string(),
+                    )),
+                    Ok(Event::default().data("[DONE]")),
+                ];
+                return Sse::new(futures_util::stream::iter(chunks)).into_response();
+            }
+
             if stream_mode == Some("chat_terminal_message_snapshot") {
                 let chunks: Vec<Result<Event, Infallible>> = vec![
                     Ok(Event::default().data(
