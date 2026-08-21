@@ -51,7 +51,7 @@ async fn responses_nonstream_preserves_thinking_signature_invalid_after_route_ex
     )
     .await;
 
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let error: Value = serde_json::from_str(&body).expect("error response JSON");
     assert_eq!(
         error["error"]["code"],
@@ -60,6 +60,67 @@ async fn responses_nonstream_preserves_thinking_signature_invalid_after_route_ex
     assert_eq!(
         error["error"]["upstream_code"],
         json!("thinking_signature_invalid")
+    );
+    assert!(
+        !error["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("All "),
+        "signature validation errors must not use the generic exhausted-route wrapper: {body}"
+    );
+}
+
+#[tokio::test]
+async fn responses_nonstream_rejects_corrupted_reasoning_envelope_before_upstream() {
+    let ctx = setup().await;
+    let envelope = json!({
+        "v": 2,
+        "provider_type": "responses",
+        "model": "gpt-5-mini",
+        "item_id": "rs_corrupted",
+        "payload": "spliced_payload",
+        "payload_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    });
+    let encrypted = format!(
+        "mz2.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&envelope).expect("serialize test reasoning envelope")
+        )
+    );
+    let captured_before = ctx.captured_bodies.lock().unwrap().len();
+
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5-mini",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": encrypted
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "continue" }]
+                }
+            ]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error: Value = serde_json::from_str(&body).expect("error response JSON");
+    assert_eq!(error["error"]["code"], json!("thinking_signature_invalid"));
+    assert_eq!(
+        error["error"]["message"],
+        json!("reasoning envelope payload checksum mismatch")
+    );
+    assert_eq!(
+        ctx.captured_bodies.lock().unwrap().len(),
+        captured_before,
+        "corrupted reasoning envelope must not reach an upstream"
     );
 }
 

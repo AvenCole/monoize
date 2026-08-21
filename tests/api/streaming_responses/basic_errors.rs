@@ -475,6 +475,10 @@ async fn responses_streaming_discards_provisional_encrypted_reasoning_snapshot()
     .expect("completed reasoning envelope");
     assert_eq!(done_envelope.item_id.as_deref(), Some("rs_mock"));
     assert_eq!(done_envelope.payload, json!("mock_sig"));
+    assert_eq!(
+        done_envelope.payload_sha256.as_deref().map(str::len),
+        Some(64)
+    );
 
     let completed = frames
         .iter()
@@ -491,4 +495,70 @@ async fn responses_streaming_discards_provisional_encrypted_reasoning_snapshot()
             .expect("terminal reasoning envelope");
     assert_eq!(terminal_envelope.item_id.as_deref(), Some("rs_mock"));
     assert_eq!(terminal_envelope.payload, json!("mock_sig"));
+    assert_eq!(
+        terminal_envelope.payload_sha256,
+        done_envelope.payload_sha256
+    );
+}
+
+#[tokio::test]
+async fn responses_streaming_rejects_corrupted_reasoning_envelope_before_upstream() {
+    use base64::Engine as _;
+
+    let ctx = setup().await;
+    let envelope = json!({
+        "v": 2,
+        "provider_type": "responses",
+        "model": "gpt-5-mini",
+        "item_id": "rs_corrupted",
+        "payload": "spliced_payload",
+        "payload_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    });
+    let encrypted = format!(
+        "mz2.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&envelope).expect("serialize test reasoning envelope")
+        )
+    );
+    let captured_before = ctx.captured_bodies.lock().unwrap().len();
+
+    let (status, text) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5-mini",
+            "stream": true,
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": encrypted
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "continue" }]
+                }
+            ]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let frames = parse_responses_sse_json(&text);
+    let error = frames
+        .iter()
+        .find(|(event, _)| event == "error")
+        .map(|(_, payload)| payload)
+        .expect("error frame");
+    assert_eq!(error["code"], json!("thinking_signature_invalid"));
+    assert_eq!(
+        error["message"],
+        json!("reasoning envelope payload checksum mismatch")
+    );
+    assert_eq!(
+        ctx.captured_bodies.lock().unwrap().len(),
+        captured_before,
+        "corrupted reasoning envelope must not reach an upstream"
+    );
 }

@@ -243,12 +243,33 @@ pub(super) async fn execute_nonstream_typed_with_validator(
             // be allowed to mutate the reasoning payload before envelope-bound
             // provider/model checks (PR4c.6) decide whether to keep or drop the
             // replayed reasoning node for this attempt.
-            urp::filter_and_unwrap_reasoning_envelopes_for_upstream(
+            if let Err(message) = urp::filter_and_unwrap_reasoning_envelopes_for_upstream(
                 &mut req_attempt.input,
                 reasoning_envelope_provider_type(attempt.provider_type),
                 &req_attempt.model,
                 auth.reasoning_envelope_enabled,
-            );
+            ) {
+                let err = AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    "thinking_signature_invalid",
+                    message,
+                );
+                return Err(finish_nonstream_error(
+                    state,
+                    auth,
+                    &attempt,
+                    &logical_model,
+                    started_at,
+                    &request_id,
+                    &request_ip,
+                    req.reasoning.as_ref().and_then(|r| r.effort.clone()),
+                    tried_providers,
+                    &capture,
+                    false,
+                    err,
+                )
+                .await);
+            }
             if let Err(err) = apply_transform_rules_request(
                 state,
                 &mut req_attempt,

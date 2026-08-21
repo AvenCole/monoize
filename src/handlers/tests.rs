@@ -2268,8 +2268,9 @@ fn exhausted_upstream_error_preserves_final_machine_code() {
 
     let err = build_exhausted_upstream_error("gpt-5.6-sol", &tried);
 
-    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
     assert_eq!(err.code, "thinking_signature_invalid");
+    assert_eq!(err.message, "encrypted content could not be verified");
     assert_eq!(
         err.upstream_code.as_deref(),
         Some("thinking_signature_invalid")

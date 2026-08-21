@@ -226,6 +226,55 @@ async fn responses_streaming_prestream_upstream_error_returns_error_stream() {
 }
 
 #[tokio::test]
+async fn responses_streaming_prestream_signature_error_omits_generic_wrapper() {
+    let ctx = setup().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, ctx.auth_header.clone())
+        .body(Body::from(
+            json!({
+                "model":"gpt-5-mini",
+                "input":"stream invalid encrypted reasoning",
+                "stream": true,
+                "force_upstream_error_status": 400,
+                "force_upstream_error_code": "thinking_signature_invalid",
+                "force_upstream_error_message": "encrypted content could not be verified"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = ctx.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let frames = parse_responses_sse_json(&text);
+    let error = frames
+        .iter()
+        .find(|(event, _)| event == "error")
+        .map(|(_, payload)| payload)
+        .expect("error frame");
+
+    assert_eq!(error["code"], json!("thinking_signature_invalid"));
+    assert!(
+        !error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("All "),
+        "signature validation errors must not use the generic exhausted-route wrapper: {text}"
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("encrypted content could not be verified"),
+        "signature validation message must preserve the upstream detail: {text}"
+    );
+}
+
+#[tokio::test]
 async fn responses_streaming_preserves_upstream_response_failure_error() {
     let ctx = setup().await;
     let req = Request::builder()

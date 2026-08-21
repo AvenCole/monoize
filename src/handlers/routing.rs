@@ -852,17 +852,28 @@ pub(super) fn build_exhausted_error_message(model: &str, tried: &[TriedProvider]
 }
 
 pub(super) fn build_exhausted_upstream_error(model: &str, tried: &[TriedProvider]) -> AppError {
-    let code = tried
-        .last()
+    let last = tried.last();
+    let code = last
         .and_then(|attempt| attempt.upstream_code.as_deref())
         .filter(|code| !code.is_empty())
         .unwrap_or("upstream_error");
-    let mut err = AppError::new(
-        StatusCode::BAD_GATEWAY,
-        code,
-        build_exhausted_error_message(model, tried),
-    );
-    if let Some(last) = tried.last() {
+    let signature_invalid = code == "thinking_signature_invalid";
+    let status = if signature_invalid {
+        last.and_then(|attempt| attempt.upstream_status)
+            .and_then(|status| StatusCode::from_u16(status).ok())
+            .filter(StatusCode::is_client_error)
+            .unwrap_or(StatusCode::BAD_REQUEST)
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    let message = if signature_invalid {
+        last.map(|attempt| attempt.error.clone())
+            .unwrap_or_else(|| build_exhausted_error_message(model, tried))
+    } else {
+        build_exhausted_error_message(model, tried)
+    };
+    let mut err = AppError::new(status, code, message);
+    if let Some(last) = last {
         err.upstream_status = last.upstream_status;
         err.upstream_code = last.upstream_code.clone();
         err.upstream_type = last.upstream_type.clone();

@@ -754,7 +754,10 @@ PR4c.4. The Monoize reasoning envelope string format MUST be:
   - `provider_type`: the upstream provider type string that produced the encrypted payload;
   - `model`: the upstream model string that produced the encrypted payload;
   - `item_id`: the upstream reasoning item id when known, otherwise `null`;
-  - `payload`: the original encrypted reasoning payload as a JSON value.
+  - `payload`: the original encrypted reasoning payload as a JSON value;
+  - `payload_sha256`: the lowercase 64-character SHA-256 hex digest of the UTF-8 bytes produced by JSON-serializing `payload` alone.
+
+Monoize MUST include `payload_sha256` on every newly created `v = 2` envelope. Monoize MUST accept a legacy `v = 2` envelope that omits `payload_sha256`.
 
 PR4c.5. Monoize MUST apply PR4c.3 to all downstream surfaces that can carry completed encrypted reasoning, including non-stream terminal responses, streaming reasoning deltas, streaming `output_item.done`, streaming `response.completed`, Chat Completions `reasoning_details[]`, and Anthropic Messages `thinking.signature` or `redacted_thinking.data`. A downstream Responses `response.output_item.added` reasoning item MUST NOT carry `encrypted_content` decoded from the corresponding upstream added snapshot.
 
@@ -763,6 +766,8 @@ PR4c.5a. When applying PR4c.3 to a streaming reasoning delta, if the canonical U
 PR4c.5b. When decoding an upstream Responses `response.output_item.added` event whose `item.type = "reasoning"`, Monoize MUST preserve a non-empty item `id` as the identity of the reasoning reconstruction slot. Monoize MUST discard `item.encrypted_content` at this boundary. It MUST NOT expose that value through canonical item extra state, and it MUST NOT wrap or emit that value in a downstream event. When a later completed snapshot supplies non-empty encrypted content for the same slot, the mz2 envelope `item_id` and downstream reasoning item `id` MUST equal the preserved id.
 
 PR4c.6. Before sending an upstream request, Monoize MUST inspect replayed URP `Reasoning.encrypted` values. If the value is an `mz2.` envelope and `reasoning_envelope_enabled = true`, Monoize MUST unwrap and forward the original `payload` only when both `provider_type` and `model` equal the selected upstream provider type and upstream model for the current attempt. If either value differs, Monoize MUST drop that replayed reasoning node from the upstream request.
+
+If an `mz2.` value is malformed, has unsupported required metadata, or has a non-empty `payload_sha256` that differs from the digest of `payload`, Monoize MUST stop routing before it sends that request to an upstream. Monoize MUST return HTTP `400` with `error.code = "thinking_signature_invalid"`. A checksum mismatch MUST NOT be treated as an upstream attempt failure. This validation MUST occur before any request-phase transform observes the unwrapped payload.
 
 PR4c.7. If `reasoning_envelope_enabled = false`, Monoize MUST NOT wrap newly produced downstream encrypted reasoning payloads. If a downstream request nevertheless replays an `mz2.` envelope, Monoize MAY unwrap it before upstream encoding, but MUST NOT enforce the provider/model mismatch drop defined by PR4c.6.
 
