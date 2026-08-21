@@ -573,7 +573,6 @@ pub fn filter_and_unwrap_reasoning_envelopes_for_upstream(
 ) {
     nodes.retain_mut(|node| {
         let Node::Reasoning {
-            id,
             encrypted,
             extra_body,
             ..
@@ -585,11 +584,6 @@ pub fn filter_and_unwrap_reasoning_envelopes_for_upstream(
             if enforce_match && !reasoning_envelope_matches(&envelope, provider_type, model) {
                 return false;
             }
-            if let Some(envelope_id) = envelope.item_id {
-                if !envelope_id.is_empty() {
-                    *id = Some(envelope_id);
-                }
-            }
             *encrypted = Some(envelope.payload);
         }
         if let Some(envelope) = extra_body
@@ -598,11 +592,6 @@ pub fn filter_and_unwrap_reasoning_envelopes_for_upstream(
         {
             if enforce_match && !reasoning_envelope_matches(&envelope, provider_type, model) {
                 return false;
-            }
-            if let Some(envelope_id) = envelope.item_id {
-                if !envelope_id.is_empty() {
-                    *id = Some(envelope_id);
-                }
             }
             extra_body.insert("encrypted_content".to_string(), envelope.payload);
         }
@@ -1687,6 +1676,60 @@ mod tests {
                 extra_body,
                 ..
             } if content == "raw reasoning" && extra_body.is_empty()
+        ));
+    }
+
+    #[test]
+    fn mz2_unwrap_preserves_explicit_reasoning_id_presence() {
+        let mut omitted_id_encrypted = Some(serde_json::json!("opaque_without_id"));
+        wrap_reasoning_payload(
+            &mut omitted_id_encrypted,
+            Some("rs_envelope_metadata"),
+            "responses",
+            "gpt-5.6-sol",
+        );
+        let mut explicit_id_encrypted = Some(serde_json::json!("opaque_with_id"));
+        wrap_reasoning_payload(
+            &mut explicit_id_encrypted,
+            Some("rs_different_envelope_metadata"),
+            "responses",
+            "gpt-5.6-sol",
+        );
+        let mut nodes = vec![
+            Node::Reasoning {
+                id: None,
+                content: None,
+                encrypted: omitted_id_encrypted,
+                summary: None,
+                source: None,
+                extra_body: HashMap::new(),
+            },
+            Node::Reasoning {
+                id: Some("rs_explicit".to_string()),
+                content: None,
+                encrypted: explicit_id_encrypted,
+                summary: None,
+                source: None,
+                extra_body: HashMap::new(),
+            },
+        ];
+
+        filter_and_unwrap_reasoning_envelopes_for_upstream(
+            &mut nodes,
+            "responses",
+            "gpt-5.6-sol",
+            true,
+        );
+
+        assert!(matches!(
+            &nodes[0],
+            Node::Reasoning { id: None, encrypted: Some(encrypted), .. }
+                if encrypted == &serde_json::json!("opaque_without_id")
+        ));
+        assert!(matches!(
+            &nodes[1],
+            Node::Reasoning { id: Some(id), encrypted: Some(encrypted), .. }
+                if id == "rs_explicit" && encrypted == &serde_json::json!("opaque_with_id")
         ));
     }
 

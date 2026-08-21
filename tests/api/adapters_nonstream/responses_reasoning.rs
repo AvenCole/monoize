@@ -320,6 +320,66 @@ async fn responses_reasoning_envelope_roundtrips_for_same_model() {
 }
 
 #[tokio::test]
+async fn responses_reasoning_envelope_does_not_restore_an_omitted_request_item_id() {
+    let ctx = setup().await;
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5-mini",
+            "input": "show reasoning",
+            "reasoning": { "effort": "high" }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first: Value = serde_json::from_str(&body).expect("first response json");
+    let mut input = first["output"].as_array().expect("output array").clone();
+    for item in &mut input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        item.remove("id");
+        item.remove("status");
+        item.remove("duration");
+    }
+    input.push(json!({
+        "type": "message",
+        "role": "user",
+        "content": [{ "type": "input_text", "text": "continue" }]
+    }));
+
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5-mini",
+            "input": input
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let upstream = last_captured_body(&ctx, "responses");
+    let reasoning_item = upstream["input"]
+        .as_array()
+        .and_then(|input| {
+            input
+                .iter()
+                .find(|item| item["type"].as_str() == Some("reasoning"))
+        })
+        .expect("same-model reasoning should be forwarded");
+    assert!(
+        reasoning_item.get("id").is_none(),
+        "mz2 metadata must not restore an omitted request item id: {upstream}"
+    );
+    assert_eq!(
+        reasoning_item["encrypted_content"].as_str(),
+        Some("mock_sig")
+    );
+}
+
+#[tokio::test]
 async fn responses_reasoning_envelope_drops_mismatched_model() {
     let ctx = setup().await;
     let (status, body) = json_post(
