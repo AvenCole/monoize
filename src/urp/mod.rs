@@ -1,9 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fmt::Write as _;
 
 pub mod decode;
 pub mod encode;
@@ -88,8 +86,6 @@ pub struct ReasoningEnvelope {
     pub model: String,
     pub item_id: Option<String>,
     pub payload: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload_sha256: Option<String>,
 }
 
 /// Wrap `(item_id, signature)` into a sigil string suitable for smuggling through a downstream
@@ -133,58 +129,25 @@ pub fn strip_reasoning_signature_sigil(signature: &str) -> String {
         .unwrap_or_else(|| signature.to_string())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output
-}
-
-fn reasoning_payload_sha256(payload: &Value) -> Result<String, String> {
-    serde_json::to_vec(payload)
-        .map(|bytes| sha256_hex(&bytes))
-        .map_err(|_| "reasoning envelope payload is not serializable".to_string())
-}
-
-fn parse_reasoning_envelope_checked(value: &Value) -> Result<Option<ReasoningEnvelope>, String> {
-    let Some(raw) = value.as_str() else {
-        return Ok(None);
-    };
+pub fn parse_reasoning_envelope(value: &Value) -> Option<ReasoningEnvelope> {
+    let raw = value.as_str()?;
     if let Some(encoded) = raw.strip_prefix(REASONING_ENVELOPE_PREFIX) {
-        let decoded = URL_SAFE_NO_PAD
-            .decode(encoded.as_bytes())
-            .map_err(|_| "invalid mz2 reasoning envelope encoding".to_string())?;
-        let envelope = serde_json::from_slice::<ReasoningEnvelope>(&decoded)
-            .map_err(|_| "invalid mz2 reasoning envelope JSON".to_string())?;
-        if envelope.v != 2 || envelope.provider_type.is_empty() || envelope.model.is_empty() {
-            return Err("unsupported mz2 reasoning envelope metadata".to_string());
+        let decoded = URL_SAFE_NO_PAD.decode(encoded.as_bytes()).ok()?;
+        let envelope = serde_json::from_slice::<ReasoningEnvelope>(&decoded).ok()?;
+        if envelope.v == 2 && !envelope.provider_type.is_empty() && !envelope.model.is_empty() {
+            return Some(envelope);
         }
-        if let Some(expected) = envelope.payload_sha256.as_deref() {
-            let actual = reasoning_payload_sha256(&envelope.payload)?;
-            if expected != actual {
-                return Err("reasoning envelope payload checksum mismatch".to_string());
-            }
-        }
-        return Ok(Some(envelope));
+        return None;
     }
 
-    let Some((item_id, payload)) = unwrap_reasoning_signature_sigil(raw) else {
-        return Ok(None);
-    };
-    Ok(Some(ReasoningEnvelope {
+    let (item_id, payload) = unwrap_reasoning_signature_sigil(raw)?;
+    Some(ReasoningEnvelope {
         v: 1,
         provider_type: String::new(),
         model: String::new(),
         item_id: Some(item_id),
         payload: Value::String(payload),
-        payload_sha256: None,
-    }))
-}
-
-pub fn parse_reasoning_envelope(value: &Value) -> Option<ReasoningEnvelope> {
-    parse_reasoning_envelope_checked(value).ok().flatten()
+    })
 }
 
 fn reasoning_envelope_matches(
@@ -209,17 +172,12 @@ fn wrap_reasoning_payload(
         return;
     }
 
-    let Ok(payload_sha256) = reasoning_payload_sha256(&payload) else {
-        *encrypted = Some(payload);
-        return;
-    };
     let envelope = ReasoningEnvelope {
         v: 2,
         provider_type: provider_type.to_string(),
         model: model.to_string(),
         item_id: item_id.filter(|id| !id.is_empty()).map(str::to_string),
         payload,
-        payload_sha256: Some(payload_sha256),
     };
     let Ok(bytes) = serde_json::to_vec(&envelope) else {
         *encrypted = Some(envelope.payload);
@@ -356,12 +314,8 @@ pub fn filter_and_unwrap_reasoning_envelopes_for_upstream(
     provider_type: &str,
     model: &str,
     enforce_match: bool,
-) -> Result<(), String> {
-    let mut validation_error = None;
+) {
     nodes.retain_mut(|node| {
-        if validation_error.is_some() {
-            return true;
-        }
         let Node::Reasoning {
             id,
             encrypted,
@@ -371,15 +325,7 @@ pub fn filter_and_unwrap_reasoning_envelopes_for_upstream(
         else {
             return true;
         };
-        let envelope = match encrypted.as_ref().map(parse_reasoning_envelope_checked) {
-            Some(Ok(envelope)) => envelope,
-            Some(Err(error)) => {
-                validation_error = Some(error);
-                return true;
-            }
-            None => None,
-        };
-        if let Some(envelope) = envelope {
+        if let Some(envelope) = encrypted.as_ref().and_then(parse_reasoning_envelope) {
             if enforce_match && !reasoning_envelope_matches(&envelope, provider_type, model) {
                 return false;
             }
@@ -390,18 +336,10 @@ pub fn filter_and_unwrap_reasoning_envelopes_for_upstream(
             }
             *encrypted = Some(envelope.payload);
         }
-        let extra_envelope = match extra_body
+        if let Some(envelope) = extra_body
             .get("encrypted_content")
-            .map(parse_reasoning_envelope_checked)
+            .and_then(parse_reasoning_envelope)
         {
-            Some(Ok(envelope)) => envelope,
-            Some(Err(error)) => {
-                validation_error = Some(error);
-                return true;
-            }
-            None => None,
-        };
-        if let Some(envelope) = extra_envelope {
             if enforce_match && !reasoning_envelope_matches(&envelope, provider_type, model) {
                 return false;
             }
@@ -414,7 +352,6 @@ pub fn filter_and_unwrap_reasoning_envelopes_for_upstream(
         }
         true
     });
-    validation_error.map_or(Ok(()), Err)
 }
 
 pub fn synthetic_tool_result_id() -> String {
@@ -1593,7 +1530,6 @@ mod tests {
         let envelope = parse_reasoning_envelope(&encrypted).expect("mz2 envelope");
         assert_eq!(envelope.item_id.as_deref(), Some("rs_original"));
         assert_eq!(envelope.payload, serde_json::json!("opaque_payload"));
-        assert_eq!(envelope.payload_sha256.as_deref().map(str::len), Some(64));
     }
 
     #[test]
@@ -1622,85 +1558,6 @@ mod tests {
         let envelope = parse_reasoning_envelope(encrypted).expect("mz2 envelope");
         assert_eq!(envelope.item_id.as_deref(), Some("rs_original"));
         assert_eq!(envelope.payload, serde_json::json!("opaque_payload"));
-        assert_eq!(envelope.payload_sha256.as_deref().map(str::len), Some(64));
-    }
-
-    #[test]
-    fn replayed_reasoning_envelope_rejects_payload_checksum_mismatch() {
-        let original_payload = serde_json::json!("terminal_payload");
-        let envelope = ReasoningEnvelope {
-            v: 2,
-            provider_type: "responses".to_string(),
-            model: "gpt-5.6-sol".to_string(),
-            item_id: Some("rs_original".to_string()),
-            payload_sha256: Some(reasoning_payload_sha256(&original_payload).unwrap()),
-            payload: serde_json::json!("spliced_payload"),
-        };
-        let encoded = serde_json::to_vec(&envelope).unwrap();
-        let encrypted = serde_json::json!(format!(
-            "{REASONING_ENVELOPE_PREFIX}{}",
-            URL_SAFE_NO_PAD.encode(encoded)
-        ));
-        let mut nodes = vec![Node::Reasoning {
-            id: None,
-            content: None,
-            encrypted: Some(encrypted),
-            summary: None,
-            source: None,
-            extra_body: HashMap::new(),
-        }];
-
-        let error = filter_and_unwrap_reasoning_envelopes_for_upstream(
-            &mut nodes,
-            "responses",
-            "gpt-5.6-sol",
-            true,
-        )
-        .unwrap_err();
-
-        assert_eq!(error, "reasoning envelope payload checksum mismatch");
-    }
-
-    #[test]
-    fn replayed_reasoning_envelope_accepts_legacy_v2_without_checksum() {
-        let envelope = ReasoningEnvelope {
-            v: 2,
-            provider_type: "responses".to_string(),
-            model: "gpt-5.6-sol".to_string(),
-            item_id: Some("rs_original".to_string()),
-            payload: serde_json::json!("legacy_payload"),
-            payload_sha256: None,
-        };
-        let encoded = serde_json::to_vec(&envelope).unwrap();
-        let encrypted = serde_json::json!(format!(
-            "{REASONING_ENVELOPE_PREFIX}{}",
-            URL_SAFE_NO_PAD.encode(encoded)
-        ));
-        let mut nodes = vec![Node::Reasoning {
-            id: None,
-            content: None,
-            encrypted: Some(encrypted),
-            summary: None,
-            source: None,
-            extra_body: HashMap::new(),
-        }];
-
-        filter_and_unwrap_reasoning_envelopes_for_upstream(
-            &mut nodes,
-            "responses",
-            "gpt-5.6-sol",
-            true,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            &nodes[0],
-            Node::Reasoning {
-                id: Some(id),
-                encrypted: Some(Value::String(payload)),
-                ..
-            } if id == "rs_original" && payload == "legacy_payload"
-        ));
     }
 
     #[test]

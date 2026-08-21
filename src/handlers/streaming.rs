@@ -239,32 +239,12 @@ pub(super) async fn forward_stream_typed(
             // Unwrap mz2 reasoning envelopes BEFORE any request-phase transform
             // observes the request input. See `nonstream.rs` for rationale and
             // spec references (urp-transform-system PIPE-1 step 6, PIPE-1d).
-            if let Err(message) = urp::filter_and_unwrap_reasoning_envelopes_for_upstream(
+            urp::filter_and_unwrap_reasoning_envelopes_for_upstream(
                 &mut req_attempt.input,
                 reasoning_envelope_provider_type(attempt.provider_type),
                 &req_attempt.model,
                 auth.reasoning_envelope_enabled,
-            ) {
-                let err = AppError::new(
-                    StatusCode::BAD_REQUEST,
-                    "thinking_signature_invalid",
-                    message,
-                );
-                spawn_stream_attempt_error(
-                    &state,
-                    &auth,
-                    &attempt,
-                    &logical_model,
-                    started_at,
-                    request_id.clone(),
-                    request_ip.clone(),
-                    None,
-                    &err,
-                    req.reasoning.as_ref().and_then(|r| r.effort.clone()),
-                    tried_providers.clone(),
-                );
-                return Err(err);
-            }
+            );
             if let Err(err) = apply_transform_rules_request(
                 &state,
                 &mut req_attempt,

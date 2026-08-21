@@ -345,11 +345,11 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_added_snapshot_discards_provisional_encrypted_content() {
+    fn reasoning_added_snapshot_keeps_encrypted_content_out_of_accumulator() {
         let item = json!({
             "type": "reasoning",
-            "id": "rs_provisional",
-            "encrypted_content": "provisional_sig",
+            "id": "rs_snapshot",
+            "encrypted_content": "added_snapshot_sig",
             "future_item_field": true
         });
         let mut slot = AccumulatedReasoningSlot::default();

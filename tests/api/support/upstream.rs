@@ -604,7 +604,7 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                             .data(json!({
                                 "type": "response.output_item.added",
                                 "output_index": 0,
-                                "item": { "type": "reasoning", "id": "rs_mock", "summary": [{ "type": "summary_text", "text": "" }], "content": [], "encrypted_content": "provisional_sig" }
+                                "item": { "type": "reasoning", "id": "rs_mock", "summary": [{ "type": "summary_text", "text": "" }], "content": [], "encrypted_content": "added_snapshot_sig" }
                             }).to_string())),
                         Ok::<_, Infallible>(Event::default()
                             .event("response.reasoning_summary_part.added")

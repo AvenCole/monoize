@@ -153,7 +153,8 @@ fn merge_reasoning_item_snapshot(
             slot.summary = summary;
         }
     }
-    // Added-item encrypted snapshots can differ from the completed token and are not replayable.
+    // Lifecycle snapshots can carry distinct opaque values. Retain only the terminal value so
+    // downstream snapshot aggregators cannot splice them.
     if overwrite_terminal_fields && !encrypted.is_empty() {
         slot.encrypted = Some(Value::String(encrypted));
     }
