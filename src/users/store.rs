@@ -2483,38 +2483,44 @@ impl UserStore {
         self.delete_api_keys_transactional(ids).await
     }
 
+    fn user_balance_from_row(row: &QueryResult) -> Result<UserBalance, String> {
+        let balance_raw: String = row
+            .try_get("", "balance_nano_usd")
+            .map_err(|e| e.to_string())?;
+        Ok(UserBalance {
+            user_id: row.try_get("", "id").map_err(|e| e.to_string())?,
+            balance_nano_usd: parse_nano_usd(&balance_raw)?,
+            balance_unlimited: row
+                .try_get::<i32>("", "balance_unlimited")
+                .map_err(|e| e.to_string())?
+                == 1,
+        })
+    }
+
+    async fn load_user_balance(&self, user_id: &str) -> Result<Option<UserBalance>, String> {
+        let row = self
+            .db
+            .read()
+            .query_one(self.db.stmt(
+                "SELECT id, balance_nano_usd, balance_unlimited FROM users WHERE id = $1",
+                vec![user_id.into()],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        row.map(|row| Self::user_balance_from_row(&row)).transpose()
+    }
+
     pub async fn get_user_balance(&self, user_id: &str) -> Result<Option<UserBalance>, String> {
         loop {
             if let Some(cached) = self.balance_cache.get(user_id) {
                 return Ok(Some(cached));
             }
             let generation = self.balance_cache.current_generation();
-            let row = self
-                .db
-                .read()
-                .query_one(self.db.stmt(
-                    "SELECT id, balance_nano_usd, balance_unlimited FROM users WHERE id = $1",
-                    vec![user_id.into()],
-                ))
-                .await
-                .map_err(|e| e.to_string())?;
-            let Some(row) = row else {
+            let Some(balance) = self.load_user_balance(user_id).await? else {
                 if self.balance_cache.current_generation() != generation {
                     continue;
                 }
                 return Ok(None);
-            };
-            let balance_raw: String = row
-                .try_get("", "balance_nano_usd")
-                .map_err(|e| e.to_string())?;
-            let balance_nano_usd = parse_nano_usd(&balance_raw)?;
-            let balance = UserBalance {
-                user_id: row.try_get("", "id").map_err(|e| e.to_string())?,
-                balance_nano_usd,
-                balance_unlimited: row
-                    .try_get::<i32>("", "balance_unlimited")
-                    .map_err(|e| e.to_string())?
-                    == 1,
             };
             if !self.balance_cache.insert_if_current(
                 user_id.to_string(),
@@ -2525,6 +2531,14 @@ impl UserStore {
             }
             return Ok(Some(balance));
         }
+    }
+
+    /// Replica preflight (M7): persisted balance without the 30s dashboard cache.
+    pub async fn get_user_balance_uncached(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserBalance>, String> {
+        self.load_user_balance(user_id).await
     }
 
     pub async fn ensure_user_can_spend(&self, user_id: &str) -> Result<(), BillingError> {

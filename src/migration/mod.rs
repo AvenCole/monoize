@@ -47,6 +47,7 @@ impl MigratorTrait for Migrator {
 #[derive(Debug, PartialEq, Eq)]
 enum StartupMigrationDecision {
     RunEmbedded,
+    FullyApplied,
     AcceptNewerApplied {
         newest_embedded: String,
         newer_applied: Vec<String>,
@@ -78,6 +79,10 @@ fn startup_migration_decision(
         .map(|version| (*version).to_string())
         .collect::<Vec<_>>();
     if newer_applied.is_empty() {
+        let missing_embedded = embedded_set.difference(&applied_set).count();
+        if missing_embedded == 0 {
+            return Ok(StartupMigrationDecision::FullyApplied);
+        }
         return Ok(StartupMigrationDecision::RunEmbedded);
     }
 
@@ -127,6 +132,7 @@ pub async fn verify_schema_current(db: &sea_orm::DatabaseConnection) -> Result<(
         StartupMigrationDecision::RunEmbedded => {
             Err(DbErr::Custom("replica_schema_pending".to_string()))
         }
+        StartupMigrationDecision::FullyApplied => Ok(()),
         StartupMigrationDecision::AcceptNewerApplied {
             newest_embedded,
             newer_applied,
@@ -153,7 +159,9 @@ pub async fn run_startup_migrations(db: &sea_orm::DatabaseConnection) -> Result<
         .collect::<Vec<_>>();
 
     match startup_migration_decision(&embedded, &applied)? {
-        StartupMigrationDecision::RunEmbedded => Migrator::up(db, None).await,
+        StartupMigrationDecision::RunEmbedded | StartupMigrationDecision::FullyApplied => {
+            Migrator::up(db, None).await
+        }
         StartupMigrationDecision::AcceptNewerApplied {
             newest_embedded,
             newer_applied,
@@ -220,6 +228,17 @@ mod tests {
         .expect("normal history is accepted");
 
         assert_eq!(decision, StartupMigrationDecision::RunEmbedded);
+    }
+
+    #[test]
+    fn fully_applied_history_is_current() {
+        let decision = startup_migration_decision(
+            &versions(&["m001_initial", "m002_current"]),
+            &versions(&["m001_initial", "m002_current"]),
+        )
+        .expect("fully applied history is accepted");
+
+        assert_eq!(decision, StartupMigrationDecision::FullyApplied);
     }
 
     #[test]
@@ -308,5 +327,63 @@ mod tests {
         run_startup_migrations(&db)
             .await
             .expect("startup wrapper accepts only strictly newer versions");
+    }
+
+    #[tokio::test]
+    async fn replica_schema_check_accepts_fully_applied_history() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::install(&db)
+            .await
+            .expect("install migration table");
+        for version in Migrator::migrations()
+            .into_iter()
+            .map(|migration| migration.name().to_string())
+        {
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO seaql_migrations (version, applied_at) VALUES (?, ?)",
+                [version.into(), 0_i64.into()],
+            ))
+            .await
+            .expect("record applied migration");
+        }
+
+        verify_schema_current(&db)
+            .await
+            .expect("PRP10 fully-applied replicas continue");
+    }
+
+    #[tokio::test]
+    async fn replica_schema_check_rejects_pending_embedded_versions() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::install(&db)
+            .await
+            .expect("install migration table");
+        let Some(first) = Migrator::migrations()
+            .into_iter()
+            .map(|migration| migration.name().to_string())
+            .next()
+        else {
+            panic!("embedded migrations must not be empty");
+        };
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO seaql_migrations (version, applied_at) VALUES (?, ?)",
+            [first.into(), 0_i64.into()],
+        ))
+        .await
+        .expect("record partial history");
+
+        let error = verify_schema_current(&db)
+            .await
+            .expect_err("pending embedded versions must fail");
+        assert!(
+            error.to_string().contains("replica_schema_pending"),
+            "{error}"
+        );
     }
 }

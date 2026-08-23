@@ -883,7 +883,14 @@ pub async fn test_channel(
     // PX6: the connectivity test uses the channel's effective proxy resolution.
     let test_http = state
         .http_clients
-        .for_channel_proxy(channel.proxy_url.as_deref());
+        .for_channel_proxy(channel.proxy_url.as_deref())
+        .map_err(|detail| {
+            AppError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("channel proxy_url cannot be used: {detail}"),
+            )
+        })?;
     let (ok, _usage) = crate::monoize_routing::probe_channel_completion(
         &test_http,
         channel,

@@ -560,8 +560,9 @@ pub async fn create_embeddings(
             }
 
             let provider = build_channel_provider_config(&attempt);
+            let http = client_http_for_attempt(&state, &attempt)?;
             let result = upstream::call_upstream_with_timeout_and_headers(
-                &client_http_for_attempt(&state, &attempt),
+                &http,
                 &provider,
                 &attempt.api_key,
                 "/v1/embeddings",
@@ -1172,13 +1173,13 @@ async fn ensure_replica_can_spend(
 
 #[allow(clippy::result_large_err)]
 async fn ensure_replica_user_can_spend(
-    _state: &AppState,
+    state: &AppState,
     user_id: &str,
     outstanding_for: impl Fn(&str) -> i128,
 ) -> AppResult<()> {
-    let balance = _state
+    let balance = state
         .user_store
-        .get_user_balance(user_id)
+        .get_user_balance_uncached(user_id)
         .await
         .map_err(|err| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", err))?
         .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, "unauthorized", "user not found"))?;

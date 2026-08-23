@@ -104,10 +104,14 @@ async fn run() -> Result<(), AppError> {
         state.user_store.flush_all_batchers().await;
     }
 
-    match state.user_store.cleanup_pending_request_logs().await {
-        Ok(n) if n > 0 => tracing::info!(count = n, "finalized pending request logs on shutdown"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!("failed to cleanup pending request logs on shutdown: {e}"),
+    if !is_replica {
+        match state.user_store.cleanup_pending_request_logs().await {
+            Ok(n) if n > 0 => {
+                tracing::info!(count = n, "finalized pending request logs on shutdown")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("failed to cleanup pending request logs on shutdown: {e}"),
+        }
     }
 
     Ok(())

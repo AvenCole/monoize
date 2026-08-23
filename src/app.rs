@@ -11,7 +11,7 @@ use crate::monoize_routing::{
     ChannelAffinityBinding, ChannelHealthState, MonoizeRoutingStore, MonoizeRuntimeConfig,
     probe_channel_completion,
 };
-use crate::node_config::{HttpClients, NodeSettings};
+use crate::node_config::{HttpClients, NodeRole, NodeSettings};
 use crate::rate_limit::RateLimiter;
 use crate::request_capture::RequestCaptureStore;
 use crate::settings::{PricingProfilePattern, SettingsStore, normalize_pricing_model_key};
@@ -204,6 +204,17 @@ pub struct AppState {
     pub image_transform_cache: Arc<ImageTransformCache>,
     pub request_capture: RequestCaptureStore,
     pub trusted_proxies: TrustedProxyConfig,
+}
+
+impl AppState {
+    pub fn with_node_role(self, role: NodeRole) -> Self {
+        let mut node = (*self.node).clone();
+        node.role = role;
+        Self {
+            node: Arc::new(node),
+            ..self
+        }
+    }
 }
 
 const ACTIVE_PROBE_CONNECTIVITY_KIND: &str = "active_probe_connectivity";
@@ -448,7 +459,7 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
     }
 
     let probe_store = monoize_store.clone();
-    let probe_http = http.clone();
+    let probe_http_clients = http_clients.clone();
     let monoize_runtime = Arc::new(tokio::sync::RwLock::new(monoize_runtime));
     if is_replica {
         // E3: fixed-interval, single-row epoch poll driving snapshot rebuilds.
@@ -576,6 +587,21 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                     if !probe_due {
                         continue;
                     }
+
+                    let probe_http =
+                        match probe_http_clients.for_channel_proxy(channel.proxy_url.as_deref()) {
+                            Ok(client) => client,
+                            Err(error) => {
+                                tracing::warn!(
+                                    channel_id = %channel.id,
+                                    channel_name = %channel.name,
+                                    provider = %provider.name,
+                                    error = %error,
+                                    "active probe skipped because channel proxy could not be built"
+                                );
+                                continue;
+                            }
+                        };
 
                     let configured_model = channel
                         .active_probe_model_override

@@ -120,8 +120,18 @@ impl LastUsedBatcher {
     /// Replica shipment path (PRP12): atomically drain all buffered entries without
     /// touching the database. Callers re-insert via `record_retry` on delivery failure.
     pub fn drain(&self) -> Vec<(String, DateTime<Utc>)> {
+        self.drain_limit(usize::MAX)
+    }
+
+    pub fn drain_limit(&self, max: usize) -> Vec<(String, DateTime<Utc>)> {
         let mut drained = Vec::new();
+        if max == 0 {
+            return drained;
+        }
         self.buffer.retain(|k, v| {
+            if drained.len() >= max {
+                return true;
+            }
             drained.push((k.clone(), *v));
             false
         });

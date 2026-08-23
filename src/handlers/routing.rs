@@ -7,14 +7,22 @@ pub(crate) fn now_ts() -> i64 {
 }
 
 /// PX6/PX7: effective outbound client for one attempt's Channel (custom proxy wins,
-/// then node-global, else direct).
+/// then node-global, else direct). Construction failure fails closed.
+#[allow(clippy::result_large_err)]
 pub(super) fn client_http_for_attempt(
     state: &AppState,
     attempt: &MonoizeAttempt,
-) -> reqwest::Client {
+) -> Result<reqwest::Client, AppError> {
     state
         .http_clients
         .for_channel_proxy(attempt.proxy_url.as_deref())
+        .map_err(|detail| {
+            AppError::new(
+                StatusCode::BAD_GATEWAY,
+                "upstream_proxy_config_invalid",
+                detail,
+            )
+        })
 }
 
 pub(crate) fn health_key(channel_id: &str, model: Option<&str>) -> String {

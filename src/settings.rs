@@ -945,63 +945,33 @@ pub async fn read_config_epoch(db: &DbPool) -> Result<u64, String> {
     }
 }
 
-/// E2 write path on the primary: increments the epoch inside the caller's open
-/// transaction. Safe against lost updates because every caller runs under the
-/// process-local settings-update lock (DB22), making the read-modify-write serialized.
+/// E2 write path on the primary: one statement computing `value + 1` inside the
+/// caller's open transaction. A missing row is inserted as epoch 1 (0 + 1).
 pub(crate) async fn bump_config_epoch_in_tx(
     db: &DbPool,
     tx: &sea_orm::DatabaseTransaction,
 ) -> Result<(), String> {
-    let current = {
-        let rows = tx
-            .query_all(db.stmt(
-                "SELECT value FROM state_records WHERE tenant_id = $1 AND kind = $2 AND id = $3",
-                vec![
-                    CONFIG_EPOCH_TENANT.into(),
-                    CONFIG_EPOCH_KIND.into(),
-                    CONFIG_EPOCH_ID.into(),
-                ],
-            ))
-            .await
-            .map_err(|e| e.to_string())?;
-        match rows.first() {
-            None => 0u64,
-            Some(row) => row
-                .try_get::<String>("", "value")
-                .map_err(|e| format!("invalid config epoch row: {e}"))?
-                .trim()
-                .parse::<u64>()
-                .map_err(|error| format!("invalid config epoch value: {error}"))?,
-        }
+    let sql = if db.is_sqlite() {
+        "INSERT INTO state_records (tenant_id, kind, id, value, expires_at) \
+         VALUES ($1, $2, $3, '1', NULL) \
+         ON CONFLICT (tenant_id, kind, id) \
+         DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+    } else {
+        "INSERT INTO state_records (tenant_id, kind, id, value, expires_at) \
+         VALUES ($1, $2, $3, '1', NULL) \
+         ON CONFLICT (tenant_id, kind, id) \
+         DO UPDATE SET value = CAST(CAST(state_records.value AS BIGINT) + 1 AS TEXT)"
     };
-    let next = current
-        .checked_add(1)
-        .ok_or_else(|| "config epoch overflow".to_string())?;
-    let result = tx
-        .execute(db.stmt(
-            "UPDATE state_records SET value = $4 WHERE tenant_id = $1 AND kind = $2 AND id = $3",
-            vec![
-                CONFIG_EPOCH_TENANT.into(),
-                CONFIG_EPOCH_KIND.into(),
-                CONFIG_EPOCH_ID.into(),
-                next.to_string().into(),
-            ],
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
-    if result.rows_affected() == 0 {
-        tx.execute(db.stmt(
-            "INSERT INTO state_records (tenant_id, kind, id, value, expires_at) VALUES ($1, $2, $3, $4, NULL)",
-            vec![
-                CONFIG_EPOCH_TENANT.into(),
-                CONFIG_EPOCH_KIND.into(),
-                CONFIG_EPOCH_ID.into(),
-                next.to_string().into(),
-            ],
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
-    }
+    tx.execute(db.stmt(
+        sql,
+        vec![
+            CONFIG_EPOCH_TENANT.into(),
+            CONFIG_EPOCH_KIND.into(),
+            CONFIG_EPOCH_ID.into(),
+        ],
+    ))
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

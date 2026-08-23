@@ -110,8 +110,9 @@ pub async fn compact_response(
                 obj.remove("max_multiplier");
             }
             let provider = build_channel_provider_config(&attempt);
+            let http = client_http_for_attempt(&state, &attempt)?;
             let result = upstream::call_upstream_with_timeout_and_headers(
-                &client_http_for_attempt(&state, &attempt),
+                &http,
                 &provider,
                 &attempt.api_key,
                 "/v1/responses/compact",

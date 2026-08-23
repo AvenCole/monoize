@@ -168,16 +168,63 @@ impl DeltaSpool {
         })
     }
 
-    pub fn pending_files(&self) -> usize {
+    fn list_json_files(&self) -> Vec<(String, u64)> {
         match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries
                 .flatten()
-                .filter(|entry| {
-                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                        return None;
+                    }
+                    let size = entry.metadata().ok()?.len();
+                    let name = path.file_name()?.to_str()?.to_string();
+                    Some((name, size))
                 })
-                .count(),
-            Err(_) => 0,
+                .collect(),
+            Err(_) => Vec::new(),
         }
+    }
+
+    pub fn reconstruct_pending_amounts(&self) -> Vec<(String, i128)> {
+        let mut names = self.list_json_files();
+        names.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut amounts = Vec::new();
+        for (name, _) in names {
+            let path = self.dir.join(&name);
+            match std::fs::read(&path) {
+                Ok(bytes) => match serde_json::from_slice::<BalanceDelta>(&bytes) {
+                    Ok(delta) => {
+                        let Some(subject) = delta_subject(&delta) else {
+                            continue;
+                        };
+                        let Ok(amount) = delta.amount_nano_usd.trim().parse::<i128>() else {
+                            continue;
+                        };
+                        amounts.push((subject, amount));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            file = %name,
+                            error = %error,
+                            "skipping unreadable delta spool file during pending reconstruction"
+                        );
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        file = %name,
+                        error = %error,
+                        "skipping unreadable delta spool file during pending reconstruction"
+                    );
+                }
+            }
+        }
+        amounts
+    }
+
+    pub fn pending_files(&self) -> usize {
+        self.list_json_files().len()
     }
 
     pub fn dir_display(&self) -> String {
@@ -215,21 +262,7 @@ impl DeltaSpool {
 
     pub async fn load_batch(&self, max_entries: usize) -> Vec<(PathBuf, u64, BalanceDelta)> {
         let _io_guard = self.io_lock.lock().await;
-        let mut names: Vec<(String, u64)> = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries
-                .flatten()
-                .filter_map(|entry| {
-                    let path = entry.path();
-                    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                        return None;
-                    }
-                    let size = entry.metadata().ok()?.len();
-                    let name = path.file_name()?.to_str()?.to_string();
-                    Some((name, size))
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let mut names: Vec<(String, u64)> = self.list_json_files();
         // Oldest first: the timestamp prefix sorts lexicographically.
         names.sort_by(|left, right| left.0.cmp(&right.0));
         let mut loaded = Vec::with_capacity(names.len());
@@ -311,12 +344,30 @@ impl ShipExtras {
             balance_deltas: self.deltas.into_iter().map(|(_, _, delta)| delta).collect(),
         }
     }
+
+    fn trim_to_fit(&mut self, log_count: usize, hard_cap: usize) -> ShipExtras {
+        let mut leftover = ShipExtras {
+            last_used: Vec::new(),
+            deltas: Vec::new(),
+        };
+        let mut remaining = hard_cap.saturating_sub(log_count);
+        if self.deltas.len() > remaining {
+            leftover.deltas = self.deltas.split_off(remaining);
+        }
+        remaining = remaining.saturating_sub(self.deltas.len());
+        if self.last_used.len() > remaining {
+            leftover.last_used = self.last_used.split_off(remaining);
+        }
+        leftover
+    }
 }
 
 struct BatchSink<'a> {
     metering: &'a ReplicaMetering,
+    last_used: &'a LastUsedBatcher,
     extras: Mutex<Option<ShipExtras>>,
     released: AtomicBool,
+    deliver_attempted: AtomicBool,
 }
 
 impl<'a> BatchSink<'a> {
@@ -330,26 +381,38 @@ impl<'a> BatchSink<'a> {
     fn was_released(&self) -> bool {
         self.released.load(Ordering::Acquire)
     }
+
+    fn deliver_attempted(&self) -> bool {
+        self.deliver_attempted.load(Ordering::Acquire)
+    }
 }
 
 #[async_trait::async_trait]
 impl MeteringSink for BatchSink<'_> {
     async fn deliver(&self, entries: &[SpoolRequestLog]) -> Result<(), String> {
+        self.deliver_attempted.store(true, Ordering::Release);
         let Some(extras) = self.take_extras() else {
-            // Concurrent deliver is impossible under flush_lock; treat as retryable.
             return Err("metering sink state unavailable".to_string());
         };
-        match self.metering.post_batch(entries.to_vec(), &extras).await {
-            Ok(()) => {
-                self.metering.release_extras(&extras).await;
-                self.released.store(true, Ordering::Release);
-                Ok(())
-            }
-            Err(error) => {
-                *self.extras.lock().unwrap_or_else(|err| err.into_inner()) = Some(extras);
-                Err(error)
-            }
-        }
+        self.metering
+            .send_composed(entries.to_vec(), extras, self.last_used)
+            .await?;
+        self.released.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShipTick {
+    Idle,
+    Success,
+    Failure,
+}
+
+pub fn next_consecutive_failures(current: usize, tick: ShipTick) -> usize {
+    match tick {
+        ShipTick::Failure => current.saturating_add(1),
+        ShipTick::Success | ShipTick::Idle => 0,
     }
 }
 
@@ -384,9 +447,14 @@ impl ReplicaMetering {
             primary_url.trim_end_matches('/'),
             METERING_INGEST_PATH
         );
+        let delta_spool = DeltaSpool::new(spool_dir, spool_max_bytes)?;
+        let pending = PendingDeductions::default();
+        for (subject, amount) in delta_spool.reconstruct_pending_amounts() {
+            pending.add(&subject, amount);
+        }
         Ok(Self {
-            delta_spool: Arc::new(DeltaSpool::new(spool_dir, spool_max_bytes)?),
-            pending: Arc::new(PendingDeductions::default()),
+            delta_spool: Arc::new(delta_spool),
+            pending: Arc::new(pending),
             client,
             endpoint,
             token: token.to_string(),
@@ -496,28 +564,47 @@ impl ReplicaMetering {
             .set(self.delta_spool.pending_files() as f64);
     }
 
-    fn requeue_extras_locally(&self, extras: ShipExtras, last_used: &LastUsedBatcher) {
-        for pair in extras.last_used {
+    fn requeue_last_used(&self, pairs: Vec<LastUsedPair>, last_used: &LastUsedBatcher) {
+        for pair in pairs {
             if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(&pair.last_used_at) {
                 last_used.record_retry(pair.api_key_id, timestamp.with_timezone(&chrono::Utc));
             }
         }
-        metrics::counter!("monoize_replica_metering_shipped_total", "result" => "error")
-            .increment(1);
+    }
+
+    async fn send_composed(
+        &self,
+        request_logs: Vec<SpoolRequestLog>,
+        mut extras: ShipExtras,
+        last_used: &LastUsedBatcher,
+    ) -> Result<(), String> {
+        let leftover = extras.trim_to_fit(request_logs.len(), METERING_BATCH_HARD_CAP);
+        self.requeue_last_used(leftover.last_used, last_used);
+        match self.post_batch(request_logs, &extras).await {
+            Ok(()) => {
+                self.release_extras(&extras).await;
+                Ok(())
+            }
+            Err(error) => {
+                self.requeue_last_used(extras.last_used, last_used);
+                metrics::counter!("monoize_replica_metering_shipped_total", "result" => "error")
+                    .increment(1);
+                Err(error)
+            }
+        }
     }
 
     /// One M4 tick: at most one POST carrying request logs, last-used pairs, and deltas.
-    /// Returns the number of request logs released.
     pub async fn ship_once(
         &self,
         log_batcher: &RequestLogBatcher,
         last_used: &LastUsedBatcher,
-    ) -> usize {
-        let drained_pairs = last_used.drain();
-        let last_used_pairs = drained_pairs
-            .iter()
+    ) -> ShipTick {
+        let last_used_pairs = last_used
+            .drain_limit(METERING_BATCH_HARD_CAP)
+            .into_iter()
             .map(|(id, timestamp)| LastUsedPair {
-                api_key_id: id.clone(),
+                api_key_id: id,
                 last_used_at: timestamp.to_rfc3339(),
             })
             .collect::<Vec<_>>();
@@ -529,34 +616,32 @@ impl ReplicaMetering {
 
         let sink = BatchSink {
             metering: self,
+            last_used,
             extras: Mutex::new(Some(extras)),
             released: AtomicBool::new(false),
+            deliver_attempted: AtomicBool::new(false),
         };
-        let shipped_logs = log_batcher.ship_via(self.ship_batch_max, &sink).await;
+        let _shipped_logs = log_batcher.ship_via(self.ship_batch_max, &sink).await;
         if sink.was_released() {
-            return shipped_logs;
+            return ShipTick::Success;
+        }
+        if sink.deliver_attempted() {
+            return ShipTick::Failure;
         }
 
-        // Either the log buffer was empty or the combined post failed inside the sink.
-        // Retry the leftover last-used/delta payload once before giving up this tick.
         let Some(leftovers) = sink.take_extras() else {
-            return shipped_logs;
+            return ShipTick::Idle;
         };
         if leftovers.is_empty() {
-            return shipped_logs;
+            return ShipTick::Idle;
         }
-        let failed = match self.post_batch(Vec::new(), &leftovers).await {
-            Ok(()) => {
-                self.release_extras(&leftovers).await;
-                return shipped_logs;
-            }
+        match self.send_composed(Vec::new(), leftovers, last_used).await {
+            Ok(()) => ShipTick::Success,
             Err(error) => {
                 tracing::warn!(error = %error, "replica metering shipment failed");
-                leftovers
+                ShipTick::Failure
             }
-        };
-        self.requeue_extras_locally(failed, last_used);
-        shipped_logs
+        }
     }
 
     pub fn spawn_ship_loop(
@@ -572,17 +657,13 @@ impl ReplicaMetering {
             let mut consecutive_failures = 0usize;
             loop {
                 ticker.tick().await;
-                let shipped = metering.ship_once(&log_batcher, &last_used).await;
-                if shipped > 0 {
-                    consecutive_failures = 0;
-                } else {
-                    consecutive_failures += 1;
-                    if consecutive_failures >= 3 {
-                        tracing::warn!(
-                            consecutive_failures,
-                            "replica metering shipments keep failing; data remains durably spooled"
-                        );
-                    }
+                let tick = metering.ship_once(&log_batcher, &last_used).await;
+                consecutive_failures = next_consecutive_failures(consecutive_failures, tick);
+                if consecutive_failures >= 3 {
+                    tracing::warn!(
+                        consecutive_failures,
+                        "replica metering shipments keep failing; data remains durably spooled"
+                    );
                 }
                 metrics::gauge!("monoize_replica_metering_pending_entries")
                     .set(metering.delta_spool.pending_files() as f64);
@@ -604,7 +685,7 @@ impl ReplicaMetering {
 // Primary-side ingest endpoint (I1–I6)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn sha256_hex_lower(input: &str) -> [u8; 32] {
+pub fn sha256_hex_lower(input: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(input.as_bytes());
     let mut out = [0u8; 32];
@@ -855,10 +936,20 @@ where
         }
         "api_key_charge" => {
             let api_key_id = delta.api_key_id.clone().unwrap_or_default();
+            let lock_suffix = if db.is_sqlite() { "" } else { " FOR UPDATE" };
+            let _ = tx
+                .query_one(db.stmt(
+                    &format!("SELECT id FROM users WHERE id = $1{lock_suffix}"),
+                    vec![delta.user_id.clone().into()],
+                ))
+                .await
+                .map_err(|error| error.to_string())?;
             let rows = tx
                 .query_all(
                     db.stmt(
-                        "SELECT user_id, sub_account_enabled, sub_account_balance_nano FROM api_keys WHERE id = $1",
+                        &format!(
+                            "SELECT user_id, sub_account_enabled, sub_account_balance_nano FROM api_keys WHERE id = $1{lock_suffix}"
+                        ),
                         vec![api_key_id.clone().into()],
                     ),
                 )
@@ -985,5 +1076,56 @@ pub async fn drain_delta_spool_to_local_db(db: &DbPool, spool: &DeltaSpool) -> R
         if files.len() < METERING_BATCH_HARD_CAP {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn trim_to_fit_keeps_total_at_hard_cap() {
+        let mut extras = ShipExtras {
+            last_used: (0..1500)
+                .map(|i| LastUsedPair {
+                    api_key_id: format!("k{i}"),
+                    last_used_at: "t".to_string(),
+                })
+                .collect(),
+            deltas: (0..800)
+                .map(|i| {
+                    (
+                        PathBuf::from(format!("{i}.json")),
+                        1,
+                        BalanceDelta {
+                            delta_id: format!("{i}"),
+                            kind: "request_charge".to_string(),
+                            user_id: "u".to_string(),
+                            api_key_id: None,
+                            amount_nano_usd: "1".to_string(),
+                            meta_json: Value::Null,
+                            created_at: "t".to_string(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let leftover = extras.trim_to_fit(500, METERING_BATCH_HARD_CAP);
+        assert_eq!(extras.deltas.len(), 800.min(METERING_BATCH_HARD_CAP - 500));
+        assert_eq!(
+            extras.last_used.len() + extras.deltas.len() + 500,
+            METERING_BATCH_HARD_CAP
+        );
+        assert!(!leftover.last_used.is_empty() || !leftover.deltas.is_empty());
+    }
+
+    #[test]
+    fn consecutive_failures_reset_on_idle_and_success() {
+        assert_eq!(next_consecutive_failures(0, ShipTick::Failure), 1);
+        assert_eq!(next_consecutive_failures(1, ShipTick::Failure), 2);
+        assert_eq!(next_consecutive_failures(2, ShipTick::Failure), 3);
+        assert_eq!(next_consecutive_failures(3, ShipTick::Idle), 0);
+        assert_eq!(next_consecutive_failures(2, ShipTick::Success), 0);
     }
 }

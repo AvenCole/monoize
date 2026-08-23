@@ -46,7 +46,7 @@ PX4. Internal cluster traffic — the replica metering shipment of section 6 —
 
 PX5. The upstream proxy configuration MUST NOT be stored in `system_settings` and MUST NOT be editable from the dashboard. Changing it requires a process restart.
 
-PX6. Per-Channel egress proxy resolution: for one upstream request issued for Channel `c`, the effective proxy is `c.proxy_url` when it is a non-empty custom URL (channel-management.spec.md CP-INV-14), otherwise the node-level `MONOIZE_UPSTREAM_PROXY_URL`, otherwise direct connection. The same resolution applies to active-probe requests for that Channel.
+PX6. Per-Channel egress proxy resolution: for one upstream request issued for Channel `c`, the effective proxy is `c.proxy_url` when it is a non-empty custom URL (channel-management.spec.md CP-INV-14), otherwise the node-level `MONOIZE_UPSTREAM_PROXY_URL`, otherwise direct connection. The same resolution applies to active-probe requests for that Channel. If a custom Channel `proxy_url` cannot be used to construct an HTTP client, that Channel's request (including an active-probe) MUST fail closed; it MUST NOT fall back to the node-global or direct client.
 
 PX7. The application MUST cache one HTTP client per distinct effective proxy URL (including the direct case) instead of constructing a client per request. Cache entries are immutable after construction; channel `proxy_url` changes take effect by resolving a different cached client on the next request.
 
@@ -116,7 +116,13 @@ M3. Before the charge path reports success on a replica, the delta MUST be durab
 
 ### 6.2 Ship loop
 
-M4. Every `MONOIZE_METERING_SHIP_INTERVAL_SECONDS`, the replica MUST send at most one batch: the oldest queued spool files up to `MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES` request logs plus all currently buffered last-used pairs plus up to the same entry cap of pending deltas, POSTed as JSON to `POST {MONOIZE_PRIMARY_INTERNAL_URL}/internal/replica/metering` with header `Authorization: Bearer {MONOIZE_REPLICA_TOKEN}`.
+M4. Every `MONOIZE_METERING_SHIP_INTERVAL_SECONDS`, the replica MUST send at most one batch POSTed as JSON to `POST {MONOIZE_PRIMARY_INTERNAL_URL}/internal/replica/metering` with header `Authorization: Bearer {MONOIZE_REPLICA_TOKEN}`. A tick with no entries MUST NOT POST. The batch is composed as:
+
+1. the oldest queued request-log spool files, at most `MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES`;
+2. pending deltas, at most `MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES`;
+3. currently buffered last-used pairs, filling remaining capacity.
+
+Total entries across the three arrays MUST be at most 2000 (I3). Entries that do not fit MUST remain buffered or spooled for the next tick.
 
 M5. Spool files, buffered last-used pairs, pending deltas, and their pending-deduction counters MUST only be released after an HTTP 200 response. Any non-200 response or transport error MUST retain everything unchanged for the next tick. After 3 consecutive failed ticks the replica MUST log a `warn` naming the consecutive-failure count, repeated per subsequent failure.
 

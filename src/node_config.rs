@@ -44,8 +44,12 @@ fn env_trimmed(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn positive_seconds(name: &'static str) -> Result<Option<u64>, (&'static str, String)> {
-    let Some(raw) = env_trimmed(name) else {
+fn positive_seconds(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    error_code: &'static str,
+) -> Result<Option<u64>, (&'static str, String)> {
+    let Some(raw) = get(name) else {
         return Ok(None);
     };
     raw.parse::<u64>()
@@ -54,7 +58,7 @@ fn positive_seconds(name: &'static str) -> Result<Option<u64>, (&'static str, St
         .map(Some)
         .ok_or_else(|| {
             (
-                name,
+                error_code,
                 format!("`{name}` must be a positive integer, got {raw:?}"),
             )
         })
@@ -78,9 +82,15 @@ impl NodeSettings {
     /// Resolves node-local settings from the environment.
     /// The returned error is `(error_code, detail)` and MUST stop startup per PRP1/PRP7/PX2.
     pub fn from_env() -> Result<Self, (&'static str, String)> {
+        Self::from_env_bindings(env_trimmed)
+    }
+
+    pub fn from_env_bindings(
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, (&'static str, String)> {
         let mut settings = Self::primary_default();
 
-        if let Some(raw_role) = env_trimmed("MONOIZE_NODE_ROLE") {
+        if let Some(raw_role) = get("MONOIZE_NODE_ROLE") {
             settings.role = match raw_role.as_str() {
                 "primary" => NodeRole::Primary,
                 "replica" => NodeRole::Replica,
@@ -95,17 +105,25 @@ impl NodeSettings {
             };
         }
 
-        settings.replica_primary_url = env_trimmed("MONOIZE_PRIMARY_INTERNAL_URL");
-        settings.replica_token = env_trimmed("MONOIZE_REPLICA_TOKEN");
-        settings.upstream_proxy_url = env_trimmed("MONOIZE_UPSTREAM_PROXY_URL");
+        settings.replica_primary_url = get("MONOIZE_PRIMARY_INTERNAL_URL");
+        settings.replica_token = get("MONOIZE_REPLICA_TOKEN");
+        settings.upstream_proxy_url = get("MONOIZE_UPSTREAM_PROXY_URL");
 
-        if let Some(seconds) = positive_seconds("MONOIZE_CONFIG_POLL_INTERVAL_SECONDS")? {
+        if let Some(seconds) = positive_seconds(
+            &get,
+            "MONOIZE_CONFIG_POLL_INTERVAL_SECONDS",
+            "config_poll_interval_invalid",
+        )? {
             settings.config_poll_interval = Duration::from_secs(seconds);
         }
-        if let Some(seconds) = positive_seconds("MONOIZE_METERING_SHIP_INTERVAL_SECONDS")? {
+        if let Some(seconds) = positive_seconds(
+            &get,
+            "MONOIZE_METERING_SHIP_INTERVAL_SECONDS",
+            "metering_ship_interval_invalid",
+        )? {
             settings.metering_ship_interval = Duration::from_secs(seconds);
         }
-        if let Some(raw) = env_trimmed("MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES") {
+        if let Some(raw) = get("MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES") {
             let parsed = raw
                 .parse::<usize>()
                 .ok()
@@ -120,10 +138,10 @@ impl NodeSettings {
                 })?;
             settings.metering_ship_batch_max_entries = parsed;
         }
-        if let Some(dir) = env_trimmed("MONOIZE_REPLICA_METERING_SPOOL_DIR") {
+        if let Some(dir) = get("MONOIZE_REPLICA_METERING_SPOOL_DIR") {
             settings.metering_spool_dir = PathBuf::from(dir);
         }
-        if let Some(raw) = env_trimmed("MONOIZE_REPLICA_METERING_SPOOL_MAX_BYTES") {
+        if let Some(raw) = get("MONOIZE_REPLICA_METERING_SPOOL_MAX_BYTES") {
             let parsed = raw.parse::<u64>().ok().filter(|value| *value > 0).ok_or_else(|| {
                 (
                     "metering_spool_quota_invalid",
@@ -259,25 +277,19 @@ impl HttpClients {
 
     /// PX6 resolution: custom channel proxy wins, then the node-global client.
     /// Cached clients are immutable after construction; a changed channel URL simply
-    /// resolves to a different cached entry on the next call.
-    pub fn for_channel_proxy(&self, proxy_url: Option<&str>) -> reqwest::Client {
+    /// resolves to a different cached entry on the next call. Construction failure
+    /// fails closed instead of falling back to a different egress path.
+    pub fn for_channel_proxy(&self, proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
         let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) else {
-            return self.global_client();
+            return Ok(self.global_client());
         };
         if let Some(entry) = self.per_proxy.get(proxy_url) {
-            return entry.value().as_ref().clone();
+            return Ok(entry.value().as_ref().clone());
         }
-        match build_client(Some(proxy_url)) {
-            Ok(client) => {
-                let client = std::sync::Arc::new(client);
-                self.per_proxy.insert(proxy_url.to_string(), client.clone());
-                client.as_ref().clone()
-            }
-            Err(error) => {
-                tracing::warn!(proxy = %proxy_url, error = %error, "invalid channel proxy_url; using direct client");
-                self.global_client()
-            }
-        }
+        let client = build_client(Some(proxy_url))?;
+        let client = std::sync::Arc::new(client);
+        self.per_proxy.insert(proxy_url.to_string(), client.clone());
+        Ok(client.as_ref().clone())
     }
 
     #[cfg(test)]
@@ -364,15 +376,19 @@ mod tests {
         assert_eq!(clients.cached_custom_proxy_count(), 0);
 
         // Follow-global channels resolve without touching the custom cache.
-        let _ = clients.for_channel_proxy(None);
-        let _ = clients.for_channel_proxy(Some("   "));
+        clients.for_channel_proxy(None).unwrap();
+        clients.for_channel_proxy(Some("   ")).unwrap();
         assert_eq!(clients.cached_custom_proxy_count(), 0);
 
-        let _first = clients.for_channel_proxy(Some("http://127.0.0.1:9090"));
+        let _first = clients
+            .for_channel_proxy(Some("http://127.0.0.1:9090"))
+            .unwrap();
         let cached = clients.custom_proxy_arc("http://127.0.0.1:9090");
         assert!(cached.is_some());
         // A repeated resolution hits the same immutable cached entry.
-        let second = clients.for_channel_proxy(Some("http://127.0.0.1:9090"));
+        let second = clients
+            .for_channel_proxy(Some("http://127.0.0.1:9090"))
+            .unwrap();
         assert_eq!(
             format!("{:p}", std::sync::Arc::as_ptr(cached.as_ref().unwrap())),
             format!(
@@ -388,10 +404,52 @@ mod tests {
         assert_eq!(clients.cached_custom_proxy_count(), 1);
         drop(second);
 
-        // An unparsable custom URL must not panic and must fall back to the global client.
-        let fallback = clients.for_channel_proxy(Some("::::not-a-url"));
-        let global = clients.global_client();
-        let _ = (fallback, global);
+        let err = clients
+            .for_channel_proxy(Some("::::not-a-url"))
+            .expect_err("invalid custom proxy must fail closed");
+        assert!(!err.is_empty(), "{err}");
         assert_eq!(clients.cached_custom_proxy_count(), 1);
+    }
+
+    fn env_err(pairs: &[(&str, &str)]) -> &'static str {
+        let map = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect::<std::collections::HashMap<_, _>>();
+        NodeSettings::from_env_bindings(|name| map.get(name).cloned())
+            .expect_err("expected config error")
+            .0
+    }
+
+    #[test]
+    fn t1_prp_and_px_error_codes() {
+        assert_eq!(
+            env_err(&[("MONOIZE_NODE_ROLE", "secondary")]),
+            "node_role_invalid"
+        );
+        assert_eq!(
+            env_err(&[("MONOIZE_CONFIG_POLL_INTERVAL_SECONDS", "0")]),
+            "config_poll_interval_invalid"
+        );
+        assert_eq!(
+            env_err(&[("MONOIZE_METERING_SHIP_INTERVAL_SECONDS", "nope")]),
+            "metering_ship_interval_invalid"
+        );
+        assert_eq!(
+            env_err(&[("MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES", "0")]),
+            "metering_batch_limit_invalid"
+        );
+        assert_eq!(
+            env_err(&[("MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES", "2001")]),
+            "metering_batch_limit_invalid"
+        );
+        assert_eq!(
+            env_err(&[("MONOIZE_REPLICA_METERING_SPOOL_MAX_BYTES", "0")]),
+            "metering_spool_quota_invalid"
+        );
+        assert_eq!(
+            env_err(&[("MONOIZE_UPSTREAM_PROXY_URL", "socks5://127.0.0.1:1080")]),
+            "upstream_proxy_config_invalid"
+        );
     }
 }
