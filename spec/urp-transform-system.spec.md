@@ -316,6 +316,22 @@ FS-5. When `force_stream` is configured in a provider transform chain for a prov
 
 FS-6. `force_stream` MUST NOT modify `request.input`, `request.tools`, `request.tool_choice`, or any response-phase payload surface.
 
+### 4.5b `set_field`
+
+SF-1. `set_field` MUST support request-phase and response-phase execution.
+
+SF-2. Config MUST contain `path` as a non-empty string and `value` as any JSON value. Config MAY contain `when_equals` as any JSON value.
+
+SF-3. If `when_equals` is absent, `set_field` MUST write `value` at `path` without inspecting the current value.
+
+SF-4. If `when_equals` is present, `set_field` MUST write `value` only when the current value at `path` is exactly equal to `when_equals` under JSON structural equality. A missing path or a different value MUST be a no-op and MUST NOT create intermediate objects.
+
+SF-5. On a request, a path that starts with `reasoning.` MUST target `request.reasoning.extra_body`. Every other path MUST target `request.extra_body`.
+
+SF-6. On a non-stream response, `path` MUST target `response.extra_body`. On a stream event, `path` MUST target the event `extra_body`.
+
+SF-7. A Provider request transform with config `{ "path": "service_tier", "when_equals": "priority", "value": "fast" }` MUST replace only the exact JSON string `"priority"`. The transform MUST preserve an absent value and every other JSON value.
+
 ### 4.6 Image transforms on request ordinary nodes
 
 EOIGT-1. `enable_openai_image_generation_tool` is request-phase only.

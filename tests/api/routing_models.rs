@@ -383,6 +383,7 @@ async fn provider_request_transform_matches_normalized_model_before_redirect() {
 async fn provider_api_type_override_matches_logical_model_before_provider_redirect() {
     let ctx = setup().await;
     seed_test_model_pricing(&ctx.state, &["gpt-5.4-fast", "gpt-5.4"]).await;
+    seed_test_fast_token_rates(&ctx.state).await;
     let (upstream_addr, _, captured_bodies) = start_upstream().await;
     let base_url = format!("http://{upstream_addr}");
 
@@ -436,7 +437,8 @@ async fn provider_api_type_override_matches_logical_model_before_provider_redire
             phase: monoize::transforms::Phase::Request,
             config: json!({
                 "path": "service_tier",
-                "value": "priority"
+                "when_equals": "priority",
+                "value": "fast"
             }),
         }],
         active_probe_enabled_override: None,
@@ -461,6 +463,7 @@ async fn provider_api_type_override_matches_logical_model_before_provider_redire
         "/v1/responses",
         json!({
             "model": "gpt-5.4-fast",
+            "service_tier": "priority",
             "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hello" }] }]
         }),
     )
@@ -477,8 +480,8 @@ async fn provider_api_type_override_matches_logical_model_before_provider_redire
     assert_eq!(upstream_body["model"].as_str(), Some("gpt-5.4"));
     assert_eq!(
         upstream_body["service_tier"].as_str(),
-        Some("priority"),
-        "service_tier should survive whitelist filtering when the logical model selects the responses API type"
+        Some("fast"),
+        "conditional set_field should rewrite the matching service_tier before Responses encoding"
     );
 }
 

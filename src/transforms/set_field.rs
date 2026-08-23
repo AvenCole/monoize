@@ -6,11 +6,34 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::any::Any;
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 struct Config {
     path: String,
     value: Value,
+    #[serde(default)]
+    when_equals: Option<Value>,
+}
+
+fn extra_path_value<'a>(extra: &'a HashMap<String, Value>, path: &str) -> Option<&'a Value> {
+    let mut keys = path.split('.').filter(|key| !key.is_empty());
+    let first = keys.next()?;
+    let mut current = extra.get(first)?;
+    for key in keys {
+        current = current.as_object()?.get(key)?;
+    }
+    Some(current)
+}
+
+fn set_field(extra: &mut HashMap<String, Value>, path: &str, config: &Config) {
+    if config
+        .when_equals
+        .as_ref()
+        .is_none_or(|expected| extra_path_value(extra, path) == Some(expected))
+    {
+        set_extra_path(extra, path, config.value.clone());
+    }
 }
 
 impl TransformConfig for Config {
@@ -36,7 +59,8 @@ impl Transform for SetFieldTransform {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "minLength": 1 },
-                "value": {}
+                "value": {},
+                "when_equals": {}
             },
             "required": ["path", "value"],
             "additionalProperties": false
@@ -68,6 +92,14 @@ impl Transform for SetFieldTransform {
         match data {
             UrpData::Request(req) => {
                 if let Some(sub_path) = cfg.path.strip_prefix("reasoning.") {
+                    if cfg.when_equals.as_ref().is_some_and(|expected| {
+                        req.reasoning
+                            .as_ref()
+                            .and_then(|reasoning| extra_path_value(&reasoning.extra_body, sub_path))
+                            != Some(expected)
+                    }) {
+                        return Ok(());
+                    }
                     let reasoning =
                         req.reasoning
                             .get_or_insert_with(|| crate::urp::ReasoningConfig {
@@ -76,12 +108,10 @@ impl Transform for SetFieldTransform {
                             });
                     set_extra_path(&mut reasoning.extra_body, sub_path, cfg.value.clone());
                 } else {
-                    set_extra_path(&mut req.extra_body, &cfg.path, cfg.value.clone());
+                    set_field(&mut req.extra_body, &cfg.path, cfg);
                 }
             }
-            UrpData::Response(resp) => {
-                set_extra_path(&mut resp.extra_body, &cfg.path, cfg.value.clone())
-            }
+            UrpData::Response(resp) => set_field(&mut resp.extra_body, &cfg.path, cfg),
             UrpData::Stream(event) => match event {
                 crate::urp::UrpStreamEvent::ResponseStart { extra_body, .. }
                 | crate::urp::UrpStreamEvent::ResponseDone { extra_body, .. }
@@ -90,7 +120,7 @@ impl Transform for SetFieldTransform {
                 | crate::urp::UrpStreamEvent::NodeDone { extra_body, .. }
                 | crate::urp::UrpStreamEvent::ProviderControl { extra_body, .. }
                 | crate::urp::UrpStreamEvent::Error { extra_body, .. } => {
-                    set_extra_path(extra_body, &cfg.path, cfg.value.clone());
+                    set_field(extra_body, &cfg.path, cfg);
                 }
             },
         }
@@ -101,3 +131,48 @@ impl Transform for SetFieldTransform {
 inventory::submit!(TransformEntry {
     factory: || Box::new(SetFieldTransform),
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(when_equals: Option<Value>) -> Config {
+        Config {
+            path: "service_tier".to_string(),
+            value: json!("fast"),
+            when_equals,
+        }
+    }
+
+    #[test]
+    fn conditional_set_field_replaces_only_exact_json_value() {
+        let mut matching = HashMap::from([("service_tier".to_string(), json!("priority"))]);
+        set_field(
+            &mut matching,
+            "service_tier",
+            &config(Some(json!("priority"))),
+        );
+        assert_eq!(matching["service_tier"], json!("fast"));
+
+        for preserved in [json!("default"), json!("fast"), json!(null), json!(1)] {
+            let mut extra = HashMap::from([("service_tier".to_string(), preserved.clone())]);
+            set_field(&mut extra, "service_tier", &config(Some(json!("priority"))));
+            assert_eq!(extra["service_tier"], preserved);
+        }
+
+        let mut missing = HashMap::new();
+        set_field(
+            &mut missing,
+            "service_tier",
+            &config(Some(json!("priority"))),
+        );
+        assert!(!missing.contains_key("service_tier"));
+    }
+
+    #[test]
+    fn unconditional_set_field_preserves_existing_behavior() {
+        let mut extra = HashMap::new();
+        set_field(&mut extra, "service_tier", &config(None));
+        assert_eq!(extra["service_tier"], json!("fast"));
+    }
+}
