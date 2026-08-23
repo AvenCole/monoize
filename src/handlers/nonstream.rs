@@ -377,7 +377,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     &path,
                     &upstream_body,
                     attempt.request_timeout_ms.saturating_mul(10).max(600_000),
-                    provider_extra_headers(attempt.provider_type, &upstream_body),
+                    &attempt_extra_headers(&attempt, &upstream_body),
                 )
                 .await;
                 match call {
@@ -471,7 +471,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     &path,
                     form,
                     attempt.request_timeout_ms,
-                    provider_extra_headers(attempt.provider_type, &upstream_body),
+                    &attempt_extra_headers(&attempt, &upstream_body),
                 )
                 .await
                 {
@@ -505,7 +505,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     &path,
                     &upstream_body,
                     attempt.request_timeout_ms,
-                    provider_extra_headers(attempt.provider_type, &upstream_body),
+                    &attempt_extra_headers(&attempt, &upstream_body),
                 )
                 .await
                 .map(|value| (Some(value), None))

@@ -463,6 +463,8 @@ async fn routing_uses_channel_model_multiplier_and_redirect_per_attempt() {
         affinity_failback_delay_seconds_override: None,
 
         proxy_url: None,
+        extra_headers: None,
+        session_affinity_auto: None,
     };
 
     state
@@ -1547,6 +1549,8 @@ async fn resolve_model_suffix_preserves_reasoning_effort_on_attempt_base_request
                 affinity_failback_delay_seconds_override: None,
 
                 proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
             }],
         })
         .await
@@ -1670,6 +1674,8 @@ async fn build_monoize_attempts_rejects_unpriced_models_before_forwarding() {
                 affinity_failback_delay_seconds_override: None,
 
                 proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
             }],
         })
         .await
@@ -1748,6 +1754,8 @@ async fn build_monoize_attempts_rejects_admin_unpriced_models_without_pricing() 
                 affinity_failback_delay_seconds_override: None,
 
                 proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
             }],
         })
         .await
@@ -1825,6 +1833,8 @@ async fn build_monoize_attempts_rejects_admin_missing_server_tool_meter_rate() {
                 affinity_failback_delay_seconds_override: None,
 
                 proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
             }],
         })
         .await
@@ -1905,6 +1915,8 @@ async fn build_monoize_attempts_accepts_redirected_model_when_logical_fallback_i
                 affinity_failback_delay_seconds_override: None,
 
                 proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
             }],
         })
         .await
@@ -2033,6 +2045,8 @@ async fn build_monoize_attempts_uses_metadata_pricing_profile_fallback() {
                 affinity_failback_delay_seconds_override: None,
 
                 proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
             }],
         })
         .await
@@ -2114,6 +2128,8 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
             affinity_failback_delay_seconds_override: None,
 
             proxy_url: None,
+            extra_headers: None,
+            session_affinity_auto: None,
         }],
     )
     .await;
@@ -2151,6 +2167,8 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
             affinity_failback_delay_seconds_override: None,
 
             proxy_url: None,
+            extra_headers: None,
+            session_affinity_auto: None,
         }],
     )
     .await;
@@ -2188,6 +2206,8 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
             affinity_failback_delay_seconds_override: None,
 
             proxy_url: None,
+            extra_headers: None,
+            session_affinity_auto: None,
         }],
     )
     .await;
@@ -2265,6 +2285,8 @@ async fn execute_nonstream_typed_keeps_bad_gateway_when_groups_filter_every_chan
             affinity_failback_delay_seconds_override: None,
 
             proxy_url: None,
+            extra_headers: None,
+            session_affinity_auto: None,
         }],
     )
     .await;
@@ -2411,6 +2433,8 @@ fn affinity_test_attempt(
         affinity_failback_delay_seconds: failback_delay_seconds,
         routing_config_revision: 0,
         proxy_url: None,
+        extra_headers: None,
+        session_affinity_auto: false,
     }
 }
 
@@ -2854,4 +2878,42 @@ fn provider_attempt_budget_survives_affinity_interleaving() {
 
     assert!(!execution.provider_budget_remaining(&provider_b));
     assert!(!execution.provider_budget_remaining(&provider_a));
+}
+
+#[test]
+fn session_affinity_is_stable_within_conversation_and_differs_across_sessions() {
+    let base = serde_json::json!({
+        "model": "cf-model",
+        "messages": [
+            { "role": "system", "content": "You are a helpful assistant." },
+            { "role": "user", "content": "solve task A" }
+        ],
+        "tools": [{ "type": "function", "function": { "name": "calc" } }]
+    });
+    let grown = {
+        let mut body = base.clone();
+        body["messages"].as_array_mut().unwrap().push(
+            serde_json::json!({ "role": "assistant", "content": "working" })
+        );
+        body
+    };
+    let first = routing::derive_session_affinity(&base).unwrap();
+    let second = routing::derive_session_affinity(&grown).unwrap();
+    assert_eq!(first, second, "appending messages must keep affinity stable");
+
+    let other_session = serde_json::json!({
+        "model": "cf-model",
+        "messages": [
+            { "role": "system", "content": "You are a helpful assistant." },
+            { "role": "user", "content": "solve task B" }
+        ]
+    });
+    let other = routing::derive_session_affinity(&other_session).unwrap();
+    assert_ne!(first, other, "distinct sessions must derive distinct affinities");
+}
+
+#[test]
+fn session_affinity_prefers_prompt_cache_key_and_sanitizes() {
+    let keyed = serde_json::json!({ "prompt_cache_key": "  sess-42  " });
+    assert_eq!(routing::derive_session_affinity(&keyed).unwrap(), "sess-42");
 }

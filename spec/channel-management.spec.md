@@ -84,6 +84,14 @@ Channel egress proxy field MAY be present:
 
 - `proxy_url: string | null`. `null`, absent, or empty means "follow global": the channel's upstream requests use the node-local proxy from `MONOIZE_UPSTREAM_PROXY_URL` (`primary-replica-deployment.spec.md` PX-series). A non-empty value is a custom absolute `http://` or `https://` proxy URL used only by this Channel's upstream requests.
 
+Channel static upstream header map MAY be present:
+
+- `extra_headers: Record<string, string> | null`. `null`, absent, or `{}` are equivalent and mean "no extra headers". Otherwise each entry is a static HTTP header injected into every upstream request issued for this Channel, applied after authentication and protocol-specific headers.
+
+Channel automatic session affinity flag MAY be present:
+
+- `session_affinity_auto: boolean | null`. `null`, absent, and `false` are equivalent and mean disabled. When `true`, every proxied upstream request issued for this Channel MUST carry a derived `x-session-affinity` header per CM-AFF-2 unless an explicit value exists per CM-AFF-1.
+
 ## 2. Invariants
 
 CP-INV-1. `channels.length >= 1`.
@@ -115,6 +123,30 @@ CP-INV-12. Every non-null `affinity_failback_delay_seconds_override` MUST be bet
 CP-INV-13. Every non-null `affinity_failback_mode_override` MUST equal `"sticky"` or `"prefer_higher_priority"`.
 
 CP-INV-14. Every non-empty `proxy_url` MUST be an absolute URL with scheme `http` or `https`. Any other value MUST be rejected with HTTP 400 code `invalid_request`. `null`, absent, and empty are equivalent and mean follow-global.
+
+CP-INV-15. Every non-null `extra_headers` value MUST satisfy all of the following; violations MUST be rejected with HTTP 400 code `invalid_request`:
+- at most 16 entries;
+- every key is trimmed non-empty, at most 128 characters, and consists only of HTTP field-name characters matching `[!#$%&'*+\-.^_\x60|~0-9A-Za-z]+`;
+- keys are unique after lowercasing;
+- no key equals, case-insensitively, one of `authorization`, `host`, `content-length`, `content-type`, `transfer-encoding`, `connection`, `keep-alive`, `upgrade`, `expect`, `te`, `trailer`;
+- every value is at most 4096 characters and contains neither CR (`0x0D`) nor LF (`0x0A`).
+
+CP-INV-15a. On persist, the server MUST trim keys and serialize the map as JSON with keys sorted ascending by byte order. An entry whose trimmed key is empty MUST cause rejection under CP-INV-15. Values MUST NOT be trimmed.
+
+CM-HDR-1. Every upstream request issued for a Channel (proxy traffic and the liveness probe of §3.8) MUST send the Channel's persisted `extra_headers` entries in addition to the authentication and protocol-specific headers. When an entry name collides with an authentication or protocol-specific header, the request MUST be rejected at configuration time by CP-INV-15 rather than silently overridden at runtime.
+
+CM-AFF-1. If the Channel `extra_headers` contains an explicit `x-session-affinity` entry, that value MUST be sent verbatim and automatic derivation MUST NOT run.
+
+CM-AFF-2. When `session_affinity_auto` is enabled and CM-AFF-1 does not apply, the gateway MUST derive the header value for each proxied request as follows:
+1. If the upstream body contains a non-empty string `prompt_cache_key`, the value MUST be that string trimmed, restricted to printable ASCII characters (`0x20..=0x7E`), and truncated to 128 characters. If nothing remains after restriction, fall through to rule 2.
+2. Otherwise the value MUST be `"mono-"` followed by the first 16 lowercase hex characters of the SHA-256 digest of the canonical JSON serialization (`serde_json`, key-sorted) of the object:
+   - `instructions`: the body `instructions` string when present, else null;
+   - `system`: the body `system` value when present, else null;
+   - `tools`: the body `tools` array when present and non-empty, else null;
+   - `head`: the first at most 2 entries of the body `messages` array when present, else the body `input` when it is a non-empty array, else null.
+The derivation MUST be a pure function of the request body: identical bodies yield identical values, and appending further messages after position 2 MUST NOT change the value.
+
+CM-AFF-3. Automatic session affinity applies only to proxied traffic. Liveness probes (§3.8) MUST NOT send derived values; explicit static `extra_headers` entries continue to apply there under CM-HDR-1.
 
 Provider group routing semantics:
 
@@ -149,7 +181,7 @@ All endpoints require an authenticated dashboard admin session.
   - `channel_retry_interval_ms?: integer`
   - `circuit_breaker_enabled?: boolean`
   - `per_model_circuit_break?: boolean`
-  - `channels: Array<{ id?: string, name: string, provider_type: ProviderType, base_url: string, api_key: string, weight?: number, enabled?: boolean, models: Record<string, { redirect: string | null, multiplier: string }>, passive_failure_count_threshold_override?: integer | null, passive_window_seconds_override?: integer | null, passive_cooldown_seconds_override?: integer | null, passive_rate_limit_cooldown_seconds_override?: integer | null, active_probe_enabled_override?: boolean | null, active_probe_interval_seconds_override?: integer | null, active_probe_success_threshold_override?: integer | null, active_probe_model_override?: string | null, affinity_enabled_override?: boolean | null, affinity_idle_ttl_seconds_override?: integer | null, affinity_failback_mode_override?: "sticky" | "prefer_higher_priority" | null, affinity_failback_delay_seconds_override?: integer | null }>`
+  - `channels: Array<{ id?: string, name: string, provider_type: ProviderType, base_url: string, api_key: string, weight?: number, enabled?: boolean, models: Record<string, { redirect: string | null, multiplier: string }>, passive_failure_count_threshold_override?: integer | null, passive_window_seconds_override?: integer | null, passive_cooldown_seconds_override?: integer | null, passive_rate_limit_cooldown_seconds_override?: integer | null, active_probe_enabled_override?: boolean | null, active_probe_interval_seconds_override?: integer | null, active_probe_success_threshold_override?: integer | null, active_probe_model_override?: string | null, affinity_enabled_override?: boolean | null, affinity_idle_ttl_seconds_override?: integer | null, affinity_failback_mode_override?: "sticky" | "prefer_higher_priority" | null, affinity_failback_delay_seconds_override?: integer | null, extra_headers?: Record<string, string> | null, session_affinity_auto?: boolean | null }>`
   - `groups?: string[]`
   - `api_type_overrides?: ApiTypeOverride[]`
   - `strip_cross_protocol_nested_extra?: boolean | null`

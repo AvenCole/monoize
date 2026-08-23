@@ -250,3 +250,223 @@ async fn responses_nonstream_usage_preserves_nested_unknown_details() {
     assert!(response["usage"].get("vendor_input_detail").is_none());
     assert!(response["usage"].get("vendor_output_detail").is_none());
 }
+
+#[tokio::test]
+async fn channel_extra_headers_are_sent_to_upstream() {
+    let ctx = setup().await;
+
+    // Build a dedicated provider whose channel carries a static affinity header.
+    let models = HashMap::from([(
+        "cf-affinity-model".to_string(),
+        monoize::monoize_routing::MonoizeModelEntry {
+            redirect: None,
+            multiplier: monoize::exact_decimal::Multiplier::ONE,
+        },
+    )]);
+    let upstream_addr = {
+        // The mock upstream address is embedded in existing channels' base_url.
+        let providers = ctx.state.monoize_store.list_providers().await.unwrap();
+        providers
+            .iter()
+            .flat_map(|provider| provider.channels.iter())
+            .map(|channel| channel.base_url.clone())
+            .next()
+            .expect("at least one channel")
+    };
+    ctx.state
+        .monoize_store
+        .create_provider(monoize::monoize_routing::CreateMonoizeProviderInput {
+            name: "up-cf-affinity".to_string(),
+            api_type_overrides: Vec::new(),
+            groups: Vec::new(),
+            channels: vec![monoize::monoize_routing::CreateMonoizeChannelInput {
+                id: None,
+                name: "cf-affinity-channel".to_string(),
+                provider_type: monoize::monoize_routing::MonoizeProviderType::ChatCompletion,
+                base_url: upstream_addr,
+                api_key: Some("upstream-key".to_string()),
+                weight: 1,
+                enabled: true,
+                passive_failure_count_threshold_override: None,
+                passive_cooldown_seconds_override: None,
+                passive_window_seconds_override: None,
+                passive_rate_limit_cooldown_seconds_override: None,
+                models,
+                active_probe_enabled_override: None,
+                active_probe_interval_seconds_override: None,
+                active_probe_success_threshold_override: None,
+                active_probe_model_override: None,
+                affinity_enabled_override: None,
+                affinity_idle_ttl_seconds_override: None,
+                affinity_failback_mode_override: None,
+                affinity_failback_delay_seconds_override: None,
+                proxy_url: None,
+                extra_headers: Some(std::collections::BTreeMap::from([(
+                    "x-session-affinity".to_string(),
+                    "ses_e2e_001".to_string(),
+                )])),
+                session_affinity_auto: Some(true),
+            }],
+            max_retries: -1,
+            channel_max_retries: 0,
+            channel_retry_interval_ms: 0,
+            circuit_breaker_enabled: false,
+            per_model_circuit_break: false,
+            transforms: Vec::new(),
+            active_probe_enabled_override: None,
+            active_probe_interval_seconds_override: None,
+            active_probe_success_threshold_override: None,
+            active_probe_model_override: None,
+            request_timeout_ms_override: None,
+            extra_fields_whitelist: None,
+            strip_cross_protocol_nested_extra: None,
+            enabled: true,
+            priority: None,
+        })
+        .await
+        .expect("create provider");
+    seed_test_model_pricing(&ctx.state, &["cf-affinity-model"]).await;
+
+    let (status, body) = json_post(
+        &ctx,
+        "/v1/chat/completions",
+        json!({
+            "model": "cf-affinity-model",
+            "messages": [{ "role": "user", "content": "affinity header check" }],
+            "max_completion_tokens": 32
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let headers = ctx.captured_headers.lock().expect("captured headers lock");
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name == "x-session-affinity" && value == "ses_e2e_001"),
+        "x-session-affinity must reach the upstream, got {headers:?}"
+    );
+}
+
+#[tokio::test]
+async fn auto_session_affinity_is_stable_per_conversation_and_distinct_across_sessions() {
+    let ctx = setup().await;
+    let upstream_addr = {
+        let providers = ctx.state.monoize_store.list_providers().await.unwrap();
+        providers
+            .iter()
+            .flat_map(|provider| provider.channels.iter())
+            .map(|channel| channel.base_url.clone())
+            .next()
+            .expect("at least one channel")
+    };
+    ctx.state
+        .monoize_store
+        .create_provider(monoize::monoize_routing::CreateMonoizeProviderInput {
+            name: "up-cf-auto-affinity".to_string(),
+            api_type_overrides: Vec::new(),
+            groups: Vec::new(),
+            channels: vec![monoize::monoize_routing::CreateMonoizeChannelInput {
+                id: None,
+                name: "cf-auto-channel".to_string(),
+                provider_type: monoize::monoize_routing::MonoizeProviderType::ChatCompletion,
+                base_url: upstream_addr,
+                api_key: Some("upstream-key".to_string()),
+                weight: 1,
+                enabled: true,
+                passive_failure_count_threshold_override: None,
+                passive_cooldown_seconds_override: None,
+                passive_window_seconds_override: None,
+                passive_rate_limit_cooldown_seconds_override: None,
+                models: HashMap::from([(
+                    "cf-auto-model".to_string(),
+                    monoize::monoize_routing::MonoizeModelEntry {
+                        redirect: None,
+                        multiplier: monoize::exact_decimal::Multiplier::ONE,
+                    },
+                )]),
+                active_probe_enabled_override: None,
+                active_probe_interval_seconds_override: None,
+                active_probe_success_threshold_override: None,
+                active_probe_model_override: None,
+                affinity_enabled_override: None,
+                affinity_idle_ttl_seconds_override: None,
+                affinity_failback_mode_override: None,
+                affinity_failback_delay_seconds_override: None,
+                proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: Some(true),
+            }],
+            max_retries: -1,
+            channel_max_retries: 0,
+            channel_retry_interval_ms: 0,
+            circuit_breaker_enabled: false,
+            per_model_circuit_break: false,
+            transforms: Vec::new(),
+            active_probe_enabled_override: None,
+            active_probe_interval_seconds_override: None,
+            active_probe_success_threshold_override: None,
+            active_probe_model_override: None,
+            request_timeout_ms_override: None,
+            extra_fields_whitelist: None,
+            strip_cross_protocol_nested_extra: None,
+            enabled: true,
+            priority: None,
+        })
+        .await
+        .expect("create provider");
+    seed_test_model_pricing(&ctx.state, &["cf-auto-model"]).await;
+
+    let turn_one = serde_json::json!({
+        "model": "cf-auto-model",
+        "messages": [
+            { "role": "system", "content": "shared system prompt" },
+            { "role": "user", "content": "session A question" }
+        ],
+        "max_completion_tokens": 32
+    });
+    let mut turn_two = turn_one.clone();
+    turn_two["messages"].as_array_mut().unwrap().push(
+        serde_json::json!({ "role": "assistant", "content": "partial answer" }),
+    );
+
+    for body in [&turn_one, &turn_two] {
+        let (status, resp) = json_post(&ctx, "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+    }
+
+    // Same conversation grown by one turn: identical affinity value twice.
+    let affinities: Vec<String> = {
+        let headers = ctx.captured_headers.lock().expect("captured headers lock");
+        headers
+            .iter()
+            .filter(|(name, _)| name == "x-session-affinity")
+            .map(|(_, value)| value.clone())
+            .collect()
+    };
+    assert_eq!(affinities.len(), 2, "{affinities:?}");
+    assert_eq!(affinities[0], affinities[1]);
+    assert!(affinities[0].starts_with("mono-"), "{affinities:?}");
+
+    // Distinct conversation head derives a distinct affinity.
+    let other = serde_json::json!({
+        "model": "cf-auto-model",
+        "messages": [
+            { "role": "system", "content": "shared system prompt" },
+            { "role": "user", "content": "session B question" }
+        ],
+        "max_completion_tokens": 32
+    });
+    let (status, resp) = json_post(&ctx, "/v1/chat/completions", other).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    let third = {
+        let headers = ctx.captured_headers.lock().expect("captured headers lock");
+        headers
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "x-session-affinity")
+            .map(|(_, value)| value.to_string())
+            .unwrap()
+    };
+    assert_ne!(third, affinities[0]);
+}

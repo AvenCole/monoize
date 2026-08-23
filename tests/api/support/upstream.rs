@@ -71,6 +71,11 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                 lock.push(("x-goog-api-key".to_string(), v.to_string()));
             }
         }
+        if let Some(v) = headers.get("x-session-affinity").and_then(|h| h.to_str().ok()) {
+            if let Ok(mut lock) = captured_headers.lock() {
+                lock.push(("x-session-affinity".to_string(), v.to_string()));
+            }
+        }
         if let Some(resp) = maybe_forced_upstream_error(&body) {
             return resp;
         }
@@ -2588,6 +2593,11 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                 lock.push(("x-goog-api-key".to_string(), v.to_string()));
             }
         }
+        if let Some(v) = headers.get("x-session-affinity").and_then(|h| h.to_str().ok()) {
+            if let Ok(mut lock) = captured_headers.lock() {
+                lock.push(("x-session-affinity".to_string(), v.to_string()));
+            }
+        }
         if let Some(resp) = maybe_forced_upstream_error(&body) {
             return resp;
         }
@@ -3686,6 +3696,11 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                 lock.push(("x-goog-api-key".to_string(), v.to_string()));
             }
         }
+        if let Some(v) = headers.get("x-session-affinity").and_then(|h| h.to_str().ok()) {
+            if let Ok(mut lock) = captured_headers.lock() {
+                lock.push(("x-session-affinity".to_string(), v.to_string()));
+            }
+        }
         if let Some(resp) = maybe_forced_upstream_error(&body) {
             return resp;
         }
@@ -4734,6 +4749,11 @@ async fn start_upstream() -> (SocketAddr, CapturedHeaders, CapturedBodies) {
                 lock.push(("x-goog-api-key".to_string(), v.to_string()));
             }
         }
+        if let Some(v) = headers.get("x-session-affinity").and_then(|h| h.to_str().ok()) {
+            if let Ok(mut lock) = captured_headers.lock() {
+                lock.push(("x-session-affinity".to_string(), v.to_string()));
+            }
+        }
         if let Some(resp) = maybe_forced_upstream_error(&body) {
             return resp;
         }
@@ -5088,7 +5108,10 @@ async fn create_test_provider(
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
             
-                proxy_url: None,}],
+                proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
+                }],
             max_retries: -1,
             channel_max_retries: 0,
             channel_retry_interval_ms: 0,

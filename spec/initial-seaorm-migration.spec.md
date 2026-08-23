@@ -299,6 +299,8 @@ ISM4.12e. Migration `m20260809_000031_request_logs_without_user_fk` requires sou
 ISM4.12f. Migration `m20260823_000033_billing_ledger_delta_dedupe` MUST add nullable TEXT column `idempotency_key` to `billing_ledger` and one partial unique index over that column restricted to non-null values, identically on SQLite and PostgreSQL (`primary-replica-deployment.spec.md` SC1). Existing rows keep NULL. The down migration MUST drop the index then the column.
 
 ISM4.12g. Migration `m20260823_000034_channel_egress_proxy` MUST add nullable TEXT column `proxy_url` to `monoize_channels` on SQLite and PostgreSQL; existing rows MUST read as NULL (follow-global) (`primary-replica-deployment.spec.md` SC3). The down migration MUST drop the column.
+ISM4.12h. Migration `m20260823_000035_channel_extra_headers` MUST add nullable TEXT column `extra_headers` to `monoize_channels` on SQLite and PostgreSQL; existing rows MUST read as NULL (no extra headers) (`channel-management.spec.md` CP-INV-15). The down migration MUST drop the column.
+ISM4.12i. Migration `m20260823_000036_channel_session_affinity_auto` MUST add nullable INTEGER column `session_affinity_auto` to `monoize_channels` on SQLite and PostgreSQL; existing rows MUST read as NULL (disabled) (`channel-management.spec.md` CM-AFF-2). The down migration MUST drop the column.
 
 ISM4.13. Legacy `providers`, `model_mappings`, and `group_members` tables MUST NOT be created.
 

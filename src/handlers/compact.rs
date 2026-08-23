@@ -118,7 +118,7 @@ pub async fn compact_response(
                 "/v1/responses/compact",
                 &upstream_body,
                 attempt.request_timeout_ms,
-                provider_extra_headers(attempt.provider_type, &upstream_body),
+                &attempt_extra_headers(&attempt, &upstream_body),
             )
             .await;
 

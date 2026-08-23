@@ -103,7 +103,7 @@ pub async fn call_upstream_with_timeout_and_headers(
     path: &str,
     body: &Value,
     timeout_ms: u64,
-    extra_headers: &[(&str, &str)],
+    extra_headers: &[(String, String)],
 ) -> Result<Value, UpstreamCallError> {
     let resp = call_upstream_raw_with_timeout_and_headers(
         client,
@@ -152,7 +152,7 @@ pub async fn call_upstream_raw_with_timeout_and_headers(
     path: &str,
     body: &Value,
     timeout_ms: u64,
-    extra_headers: &[(&str, &str)],
+    extra_headers: &[(String, String)],
 ) -> Result<reqwest::Response, UpstreamCallError> {
     let base = provider.base_url.as_ref().ok_or_else(|| {
         UpstreamCallError::new(
@@ -172,7 +172,7 @@ pub async fn call_upstream_raw_with_timeout_and_headers(
     req = apply_auth(req, auth, auth_value)
         .map_err(|err| UpstreamCallError::new(UpstreamErrorKind::Http, None, err.message))?;
     for (k, v) in extra_headers {
-        req = req.header(*k, *v);
+        req = req.header(k, v);
     }
     let resp = req
         .send()
@@ -204,7 +204,7 @@ pub async fn call_upstream_multipart_with_timeout_and_headers(
     path: &str,
     form: reqwest::multipart::Form,
     timeout_ms: u64,
-    extra_headers: &[(&str, &str)],
+    extra_headers: &[(String, String)],
 ) -> Result<reqwest::Response, UpstreamCallError> {
     let base = provider.base_url.as_ref().ok_or_else(|| {
         UpstreamCallError::new(
@@ -224,7 +224,7 @@ pub async fn call_upstream_multipart_with_timeout_and_headers(
     req = apply_auth(req, auth, auth_value)
         .map_err(|err| UpstreamCallError::new(UpstreamErrorKind::Http, None, err.message))?;
     for (k, v) in extra_headers {
-        req = req.header(*k, *v);
+        req = req.header(k, v);
     }
     let resp = req
         .send()

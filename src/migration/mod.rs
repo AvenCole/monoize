@@ -41,6 +41,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260823_000032_billing_plan_subscriptions::Migration),
             Box::new(m20260823_000033_billing_ledger_delta_dedupe::Migration),
             Box::new(m20260823_000034_channel_egress_proxy::Migration),
+            Box::new(m20260823_000035_channel_extra_headers::Migration),
+            Box::new(m20260823_000036_channel_session_affinity_auto::Migration),
         ]
     }
 }
@@ -211,6 +213,8 @@ mod m20260809_000031_request_logs_without_user_fk;
 mod m20260823_000032_billing_plan_subscriptions;
 mod m20260823_000033_billing_ledger_delta_dedupe;
 mod m20260823_000034_channel_egress_proxy;
+mod m20260823_000035_channel_extra_headers;
+mod m20260823_000036_channel_session_affinity_auto;
 
 #[cfg(test)]
 mod tests {

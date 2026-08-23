@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, QueryResult, Value as SeaValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -138,6 +138,12 @@ pub struct MonoizeChannel {
     pub affinity_failback_delay_seconds_override: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// CP-INV-15: static headers injected into every upstream request for this Channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_headers: Option<BTreeMap<String, String>>,
+    /// CM-AFF-2: derive per-request `x-session-affinity` when no explicit value exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_affinity_auto: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub _healthy: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -215,6 +221,12 @@ pub struct CreateMonoizeChannelInput {
     /// CP-INV-14: None/empty = follow-global; Some(url) = custom http(s) egress proxy.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// CP-INV-15: static upstream headers; None/empty map = none.
+    #[serde(default)]
+    pub extra_headers: Option<BTreeMap<String, String>>,
+    /// CM-AFF-2: enable derived per-request session affinity.
+    #[serde(default)]
+    pub session_affinity_auto: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -609,6 +621,107 @@ fn normalized_proxy_url(raw: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// CP-INV-15: reserved header names that must not be overridden by Channel extras.
+const EXTRA_HEADERS_RESERVED: &[&str] = &[
+    "authorization",
+    "host",
+    "content-length",
+    "content-type",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "upgrade",
+    "expect",
+    "te",
+    "trailer",
+];
+
+const EXTRA_HEADERS_MAX_ENTRIES: usize = 16;
+const EXTRA_HEADERS_MAX_KEY_LEN: usize = 128;
+const EXTRA_HEADERS_MAX_VALUE_LEN: usize = 4096;
+
+fn validate_channel_extra_headers(
+    channel_name: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if headers.len() > EXTRA_HEADERS_MAX_ENTRIES {
+        return Err(format!(
+            "channel '{channel_name}' extra_headers must contain at most {EXTRA_HEADERS_MAX_ENTRIES} entries"
+        ));
+    }
+    let mut seen_lower: HashSet<String> = HashSet::new();
+    for (key, value) in headers {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return Err(format!(
+                "channel '{channel_name}' extra_headers key must not be empty"
+            ));
+        }
+        if trimmed.len() > EXTRA_HEADERS_MAX_KEY_LEN {
+            return Err(format!(
+                "channel '{channel_name}' extra_headers key exceeds {EXTRA_HEADERS_MAX_KEY_LEN} characters"
+            ));
+        }
+        let valid_token = trimmed.bytes().all(|byte| {
+            matches!(byte,
+                b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+                | b'^' | b'_' | b'`' | b'|' | b'~'
+                | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
+        });
+        if !valid_token {
+            return Err(format!(
+                "channel '{channel_name}' extra_headers key '{trimmed}' contains invalid characters"
+            ));
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        // Case-insensitive duplicate keys would make the effective value ambiguous.
+        if !seen_lower.insert(lower.clone()) {
+            return Err(format!(
+                "channel '{channel_name}' extra_headers contains duplicate key '{trimmed}'"
+            ));
+        }
+        if EXTRA_HEADERS_RESERVED.contains(&lower.as_str()) {
+            return Err(format!(
+                "channel '{channel_name}' extra_headers key '{trimmed}' is reserved and must not be set"
+            ));
+        }
+        if value.len() > EXTRA_HEADERS_MAX_VALUE_LEN {
+            return Err(format!(
+                "channel '{channel_name}' extra_headers value for '{trimmed}' exceeds {EXTRA_HEADERS_MAX_VALUE_LEN} characters"
+            ));
+        }
+        if value.contains('\r') || value.contains('\n') {
+            return Err(format!(
+                "channel '{channel_name}' extra_headers value for '{trimmed}' must not contain CR or LF"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// CP-INV-15a: trim keys, drop nothing else, canonical JSON with sorted keys;
+/// an empty map persists as NULL.
+fn normalized_extra_headers_json(raw: Option<&BTreeMap<String, String>>) -> Option<String> {
+    let headers = raw?;
+    let mut trimmed: BTreeMap<&str, &String> = BTreeMap::new();
+    for (key, value) in headers {
+        trimmed.insert(key.trim(), value);
+    }
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&trimmed).ok()
+}
+
+fn decode_extra_headers(raw: Option<String>) -> Result<Option<BTreeMap<String, String>>, String> {
+    let Some(text) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| format!("invalid stored extra_headers JSON: {e}"))
+}
+
 fn decode_channel_model_row(row: &QueryResult, model: &str) -> Result<MonoizeChannel, String> {
     let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
     let multiplier = row
@@ -755,6 +868,15 @@ fn decode_channel_row(
             .try_get::<Option<String>>("", "proxy_url")
             .map_err(|e| e.to_string())?
             .filter(|value| !value.trim().is_empty()),
+        extra_headers: decode_extra_headers(
+            row.try_get::<Option<String>>("", "extra_headers")
+                .map_err(|e| e.to_string())?,
+        )?,
+        session_affinity_auto: row
+            .try_get::<Option<i32>>("", "session_affinity_auto")
+            .map_err(|e| e.to_string())?
+            .map(|value| decode_database_bool("channel", &id, "session_affinity_auto", value))
+            .transpose()?,
         _healthy: None,
         _last_success_at: None,
         _health_status: None,
@@ -1053,7 +1175,8 @@ impl MonoizeRoutingStore {
                             active_probe_enabled_override, active_probe_interval_seconds_override,
                             active_probe_success_threshold_override, active_probe_model_override,
                             affinity_enabled_override, affinity_idle_ttl_seconds_override,
-                            affinity_failback_mode_override, affinity_failback_delay_seconds_override
+                            affinity_failback_mode_override, affinity_failback_delay_seconds_override,
+                            proxy_url, extra_headers, session_affinity_auto
                      FROM monoize_channels{provider_filter}
                      ORDER BY created_at ASC"
                 ),
@@ -1258,6 +1381,8 @@ impl MonoizeRoutingStore {
                           c.affinity_enabled_override, c.affinity_idle_ttl_seconds_override,
                           c.affinity_failback_mode_override, c.affinity_failback_delay_seconds_override,
                           c.proxy_url,
+                          c.extra_headers,
+                          c.session_affinity_auto,
                           cm.redirect, cm.multiplier
                    FROM monoize_channels c
                    JOIN monoize_providers p ON p.id = c.provider_id
@@ -1332,6 +1457,7 @@ impl MonoizeRoutingStore {
                           c.active_probe_success_threshold_override, c.active_probe_model_override,
                           c.affinity_enabled_override, c.affinity_idle_ttl_seconds_override,
                           c.affinity_failback_mode_override, c.affinity_failback_delay_seconds_override,
+                          c.proxy_url, c.extra_headers, c.session_affinity_auto,
                           cm.model_name, cm.redirect, cm.multiplier
                    FROM monoize_channels c
                    JOIN monoize_providers p ON p.id = c.provider_id
@@ -1950,12 +2076,15 @@ impl MonoizeRoutingStore {
                         .into(),
                     opt_u64_to_value(input.affinity_failback_delay_seconds_override),
                     normalized_proxy_url(input.proxy_url.as_deref()).into(),
+                    normalized_extra_headers_json(input.extra_headers.as_ref())
+                        .into(),
+                    opt_bool_to_value(input.session_affinity_auto),
                     now.clone().into(),
                     now.clone().into(),
                 ]);
                 rows.push(format!(
                     "({})",
-                    (start..start + 23)
+                    (start..start + 25)
                         .map(|index| format!("${index}"))
                         .collect::<Vec<_>>()
                         .join(", ")
@@ -1972,6 +2101,8 @@ impl MonoizeRoutingStore {
                       affinity_enabled_override, affinity_idle_ttl_seconds_override,
                       affinity_failback_mode_override, affinity_failback_delay_seconds_override,
                       proxy_url,
+                      extra_headers,
+                      session_affinity_auto,
                       created_at, updated_at)
                      VALUES {}",
                     rows.join(", ")
@@ -2122,6 +2253,9 @@ fn validate_channels(
         }
         if c.weight < 0 {
             return Err("channel weight must be >= 0".to_string());
+        }
+        if let Some(headers) = &c.extra_headers {
+            validate_channel_extra_headers(&c.name, headers)?;
         }
         if let Some(v) = c.passive_failure_count_threshold_override {
             if !(1..=i32::MAX as u32).contains(&v) {
@@ -2305,6 +2439,11 @@ pub async fn probe_channel_completion(
     };
     for &(header_name, header_value) in extra_headers {
         request = request.header(header_name, header_value);
+    }
+    if let Some(channel_headers) = &channel.extra_headers {
+        for (header_name, header_value) in channel_headers {
+            request = request.header(header_name, header_value);
+        }
     }
     let result = request.json(&body).send().await;
 
@@ -2954,6 +3093,74 @@ mod tests {
             )
             .unwrap(),
             vec!["alpha".to_string(), "beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn extra_headers_validation_accepts_valid_and_rejects_invalid() {
+        let ok = BTreeMap::from([("x-session-affinity".to_string(), "ses_001".to_string())]);
+        assert!(validate_channel_extra_headers("ch", &ok).is_ok());
+
+        for (name, value) in [("Authorization", "x"), ("CONTENT-TYPE", "application/json")] {
+            let reserved = BTreeMap::from([(name.to_string(), value.to_string())]);
+            assert!(
+                validate_channel_extra_headers("ch", &reserved).is_err(),
+                "reserved header {name} must be rejected"
+            );
+        }
+
+        let dup = BTreeMap::from([
+            ("X-Test".to_string(), "a".to_string()),
+            ("x-test".to_string(), "b".to_string()),
+        ]);
+        assert!(validate_channel_extra_headers("ch", &dup).is_err());
+
+        let crlf = BTreeMap::from([("X-Ok".to_string(), "a\r\nb".to_string())]);
+        assert!(validate_channel_extra_headers("ch", &crlf).is_err());
+
+        let invalid_token = BTreeMap::from([("X Bad Header".to_string(), "v".to_string())]);
+        assert!(validate_channel_extra_headers("ch", &invalid_token).is_err());
+
+        let empty_key = BTreeMap::from([("   ".to_string(), "v".to_string())]);
+        assert!(validate_channel_extra_headers("ch", &empty_key).is_err());
+
+        let too_many: BTreeMap<String, String> = (0..EXTRA_HEADERS_MAX_ENTRIES + 1)
+            .map(|index| (format!("X-H{index}"), "v".to_string()))
+            .collect();
+        assert!(validate_channel_extra_headers("ch", &too_many).is_err());
+    }
+
+    #[test]
+    fn extra_headers_normalization_trims_keys_and_sorts_json() {
+        let raw = BTreeMap::from([
+            ("  Z-Last  ".to_string(), "2".to_string()),
+            ("A-First".to_string(), "1".to_string()),
+        ]);
+        assert_eq!(
+            normalized_extra_headers_json(Some(&raw)).unwrap(),
+            r#"{"A-First":"1","Z-Last":"2"}"#
+        );
+        assert!(normalized_extra_headers_json(None).is_none());
+        assert!(normalized_extra_headers_json(Some(&BTreeMap::new())).is_none());
+    }
+
+    #[test]
+    fn extra_headers_decode_roundtrips_and_rejects_garbage() {
+        assert!(decode_extra_headers(None).unwrap().is_none());
+        assert!(decode_extra_headers(Some("  ".to_string())).unwrap().is_none());
+        let decoded = decode_extra_headers(Some(r#"{"X-A":"1"}"#.to_string()));
+        assert!(decoded.is_ok());
+        assert!(decode_extra_headers(Some("not-json".to_string())).is_err());
+
+        let canonical = normalized_extra_headers_json(Some(&BTreeMap::from([(
+            "X-Session-Affinity".to_string(),
+            "ses_9".to_string(),
+        )])))
+        .unwrap();
+        let round = decode_extra_headers(Some(canonical)).unwrap().unwrap();
+        assert_eq!(
+            round.get("X-Session-Affinity").map(String::as_str),
+            Some("ses_9")
         );
     }
 }

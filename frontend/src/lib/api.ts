@@ -245,6 +245,8 @@ export interface MonoizeChannel {
   affinity_failback_mode_override?: AffinityFailbackMode | null;
   affinity_failback_delay_seconds_override?: number | null;
   proxy_url?: string | null;
+  extra_headers?: Record<string, string> | null;
+  session_affinity_auto?: boolean | null;
   _healthy?: boolean;
   _last_success_at?: string;
   _health_status?: "healthy" | "probing" | "unhealthy";
@@ -306,6 +308,8 @@ export interface CreateMonoizeChannelInput {
   affinity_failback_mode_override?: AffinityFailbackMode | null;
   affinity_failback_delay_seconds_override?: number | null;
   proxy_url?: string | null;
+  extra_headers?: Record<string, string> | null;
+  session_affinity_auto?: boolean | null;
 }
 
 export interface CreateProviderInput {

@@ -38,6 +38,7 @@ import {
 	DialogTitle
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import {
 	Select,
@@ -138,8 +139,29 @@ function channelInput(channel: ChannelRow) {
 		affinity_idle_ttl_seconds_override: optionalPositiveInteger(channel.affinity_idle_ttl_seconds_override),
 		affinity_failback_mode_override: channel.affinity_failback_mode_override,
 		affinity_failback_delay_seconds_override: optionalPositiveInteger(channel.affinity_failback_delay_seconds_override),
-		proxy_url: channel.proxy_url.trim() || null
+		proxy_url: channel.proxy_url.trim() || null,
+		extra_headers: parseExtraHeaders(channel.extra_headers),
+		session_affinity_auto: channel.session_affinity_auto
 	}
+}
+
+function parseExtraHeaders(raw: string): Record<string, string> | null {
+	const text = raw.trim()
+	if (!text) return null
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(text)
+	} catch {
+		throw new Error(c('自定义请求头必须是合法的 JSON 对象', 'Extra headers must be valid JSON'))
+	}
+	if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+		throw new Error(c('自定义请求头必须是 JSON 对象，如 {"x-session-affinity":"ses_001"}', 'Extra headers must be a JSON object, e.g. {"x-session-affinity":"ses_001"}'))
+	}
+	const out: Record<string, string> = {}
+	for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+		out[key.trim()] = String(value)
+	}
+	return Object.keys(out).length > 0 ? out : null
 }
 
 function buildInput(form: ProviderForm): CreateProviderInput {
@@ -565,6 +587,10 @@ function ChannelDetail({ form, activeChannel, selectedChannel, setMobileChannelO
 				<NumberOverride min={0} label={c('回切延迟（秒）', 'Failback delay (seconds)')} value={activeChannel.affinity_failback_delay_seconds_override} placeholder={settings?.monoize_affinity_failback_delay_seconds} onChange={value => updateChannel(selectedChannel, { affinity_failback_delay_seconds_override: value })} />
 				<Field label={c('出口代理', 'Egress proxy')} hint={c('留空跟随节点全局代理；填写 http(s) 代理地址仅对本 Channel 生效', 'Empty follows the node-global proxy; an http(s) URL applies to this channel only')}>
 					<Input value={activeChannel.proxy_url} placeholder='http://proxy:port' onChange={event => updateChannel(selectedChannel, { proxy_url: event.target.value })} />
+				</Field>
+				<NullableBoolean label={c('自动会话亲和', 'Auto session affinity')} value={activeChannel.session_affinity_auto} onChange={value => updateChannel(selectedChannel, { session_affinity_auto: value })} c={c} />
+				<Field label={c('自定义请求头', 'Extra headers')} hint={c('注入到该 Channel 的所有上游请求，例如 Cloudflare 缓存亲和 {"x-session-affinity":"ses_001"}', 'Injected into every upstream request of this channel, e.g. Cloudflare cache affinity {"x-session-affinity":"ses_001"}')} className='sm:col-span-2'>
+					<Textarea value={activeChannel.extra_headers} rows={3} placeholder={'{"x-session-affinity": "ses_001"}'} className='font-mono text-xs' onChange={event => updateChannel(selectedChannel, { extra_headers: event.target.value })} />
 				</Field>
 				<p className='text-xs leading-relaxed text-muted-foreground sm:col-span-2'>
 					{c('“保持当前 Channel”会让同一 Agent Thread 持续使用回落后的 Channel；“优先级恢复”在延迟结束后，遇到更高优先级 Provider 恢复时按正常顺序重新选择。', '“Keep current channel” keeps an Agent thread on its fallback channel. “Prefer higher priority” returns to normal ordering after the delay when an earlier provider becomes eligible.')}

@@ -824,6 +824,10 @@ struct MonoizeAttempt {
     routing_config_revision: u64,
     /// PX6: per-Channel egress proxy override (None = follow node-global).
     proxy_url: Option<String>,
+    /// CP-INV-15: static upstream headers configured on the Channel.
+    extra_headers: Option<std::collections::BTreeMap<String, String>>,
+    /// CM-AFF-2: derive per-request session affinity for this Channel.
+    session_affinity_auto: bool,
 }
 
 fn reasoning_envelope_provider_type(provider_type: ProviderType) -> &'static str {

@@ -133,6 +133,8 @@ mod tests {
                     affinity_failback_delay_seconds_override: None,
 
                     proxy_url: None,
+                    extra_headers: None,
+                    session_affinity_auto: None,
                 }],
                 transforms: Vec::new(),
                 api_type_overrides: Vec::new(),

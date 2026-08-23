@@ -39,6 +39,8 @@ export type ChannelRow = {
 	affinity_failback_mode_override: AffinityFailbackMode | null
 	affinity_failback_delay_seconds_override: string
 	proxy_url: string
+	extra_headers: string
+	session_affinity_auto: boolean | null
 	_health_status?: 'healthy' | 'probing' | 'unhealthy'
 }
 
@@ -115,6 +117,8 @@ export function emptyChannelRow(): ChannelRow {
 		affinity_failback_mode_override: null,
 		affinity_failback_delay_seconds_override: '',
 		proxy_url: '',
+		extra_headers: '',
+		session_affinity_auto: null,
 		_health_status: undefined
 	}
 }
@@ -190,6 +194,8 @@ export function fromProvider(provider: Provider): ProviderForm {
 			affinity_failback_mode_override: channel.affinity_failback_mode_override ?? null,
 			affinity_failback_delay_seconds_override: channel.affinity_failback_delay_seconds_override == null ? '' : String(channel.affinity_failback_delay_seconds_override),
 			proxy_url: channel.proxy_url ?? '',
+			extra_headers: channel.extra_headers && Object.keys(channel.extra_headers).length > 0 ? JSON.stringify(channel.extra_headers, null, 2) : '',
+			session_affinity_auto: channel.session_affinity_auto ?? null,
 			_health_status: channel._health_status
 		})),
 		transforms: provider.transforms ?? [],

@@ -669,6 +669,8 @@ pub(super) async fn collect_provider_attempts(
             affinity_failback_delay_seconds,
             routing_config_revision,
             proxy_url: channel.proxy_url.clone(),
+            extra_headers: channel.extra_headers.clone(),
+            session_affinity_auto: channel.session_affinity_auto.unwrap_or(false),
         });
     }
 }
@@ -825,6 +827,86 @@ pub(super) fn provider_extra_headers(
         ProviderType::Replicate => &[("prefer", "wait=60")],
         _ => &[],
     }
+}
+
+/// CM-HDR-1 + CM-AFF-1/2: protocol headers first, then the Channel's static
+/// `extra_headers`, then a derived `x-session-affinity` when the Channel
+/// enables automatic session affinity and no explicit value was configured.
+pub(super) fn attempt_extra_headers(
+    attempt: &MonoizeAttempt,
+    body: &serde_json::Value,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = provider_extra_headers(attempt.provider_type, body)
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect();
+    if let Some(extras) = &attempt.extra_headers {
+        for (name, value) in extras {
+            out.push((name.clone(), value.clone()));
+        }
+    }
+    if attempt.session_affinity_auto
+        && !out
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-session-affinity"))
+        && let Some(value) = derive_session_affinity(body)
+    {
+        out.push(("x-session-affinity".to_string(), value));
+    }
+    out
+}
+
+const SESSION_AFFINITY_MAX_KEY_CHARS: usize = 128;
+const SESSION_AFFINITY_HEX_LEN: usize = 16;
+
+/// CM-AFF-2: pure function of the request body. `prompt_cache_key` wins when
+/// present; otherwise a digest over the stable conversation head (instructions,
+/// system, tools, and the first two history entries) so that appending further
+/// messages within one session keeps the same affinity while distinct sessions
+/// spread across instances.
+pub(super) fn derive_session_affinity(body: &serde_json::Value) -> Option<String> {
+    use sha2::Digest;
+
+    if let Some(key) = body.get("prompt_cache_key").and_then(Value::as_str) {
+        let sanitized: String = key
+            .trim()
+            .chars()
+            .filter(|c| ('\u{20}'..='\u{7e}').contains(c))
+            .take(SESSION_AFFINITY_MAX_KEY_CHARS)
+            .collect();
+        if !sanitized.is_empty() {
+            return Some(sanitized);
+        }
+    }
+
+    let head: Option<Value> = ["messages", "input"].iter().find_map(|field| {
+        let items = body.get(*field)?.as_array()?;
+        if items.is_empty() {
+            return None;
+        }
+        Some(Value::Array(items.iter().take(2).cloned().collect()))
+    });
+
+    let payload = serde_json::json!({
+        "head": head.unwrap_or(Value::Null),
+        "instructions": body
+            .get("instructions")
+            .filter(|value| value.is_string())
+            .cloned()
+            .unwrap_or(Value::Null),
+        "system": body.get("system").cloned().unwrap_or(Value::Null),
+        "tools": body
+            .get("tools")
+            .and_then(Value::as_array)
+            .filter(|tools| !tools.is_empty())
+            .map(|tools| Value::Array(tools.clone()))
+            .unwrap_or(Value::Null),
+    });
+    let digest = sha2::Sha256::digest(serde_json::to_string(&payload).ok()?);
+    let prefix = u64::from_be_bytes([
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ]);
+    Some(format!("mono-{prefix:016x}"))
 }
 
 fn messages_body_uses_files_api(value: &serde_json::Value) -> bool {

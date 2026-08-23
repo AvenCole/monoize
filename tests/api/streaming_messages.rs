@@ -612,6 +612,8 @@ async fn messages_streaming_plaintext_reasoning_to_summary_preserves_thinking_de
                 affinity_failback_delay_seconds_override: None,
 
                 proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
             }],
             max_retries: -1,
             channel_max_retries: 0,
@@ -1289,6 +1291,8 @@ async fn messages_stream_passthrough_transform_preserves_plaintext_reasoning_chu
                 affinity_failback_delay_seconds_override: None,
 
                 proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
             }],
             max_retries: -1,
             channel_max_retries: 0,

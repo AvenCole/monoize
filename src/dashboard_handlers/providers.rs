@@ -1113,6 +1113,8 @@ mod tests {
                 affinity_failback_delay_seconds_override: None,
 
                 proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
             }],
             groups: Vec::new(),
             transforms: Vec::new(),

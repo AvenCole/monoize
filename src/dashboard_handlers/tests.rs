@@ -258,6 +258,8 @@ fn dashboard_provider_response_includes_groups_and_channel_hides_api_key() {
         _health_status: None,
 
         proxy_url: None,
+        extra_headers: None,
+        session_affinity_auto: None,
     };
 
     let provider = MonoizeProvider {

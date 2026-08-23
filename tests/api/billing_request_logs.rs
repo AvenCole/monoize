@@ -1467,6 +1467,8 @@ async fn billing_model_field_does_not_affect_upstream_charge() {
                 affinity_failback_delay_seconds_override: None,
 
                 proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
             }],
             max_retries: -1,
             channel_max_retries: 0,
@@ -1617,6 +1619,8 @@ async fn redirected_model_pricing_falls_back_to_logical_model_when_upstream_unpr
                 affinity_failback_delay_seconds_override: None,
 
                 proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
             }],
             max_retries: -1,
             channel_max_retries: 0,
@@ -1767,6 +1771,8 @@ async fn suffixed_model_pricing_uses_base_model_metadata_without_separate_alias_
                 affinity_failback_delay_seconds_override: None,
 
                 proxy_url: None,
+                extra_headers: None,
+                session_affinity_auto: None,
             }],
             max_retries: -1,
             channel_max_retries: 0,
