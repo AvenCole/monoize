@@ -554,7 +554,8 @@ async fn responses_nonstream_collects_completed_snapshot_image_generation_result
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
-            }],
+            
+            proxy_url: None,}],
             max_retries: -1,
             channel_max_retries: 0,
             channel_retry_interval_ms: 0,

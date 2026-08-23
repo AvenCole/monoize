@@ -43,6 +43,7 @@ mod tests {
             metrics_path: "/metrics".to_string(),
             database_dsn: "sqlite::memory:".to_string(),
             request_log_spool_dir: None,
+            node: crate::node_config::NodeSettings::primary_default(),
         })
         .await
         .expect("state loads");
@@ -130,6 +131,8 @@ mod tests {
                     affinity_idle_ttl_seconds_override: None,
                     affinity_failback_mode_override: None,
                     affinity_failback_delay_seconds_override: None,
+
+                    proxy_url: None,
                 }],
                 transforms: Vec::new(),
                 api_type_overrides: Vec::new(),

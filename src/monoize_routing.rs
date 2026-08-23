@@ -137,6 +137,8 @@ pub struct MonoizeChannel {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub affinity_failback_delay_seconds_override: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub _healthy: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub _last_success_at: Option<String>,
@@ -210,6 +212,9 @@ pub struct CreateMonoizeChannelInput {
     pub affinity_failback_mode_override: Option<AffinityFailbackMode>,
     #[serde(default)]
     pub affinity_failback_delay_seconds_override: Option<u64>,
+    /// CP-INV-14: None/empty = follow-global; Some(url) = custom http(s) egress proxy.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -597,6 +602,13 @@ fn generate_short_id() -> String {
         .collect()
 }
 
+/// CP-INV-14: trim and treat empty as NULL (follow-global).
+fn normalized_proxy_url(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn decode_channel_model_row(row: &QueryResult, model: &str) -> Result<MonoizeChannel, String> {
     let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
     let multiplier = row
@@ -739,6 +751,10 @@ fn decode_channel_row(
                 )
             })
             .transpose()?,
+        proxy_url: row
+            .try_get::<Option<String>>("", "proxy_url")
+            .map_err(|e| e.to_string())?
+            .filter(|value| !value.trim().is_empty()),
         _healthy: None,
         _last_success_at: None,
         _health_status: None,
@@ -877,6 +893,12 @@ impl MonoizeRoutingStore {
         let store = Self { db };
         store.migrate_transform_rule_ids().await?;
         Ok(store)
+    }
+
+    /// Replica-side constructor per PRP11: skips canonicalization writes that the
+    /// primary already performed on the shared database.
+    pub async fn new_read_only(db: DbPool) -> Result<Self, String> {
+        Ok(Self { db })
     }
 
     async fn migrate_transform_rule_ids(&self) -> Result<(), String> {
@@ -1235,6 +1257,7 @@ impl MonoizeRoutingStore {
                           c.active_probe_success_threshold_override, c.active_probe_model_override,
                           c.affinity_enabled_override, c.affinity_idle_ttl_seconds_override,
                           c.affinity_failback_mode_override, c.affinity_failback_delay_seconds_override,
+                          c.proxy_url,
                           cm.redirect, cm.multiplier
                    FROM monoize_channels c
                    JOIN monoize_providers p ON p.id = c.provider_id
@@ -1926,12 +1949,13 @@ impl MonoizeRoutingStore {
                         .map(|mode| mode.as_str().to_string())
                         .into(),
                     opt_u64_to_value(input.affinity_failback_delay_seconds_override),
+                    normalized_proxy_url(input.proxy_url.as_deref()).into(),
                     now.clone().into(),
                     now.clone().into(),
                 ]);
                 rows.push(format!(
                     "({})",
-                    (start..start + 22)
+                    (start..start + 23)
                         .map(|index| format!("${index}"))
                         .collect::<Vec<_>>()
                         .join(", ")
@@ -1947,6 +1971,7 @@ impl MonoizeRoutingStore {
                       active_probe_success_threshold_override, active_probe_model_override,
                       affinity_enabled_override, affinity_idle_ttl_seconds_override,
                       affinity_failback_mode_override, affinity_failback_delay_seconds_override,
+                      proxy_url,
                       created_at, updated_at)
                      VALUES {}",
                     rows.join(", ")

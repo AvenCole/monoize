@@ -4,7 +4,7 @@ use crate::monoize_routing::AffinityFailbackMode;
 use crate::transforms::{TransformRuleConfig, canonicalize_transform_rules};
 use crate::users::ModelRedirectRule;
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, sea_query::OnConflict};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, sea_query::OnConflict};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -238,6 +238,12 @@ impl SettingsStore {
         store.ensure_defaults().await?;
         store.migrate_transform_rule_ids().await?;
         Ok(store)
+    }
+
+    /// Replica-side constructor per PRP11: performs no writes because defaults and
+    /// canonicalization markers are guaranteed to exist once the primary has started.
+    pub async fn new_read_only(db: DbPool) -> Result<Self, String> {
+        Ok(Self { db })
     }
 
     async fn ensure_defaults(&self) -> Result<(), String> {
@@ -832,6 +838,7 @@ impl SettingsStore {
             .exec(&*transaction)
             .await
             .map_err(|e| e.to_string())?;
+        bump_config_epoch_in_tx(&self.db, &transaction).await?;
         transaction.commit().await.map_err(|e| e.to_string())?;
         settings.updated_at = committed_at;
         Ok(settings)
@@ -884,12 +891,118 @@ impl SettingsStore {
         &self,
         patterns: &[PricingProfilePattern],
     ) -> Result<(), String> {
-        self.set(
-            "pricing_profile_model_patterns",
-            &serde_json::to_string(patterns).map_err(|e| e.to_string())?,
-        )
-        .await
+        // E2: the point mutation and its epoch increment commit in one transaction.
+        let transaction = self.db.begin_write().await.map_err(|e| e.to_string())?;
+        let now = Utc::now().to_rfc3339();
+        let model = system_settings::ActiveModel {
+            key: Set("pricing_profile_model_patterns".to_string()),
+            value: Set(serde_json::to_string(patterns).map_err(|e| e.to_string())?),
+            updated_at: Set(now),
+        };
+        system_settings::Entity::insert(model)
+            .on_conflict(
+                OnConflict::column(system_settings::Column::Key)
+                    .update_columns([
+                        system_settings::Column::Value,
+                        system_settings::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&*transaction)
+            .await
+            .map_err(|e| e.to_string())?;
+        bump_config_epoch_in_tx(&self.db, &transaction).await?;
+        transaction.commit().await.map_err(|e| e.to_string())
     }
+}
+
+pub(crate) const CONFIG_EPOCH_TENANT: &str = "monoize";
+pub(crate) const CONFIG_EPOCH_KIND: &str = "config_epoch";
+pub(crate) const CONFIG_EPOCH_ID: &str = "global";
+
+/// E3 read path on a replica: exactly one row, one column.
+pub async fn read_config_epoch(db: &DbPool) -> Result<u64, String> {
+    let rows = db
+        .read()
+        .query_all(db.stmt(
+            "SELECT value FROM state_records WHERE tenant_id = $1 AND kind = $2 AND id = $3",
+            vec![
+                CONFIG_EPOCH_TENANT.into(),
+                CONFIG_EPOCH_KIND.into(),
+                CONFIG_EPOCH_ID.into(),
+            ],
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    match rows.first() {
+        None => Ok(0),
+        Some(row) => row
+            .try_get::<String>("", "value")
+            .map_err(|e| format!("invalid config epoch row: {e}"))?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("invalid config epoch value: {error}")),
+    }
+}
+
+/// E2 write path on the primary: increments the epoch inside the caller's open
+/// transaction. Safe against lost updates because every caller runs under the
+/// process-local settings-update lock (DB22), making the read-modify-write serialized.
+pub(crate) async fn bump_config_epoch_in_tx(
+    db: &DbPool,
+    tx: &sea_orm::DatabaseTransaction,
+) -> Result<(), String> {
+    let current = {
+        let rows = tx
+            .query_all(db.stmt(
+                "SELECT value FROM state_records WHERE tenant_id = $1 AND kind = $2 AND id = $3",
+                vec![
+                    CONFIG_EPOCH_TENANT.into(),
+                    CONFIG_EPOCH_KIND.into(),
+                    CONFIG_EPOCH_ID.into(),
+                ],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        match rows.first() {
+            None => 0u64,
+            Some(row) => row
+                .try_get::<String>("", "value")
+                .map_err(|e| format!("invalid config epoch row: {e}"))?
+                .trim()
+                .parse::<u64>()
+                .map_err(|error| format!("invalid config epoch value: {error}"))?,
+        }
+    };
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| "config epoch overflow".to_string())?;
+    let result = tx
+        .execute(db.stmt(
+            "UPDATE state_records SET value = $4 WHERE tenant_id = $1 AND kind = $2 AND id = $3",
+            vec![
+                CONFIG_EPOCH_TENANT.into(),
+                CONFIG_EPOCH_KIND.into(),
+                CONFIG_EPOCH_ID.into(),
+                next.to_string().into(),
+            ],
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    if result.rows_affected() == 0 {
+        tx.execute(db.stmt(
+            "INSERT INTO state_records (tenant_id, kind, id, value, expires_at) VALUES ($1, $2, $3, $4, NULL)",
+            vec![
+                CONFIG_EPOCH_TENANT.into(),
+                CONFIG_EPOCH_KIND.into(),
+                CONFIG_EPOCH_ID.into(),
+                next.to_string().into(),
+            ],
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn decode_registration_enabled(raw: &str) -> Result<bool, String> {

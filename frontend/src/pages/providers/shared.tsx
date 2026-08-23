@@ -38,6 +38,7 @@ export type ChannelRow = {
 	affinity_idle_ttl_seconds_override: string
 	affinity_failback_mode_override: AffinityFailbackMode | null
 	affinity_failback_delay_seconds_override: string
+	proxy_url: string
 	_health_status?: 'healthy' | 'probing' | 'unhealthy'
 }
 
@@ -113,6 +114,7 @@ export function emptyChannelRow(): ChannelRow {
 		affinity_idle_ttl_seconds_override: '',
 		affinity_failback_mode_override: null,
 		affinity_failback_delay_seconds_override: '',
+		proxy_url: '',
 		_health_status: undefined
 	}
 }
@@ -187,6 +189,7 @@ export function fromProvider(provider: Provider): ProviderForm {
 			affinity_idle_ttl_seconds_override: channel.affinity_idle_ttl_seconds_override == null ? '' : String(channel.affinity_idle_ttl_seconds_override),
 			affinity_failback_mode_override: channel.affinity_failback_mode_override ?? null,
 			affinity_failback_delay_seconds_override: channel.affinity_failback_delay_seconds_override == null ? '' : String(channel.affinity_failback_delay_seconds_override),
+			proxy_url: channel.proxy_url ?? '',
 			_health_status: channel._health_status
 		})),
 		transforms: provider.transforms ?? [],

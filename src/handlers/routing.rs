@@ -6,8 +6,15 @@ pub(crate) fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-pub(super) fn client_http(state: &AppState) -> &reqwest::Client {
-    &state.http
+/// PX6/PX7: effective outbound client for one attempt's Channel (custom proxy wins,
+/// then node-global, else direct).
+pub(super) fn client_http_for_attempt(
+    state: &AppState,
+    attempt: &MonoizeAttempt,
+) -> reqwest::Client {
+    state
+        .http_clients
+        .for_channel_proxy(attempt.proxy_url.as_deref())
 }
 
 pub(crate) fn health_key(channel_id: &str, model: Option<&str>) -> String {
@@ -653,6 +660,7 @@ pub(super) async fn collect_provider_attempts(
             affinity_failback_mode,
             affinity_failback_delay_seconds,
             routing_config_revision,
+            proxy_url: channel.proxy_url.clone(),
         });
     }
 }

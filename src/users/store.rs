@@ -297,6 +297,25 @@ impl UserStore {
         pending_request_logs: Arc<dashmap::DashMap<String, super::InsertRequestLog>>,
         request_log_spool_dir: Option<std::path::PathBuf>,
     ) -> Result<Self, String> {
+        Self::new_for_role(
+            db,
+            log_broadcast,
+            pending_request_logs,
+            request_log_spool_dir,
+            false,
+        )
+        .await
+    }
+
+    /// `is_replica` skips the startup write passes (PRP11): transform-id canonicalization,
+    /// key-hash backfill, and expired-session deletion are primary responsibilities.
+    pub async fn new_for_role(
+        db: crate::db::DbPool,
+        log_broadcast: tokio::sync::broadcast::Sender<Vec<super::InsertRequestLog>>,
+        pending_request_logs: Arc<dashmap::DashMap<String, super::InsertRequestLog>>,
+        request_log_spool_dir: Option<std::path::PathBuf>,
+        is_replica: bool,
+    ) -> Result<Self, String> {
         use std::time::Duration;
         let store = Self {
             db,
@@ -312,9 +331,11 @@ impl UserStore {
             registration_lock: Arc::new(tokio::sync::Mutex::new(())),
             api_key_creation_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
-        store.migrate_transform_rule_ids().await?;
-        store.migrate_api_key_lookup_hashes().await?;
-        store.cleanup_expired_sessions().await?;
+        if !is_replica {
+            store.migrate_transform_rule_ids().await?;
+            store.migrate_api_key_lookup_hashes().await?;
+            store.cleanup_expired_sessions().await?;
+        }
         Ok(store)
     }
 
@@ -517,18 +538,29 @@ impl UserStore {
     }
 
     pub fn spawn_background_tasks(&self) {
-        self.last_used_batcher
-            .clone()
-            .spawn_flush_task(self.db.clone(), std::time::Duration::from_secs(30));
-        self.request_log_batcher
-            .clone()
-            .spawn_flush_task(self.db.clone(), std::time::Duration::from_secs(2));
+        self.spawn_background_tasks_for_role(false);
+    }
+
+    /// On a replica the DB flush loops, session cleanup, and log retention loops are
+    /// replaced by the shipment pipeline (`primary-replica-deployment.spec.md` PRP12).
+    pub fn spawn_background_tasks_for_role(&self, is_replica: bool) {
+        if !is_replica {
+            self.last_used_batcher
+                .clone()
+                .spawn_flush_task(self.db.clone(), std::time::Duration::from_secs(30));
+            self.request_log_batcher
+                .clone()
+                .spawn_flush_task(self.db.clone(), std::time::Duration::from_secs(2));
+        }
         self.api_key_cache
             .clone()
             .spawn_eviction_task(std::time::Duration::from_secs(30));
         self.balance_cache
             .clone()
             .spawn_eviction_task(std::time::Duration::from_secs(30));
+        if is_replica {
+            return;
+        }
         let store = self.clone();
         tokio::spawn(async move {
             loop {
@@ -550,6 +582,16 @@ impl UserStore {
                 }
             }
         });
+    }
+
+    /// Replica shipment pipeline access (PRP12/M4).
+    pub fn last_used_batcher_clone(&self) -> crate::db_cache::LastUsedBatcher {
+        self.last_used_batcher.clone()
+    }
+
+    /// Replica shipment pipeline access (PRP12/M4).
+    pub fn request_log_batcher_clone(&self) -> crate::db_cache::RequestLogBatcher {
+        self.request_log_batcher.clone()
     }
 
     pub async fn flush_all_batchers(&self) {

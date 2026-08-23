@@ -18,6 +18,7 @@ async fn setup() -> TestContext {
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+        node: monoize::node_config::NodeSettings::primary_default(),
     })
     .await
     .expect("state loads");

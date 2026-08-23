@@ -370,7 +370,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     .stream_idle_timeout_ms
                     .max(1);
                 let call = upstream::call_upstream_raw_with_timeout_and_headers(
-                    client_http(state),
+                    &client_http_for_attempt(state, &attempt),
                     &provider,
                     &attempt.api_key,
                     &path,
@@ -463,7 +463,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     }
                 };
                 match upstream::call_upstream_multipart_with_timeout_and_headers(
-                    client_http(state),
+                    &client_http_for_attempt(state, &attempt),
                     &provider,
                     &attempt.api_key,
                     &path,
@@ -496,7 +496,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                 }
             } else {
                 upstream::call_upstream_with_timeout_and_headers(
-                    client_http(state),
+                    &client_http_for_attempt(state, &attempt),
                     &provider,
                     &attempt.api_key,
                     &path,

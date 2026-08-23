@@ -346,7 +346,7 @@ pub(super) async fn forward_stream_typed(
                 let path =
                     upstream_path_for_model(attempt.provider_type, &req_attempt.model, false);
                 let call = upstream::call_upstream_with_timeout_and_headers(
-                    client_http(&state),
+                    &client_http_for_attempt(&state, &attempt),
                     &provider,
                     &attempt.api_key,
                     &path,
@@ -748,7 +748,7 @@ pub(super) async fn forward_stream_typed(
             let provider = build_channel_provider_config(&attempt);
             let path = upstream_path_for_model(attempt.provider_type, &req_attempt.model, true);
             let call = upstream::call_upstream_raw_with_timeout_and_headers(
-                client_http(&state),
+                &client_http_for_attempt(&state, &attempt),
                 &provider,
                 &attempt.api_key,
                 &path,

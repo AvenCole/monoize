@@ -452,12 +452,36 @@ pub async fn get_provider(
     Ok(Json(provider_with_runtime(&state, provider).await))
 }
 
+/// CP-INV-14: non-empty channel `proxy_url` must be an absolute http(s) URL.
+#[allow(clippy::result_large_err)]
+fn validate_channel_proxy_urls<'a>(
+    channels: impl IntoIterator<Item = &'a crate::monoize_routing::CreateMonoizeChannelInput>,
+) -> AppResult<()> {
+    for channel in channels {
+        if let Some(url) = channel
+            .proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            && let Err(detail) = crate::node_config::validate_http_proxy_url(url)
+        {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("channel '{}' has invalid proxy_url: {detail}", channel.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub async fn create_provider(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CreateMonoizeProviderInput>,
 ) -> AppResult<impl IntoResponse> {
     require_admin(&headers, &state).await?;
+    validate_channel_proxy_urls(body.channels.iter())?;
 
     let provider = state
         .monoize_store
@@ -480,6 +504,9 @@ pub async fn update_provider(
     Json(body): Json<UpdateMonoizeProviderInput>,
 ) -> AppResult<impl IntoResponse> {
     require_admin(&headers, &state).await?;
+    if let Some(channels) = body.channels.as_ref() {
+        validate_channel_proxy_urls(channels.iter())?;
+    }
 
     let prev_provider = state
         .monoize_store
@@ -853,8 +880,12 @@ pub async fn test_channel(
         .unwrap_or_else(|| model_name.clone());
 
     let started_at = std::time::Instant::now();
+    // PX6: the connectivity test uses the channel's effective proxy resolution.
+    let test_http = state
+        .http_clients
+        .for_channel_proxy(channel.proxy_url.as_deref());
     let (ok, _usage) = crate::monoize_routing::probe_channel_completion(
-        &state.http,
+        &test_http,
         channel,
         request_timeout_ms,
         &upstream_model,
@@ -1073,6 +1104,8 @@ mod tests {
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
+
+                proxy_url: None,
             }],
             groups: Vec::new(),
             transforms: Vec::new(),
@@ -1231,6 +1264,7 @@ mod tests {
             metrics_path: "/metrics".to_string(),
             database_dsn: "sqlite::memory:".to_string(),
             request_log_spool_dir: None,
+            node: crate::node_config::NodeSettings::primary_default(),
         })
         .await
         .expect("state loads");

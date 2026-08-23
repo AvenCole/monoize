@@ -85,7 +85,7 @@ DB15. `stmt()` MUST pass SQL through unchanged when `backend == DbBackend::Postg
 
 ## 6. Automatic Schema Migration
 
-DB16. On startup, after `DbPool::connect()` succeeds, the application MUST acquire the database write guard and call `run_startup_migrations(&*write_guard)`.
+DB16. On startup, when the node role is `primary` (`primary-replica-deployment.spec.md` PRP1), after `DbPool::connect()` succeeds, the application MUST acquire the database write guard and call `run_startup_migrations(&*write_guard)`. When the node role is `replica`, no migration MUST run and startup follows the read-only verification in `primary-replica-deployment.spec.md` PRP10.
 
 DB16a. `run_startup_migrations` MUST compare the complete set of applied version names in `seaql_migrations` with the ordered version names returned by the embedded `Migrator::migrations()` list.
 
@@ -194,7 +194,7 @@ DB23. A settings update MUST read its base state after every earlier settings up
 
 DB23a. One dashboard settings update MUST write all changed `system_settings` rows in one database transaction. If any row write or commit fails, no row from that update may remain committed and `monoize_runtime` MUST remain unchanged.
 
-DB23b. After the transaction commits, Monoize MUST construct and publish `monoize_runtime` from the committed values before returning success. The supported single-process writer model is defined by `unified_responses_proxy.spec.md` C6.
+DB23b. After the transaction commits, Monoize MUST construct and publish `monoize_runtime` from the committed values before returning success. The supported writer model is one `primary`-role process per deployment, defined by `unified_responses_proxy.spec.md` C6; replicas obtain equivalent snapshots via `primary-replica-deployment.spec.md` E3.
 
 DB23c. `monoize_runtime` MUST contain the committed `reasoning_suffix_map`, `pricing_profile_model_patterns`, and `codex_model_ids`. A forwarding request MUST clone the suffix and pricing values from one runtime read and MUST NOT query `system_settings` for either value. `GET /v1/models` MUST clone `codex_model_ids` from the runtime snapshot and MUST NOT load all settings. The dedicated pricing-pattern mutation MUST publish its committed pattern list before returning success.
 

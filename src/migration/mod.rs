@@ -38,6 +38,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260809_000029_sessions_expires_at_index::Migration),
             Box::new(m20260809_000030_normalize_billing_json_nulls::Migration),
             Box::new(m20260809_000031_request_logs_without_user_fk::Migration),
+            Box::new(m20260823_000032_billing_ledger_delta_dedupe::Migration),
+            Box::new(m20260823_000033_channel_egress_proxy::Migration),
         ]
     }
 }
@@ -108,6 +110,37 @@ fn startup_migration_decision(
     })
 }
 
+/// PRP10 (`primary-replica-deployment.spec.md`): read-only schema currency check for
+/// replicas. Returns Err only when embedded migrations are still pending (the database
+/// must first be migrated by the primary); never writes.
+pub async fn verify_schema_current(db: &sea_orm::DatabaseConnection) -> Result<(), DbErr> {
+    let embedded = Migrator::migrations()
+        .into_iter()
+        .map(|migration| migration.name().to_string())
+        .collect::<Vec<_>>();
+    let applied = Migrator::get_migration_models(db)
+        .await?
+        .into_iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    match startup_migration_decision(&embedded, &applied)? {
+        StartupMigrationDecision::RunEmbedded => {
+            Err(DbErr::Custom("replica_schema_pending".to_string()))
+        }
+        StartupMigrationDecision::AcceptNewerApplied {
+            newest_embedded,
+            newer_applied,
+        } => {
+            tracing::warn!(
+                newest_embedded_version = %newest_embedded,
+                newer_applied_versions = ?newer_applied,
+                "replica accepting strictly newer applied migrations (rollback binary)"
+            );
+            Ok(())
+        }
+    }
+}
+
 pub async fn run_startup_migrations(db: &sea_orm::DatabaseConnection) -> Result<(), DbErr> {
     let embedded = Migrator::migrations()
         .into_iter()
@@ -166,6 +199,8 @@ mod m20260809_000028_channel_model_name_index;
 mod m20260809_000029_sessions_expires_at_index;
 mod m20260809_000030_normalize_billing_json_nulls;
 mod m20260809_000031_request_logs_without_user_fk;
+mod m20260823_000032_billing_ledger_delta_dedupe;
+mod m20260823_000033_channel_egress_proxy;
 
 #[cfg(test)]
 mod tests {

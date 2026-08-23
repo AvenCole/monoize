@@ -111,7 +111,7 @@ pub async fn compact_response(
             }
             let provider = build_channel_provider_config(&attempt);
             let result = upstream::call_upstream_with_timeout_and_headers(
-                client_http(&state),
+                &client_http_for_attempt(&state, &attempt),
                 &provider,
                 &attempt.api_key,
                 "/v1/responses/compact",

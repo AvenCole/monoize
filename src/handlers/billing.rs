@@ -1694,6 +1694,50 @@ async fn maybe_charge_usage_with_output(
         "request_id": request_id,
     });
 
+    if state.node.is_replica() {
+        // M3: on replicas the synchronous charge path is replaced by a durable
+        // balance-delta enqueue; the primary applies it idempotently later.
+        if auth.sub_account_enabled {
+            crate::replica::metering::ReplicaMetering::enqueue_balance_delta_for_request(
+                state,
+                "api_key_charge",
+                user_id,
+                auth.api_key_id.as_deref(),
+                charge_nano,
+                &meta,
+            )
+            .await
+            .map_err(|err| {
+                AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "metering_enqueue_failed",
+                    err,
+                )
+            })?;
+        } else {
+            crate::replica::metering::ReplicaMetering::enqueue_balance_delta_for_request(
+                state,
+                "request_charge",
+                user_id,
+                None,
+                charge_nano,
+                &meta,
+            )
+            .await
+            .map_err(|err| {
+                AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "metering_enqueue_failed",
+                    err,
+                )
+            })?;
+        }
+        return Ok(ChargeComputation {
+            charge_nano_usd: Some(charge_nano),
+            billing_breakdown: Some(billing_breakdown),
+        });
+    }
+
     if auth.sub_account_enabled {
         let api_key_id = auth.api_key_id.as_deref().unwrap_or("");
         match state
