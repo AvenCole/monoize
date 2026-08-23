@@ -43,6 +43,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       image: ${{ steps.image.outputs.name }}
+      revision: ${{ steps.source.outputs.revision }}
     steps:
       - name: Check out release ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,6 +53,11 @@ jobs:
 
       - name: Match tag to Cargo version
         run: python3 scripts/package_release.py validate --tag "$RELEASE_TAG"
+
+      - name: Resolve immutable source revision
+        id: source
+        shell: bash
+        run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Validate container tag
         if: ${{ github.event_name == 'release' || inputs.publish_container }}
@@ -98,7 +104,7 @@ jobs:
       - name: Check out release ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ needs.validate.outputs.revision }}
           persist-credentials: false
 
       - name: Install stable Rust
@@ -148,14 +154,14 @@ jobs:
 
   verify:
     name: Verify complete release set
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Check out release ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ needs.validate.outputs.revision }}
           persist-credentials: false
 
       - name: Download target artifacts
@@ -222,7 +228,7 @@ jobs:
       - name: Check out release ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ needs.validate.outputs.revision }}
           persist-credentials: false
 
       - name: Resolve source revision

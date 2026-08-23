@@ -15,6 +15,8 @@ RA-T3. The workflow MUST check out `github.event.release.tag_name` rather than t
 
 RA-T3a. The workflow MAY expose a manual preflight trigger with explicit `ref` and `tag` inputs. A manual preflight MUST execute validation, all six builds, packaging, checksum verification, and Actions-artifact staging. It MUST NOT upload files to a GitHub Release.
 
+RA-T3b. The validation job MUST resolve the checked-out release ref to one commit SHA. Every build, verification, and container job in the same run MUST check out that exact commit SHA. A later movement of a branch or tag ref MUST NOT change the source revision used by any job in the run.
+
 RA-T4. The release tag MUST equal the literal character `v` followed by the `[package].version` value in `Cargo.toml`. A mismatch MUST fail before compilation and MUST upload no Release assets.
 
 RA-T5. Build jobs MUST have `contents: read` permission. Only the asset-publishing job MAY have `contents: write` permission.

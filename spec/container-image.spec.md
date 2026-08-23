@@ -58,6 +58,8 @@ CI-P4. For a GitHub Release, the workflow MUST check out `github.event.release.t
 
 CI-P5. A manual run MUST accept a Git ref, a `publish_container` boolean, and one container tag. When `publish_container` is true, it MUST check out that ref and publish only that exact container tag.
 
+CI-P5a. The container build MUST use the immutable source commit SHA resolved by the validation job. It MUST NOT resolve the release tag or manual Git ref again.
+
 CI-P6. A manual container tag MUST match `^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`.
 
 CI-P7. Concurrent workflow runs that target the same publication tag MUST execute sequentially. A newer run MUST NOT cancel an active run.
