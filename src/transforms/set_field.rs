@@ -59,8 +59,8 @@ impl Transform for SetFieldTransform {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "minLength": 1 },
-                "value": {},
-                "when_equals": {}
+                "value": { "description": "JSON value written at path. Example: \"normal\"." },
+                "when_equals": { "description": "Optional. When set, write only if the current value equals this JSON value. Leave empty to always write." }
             },
             "required": ["path", "value"],
             "additionalProperties": false
@@ -174,5 +174,22 @@ mod tests {
         let mut extra = HashMap::new();
         set_field(&mut extra, "service_tier", &config(None));
         assert_eq!(extra["service_tier"], json!("fast"));
+    }
+
+    #[test]
+    fn when_equals_null_matches_only_json_null() {
+        let cfg = config(Some(Value::Null));
+
+        let mut matching = HashMap::from([("service_tier".to_string(), Value::Null)]);
+        set_field(&mut matching, "service_tier", &cfg);
+        assert_eq!(matching["service_tier"], json!("fast"));
+
+        let mut missing = HashMap::new();
+        set_field(&mut missing, "service_tier", &cfg);
+        assert!(!missing.contains_key("service_tier"));
+
+        let mut other = HashMap::from([("service_tier".to_string(), json!("priority"))]);
+        set_field(&mut other, "service_tier", &cfg);
+        assert_eq!(other["service_tier"], json!("priority"));
     }
 }

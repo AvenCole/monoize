@@ -515,6 +515,8 @@
 		"configureRule": "{{phase}} Transform ルールを設定",
 		"unknownRuleReadOnly": "この Transform はレジストリに存在しません。設定は読み取り専用です。",
 		"noConfigFields": "この Transform には設定項目がありません。",
+		"jsonFieldPlaceholder": "JSON（例: \"normal\"）",
+		"jsonFieldOptionalHint": "空欄にするとこのフィールドを省略します。",
 		"validationInvalidJson": "無効な JSON",
 		"validationConfigObject": "Config は JSON オブジェクトである必要があります",
 		"validationRuleInvalid": "Transform #{{index}} が無効です：{{reason}}"

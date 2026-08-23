@@ -518,6 +518,8 @@
 		"configureRule": "Configure {{phase}} transform rule",
 		"unknownRuleReadOnly": "This transform is not in registry. Config is read-only.",
 		"noConfigFields": "This transform has no config fields.",
+		"jsonFieldPlaceholder": "JSON, e.g. \"normal\"",
+		"jsonFieldOptionalHint": "Leave empty to omit this field.",
 		"validationInvalidJson": "Invalid JSON",
 		"validationConfigObject": "Config must be a JSON object",
 		"validationRuleInvalid": "Transform #{{index}} is invalid: {{reason}}"

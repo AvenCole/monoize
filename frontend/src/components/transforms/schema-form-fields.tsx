@@ -4,13 +4,20 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import type { JsonSchemaObject, JsonSchemaProperty } from "./transform-schema";
+import {
+  isJsonValuedProperty,
+  isRequiredSchemaKey,
+  type JsonSchemaObject,
+  type JsonSchemaProperty,
+} from "./transform-schema";
 
 type SchemaFormFieldsProps = {
   schema: JsonSchemaObject | null;
   config: Record<string, unknown>;
   errors: Record<string, string>;
   rawJsonInputs: Record<string, string>;
+  jsonFieldPlaceholder?: string;
+  jsonFieldOptionalHint?: string;
   disabled?: boolean;
   onFieldChange: (key: string, value: unknown) => void;
   onRawJsonInputChange: (key: string, value: string) => void;
@@ -22,6 +29,8 @@ export function SchemaFormFields({
   config,
   errors,
   rawJsonInputs,
+  jsonFieldPlaceholder,
+  jsonFieldOptionalHint,
   disabled,
   onFieldChange,
   onRawJsonInputChange,
@@ -58,6 +67,12 @@ export function SchemaFormFields({
               property={schemaProperty}
               value={config[key]}
               rawJsonInputs={rawJsonInputs}
+              jsonFieldPlaceholder={jsonFieldPlaceholder}
+              jsonFieldOptionalHint={
+                isJsonValuedProperty(schemaProperty) && !isRequiredSchemaKey(schema, key)
+                  ? jsonFieldOptionalHint
+                  : undefined
+              }
               disabled={disabled}
               onFieldChange={onFieldChange}
               onRawJsonInputChange={onRawJsonInputChange}
@@ -76,6 +91,8 @@ type SchemaPropertyFieldProps = {
   property: JsonSchemaProperty;
   value: unknown;
   rawJsonInputs: Record<string, string>;
+  jsonFieldPlaceholder?: string;
+  jsonFieldOptionalHint?: string;
   disabled?: boolean;
   onFieldChange: (key: string, value: unknown) => void;
   onRawJsonInputChange: (key: string, value: string) => void;
@@ -87,6 +104,8 @@ function SchemaPropertyField({
   property,
   value,
   rawJsonInputs,
+  jsonFieldPlaceholder,
+  jsonFieldOptionalHint,
   disabled,
   onFieldChange,
   onRawJsonInputChange,
@@ -160,17 +179,21 @@ function SchemaPropertyField({
     );
   }
 
-  const rawValue =
-    rawJsonInputs[field] ??
-    JSON.stringify(value === undefined ? null : value, null, 2);
+  const rawValue = rawJsonInputs[field] ?? (value === undefined ? "" : JSON.stringify(value, null, 2));
   return (
-    <Textarea
-      value={rawValue}
-      rows={4}
-      disabled={disabled}
-      className="font-mono text-xs"
-      onChange={(e) => onRawJsonInputChange(field, e.target.value)}
-      onBlur={() => onRawJsonInputCommit(field)}
-    />
+    <div className="space-y-1">
+      <Textarea
+        value={rawValue}
+        rows={3}
+        disabled={disabled}
+        placeholder={jsonFieldPlaceholder}
+        className="font-mono text-xs"
+        onChange={(e) => onRawJsonInputChange(field, e.target.value)}
+        onBlur={() => onRawJsonInputCommit(field)}
+      />
+      {jsonFieldOptionalHint && (
+        <p className="text-xs text-muted-foreground">{jsonFieldOptionalHint}</p>
+      )}
+    </div>
   );
 }

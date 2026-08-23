@@ -518,6 +518,8 @@
 		"configureRule": "配置 {{phase}} Transform 规则",
 		"unknownRuleReadOnly": "该 Transform 不在 registry 中，config 为只读。",
 		"noConfigFields": "该 Transform 无可配置字段。",
+		"jsonFieldPlaceholder": "JSON，例如 \"normal\"",
+		"jsonFieldOptionalHint": "留空表示不设置该字段。",
 		"validationInvalidJson": "JSON 格式无效",
 		"validationConfigObject": "Config 必须是 JSON 对象",
 		"validationRuleInvalid": "第 {{index}} 条 Transform 无效：{{reason}}"

@@ -21,6 +21,46 @@ export type TransformRuleValidationError = {
   message: string;
 };
 
+export type JsonFieldParseResult =
+  | { kind: "omit" }
+  | { kind: "value"; value: unknown }
+  | { kind: "error" };
+
+export function isJsonValuedProperty(property?: JsonSchemaProperty | null): boolean {
+  if (!property) {
+    return true;
+  }
+  return property.type == null && !Array.isArray(property.enum);
+}
+
+export function isRequiredSchemaKey(schema: JsonSchemaObject | null, key: string): boolean {
+  const required = schema?.required;
+  return Array.isArray(required) && required.includes(key);
+}
+
+export function jsonFieldInitialText(config: Record<string, unknown>, key: string): string {
+  if (!Object.prototype.hasOwnProperty.call(config, key)) {
+    return "";
+  }
+  return JSON.stringify(config[key], null, 2);
+}
+
+export function parseJsonConfigField(raw: string, required: boolean): JsonFieldParseResult {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return required ? { kind: "error" } : { kind: "omit" };
+  }
+  try {
+    return { kind: "value", value: JSON.parse(trimmed) };
+  } catch {
+    const first = trimmed[0];
+    if (first === "{" || first === "[" || first === "\"") {
+      return { kind: "error" };
+    }
+    return { kind: "value", value: trimmed };
+  }
+}
+
 export function getSchemaObject(schema: Record<string, unknown>): JsonSchemaObject | null {
   if (!isRecord(schema)) {
     return null;
