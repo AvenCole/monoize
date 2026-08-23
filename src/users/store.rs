@@ -2410,7 +2410,7 @@ impl UserStore {
         if disabling_sub_account || requested_sub_account_balance.is_some() {
             let write = self.db.write().await;
             let tx = write.begin().await.map_err(|e| e.to_string())?;
-            let mut user = self
+            let user = self
                 .lock_user_balance_tx(&tx, &existing_key.user_id)
                 .await
                 .map_err(|e| e.message)?;
@@ -2437,7 +2437,6 @@ impl UserStore {
                     ))
                     .await
                     .map_err(|e| e.to_string())?;
-                    user.balance = next;
                     Some(next)
                 };
 
@@ -2491,7 +2490,6 @@ impl UserStore {
                         ))
                         .await
                         .map_err(|e| e.to_string())?;
-                        user.balance = next;
                         Some(next)
                     };
                     self.insert_billing_ledger_tx(
