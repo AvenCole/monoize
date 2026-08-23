@@ -24,8 +24,8 @@ pub use api_keys::{
     update_api_key,
 };
 pub use auth::{
-    AuthResponse, LoginRequest, RegisterRequest, UpdateMeRequest, UserResponse, get_me, login,
-    logout, register, update_me,
+    AuthResponse, LoginRequest, RegisterRequest, UpdateMeRequest, UserBillingPlanResponse,
+    UserResponse, get_me, login, logout, register, update_me, user_response_from_store,
 };
 pub use billing_plans::{
     BillingPlanResponse, CreateBillingPlanRequest, UpdateBillingPlanRequest, create_billing_plan,

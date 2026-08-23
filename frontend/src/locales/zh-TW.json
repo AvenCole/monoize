@@ -104,6 +104,8 @@
 		"cards": {
 			"accountData": "帳戶資料",
 			"currentBalance": "目前餘額",
+			"subscription": "訂閱方案",
+			"noPlan": "未訂閱",
 			"myApiKeys": "我的 API 金鑰",
 			"requestOverview": "請求概覽",
 			"totalRequests": "30 天請求數",
@@ -155,7 +157,13 @@
 		"balanceAdd": "增加",
 		"balanceAddPlaceholder": "增加金額（如 10.50）",
 		"balanceCurrentHint": "目前：${{amount}}",
-		"unlimited": "無限"
+		"unlimited": "無限",
+		"plan": "方案",
+		"noPlan": "無",
+		"todaySpend": "今日消耗",
+		"todayCalls": "今日呼叫",
+		"todaySummary": "今日 {{spend}} · {{calls}} 次呼叫",
+		"viewLogs": "查看日誌"
 	},
 	"apiKeys": {
 		"title": "Token 管理",
@@ -579,7 +587,15 @@
 		"language": "語言",
 		"languageDescription": "選擇您偏好的語言",
 		"theme": "主題",
-		"themeDescription": "選擇您偏好的配色方案"
+		"themeDescription": "選擇您偏好的配色方案",
+		"billing": "帳單",
+		"billingDescription": "目前餘額與已指派的訂閱方案",
+		"currentBalance": "目前餘額",
+		"plan": "方案",
+		"grantAmount": "發放額度",
+		"nextGrant": "下次重置",
+		"noPlan": "未指派訂閱方案",
+		"unrestrictedGroups": "此方案不限制群組"
 	},
 	"modelMetadata": {
 		"title": "模型資料庫",
@@ -719,6 +735,7 @@
 		"filterModel": "模型",
 		"filterModelPlaceholder": "模型篩選",
 		"filterUsername": "使用者名稱",
+		"filterUsernamePlaceholder": "全部使用者",
 		"filterToken": "Token",
 		"allTokens": "全部 Token",
 		"filterStatus": "狀態",

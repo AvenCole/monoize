@@ -104,6 +104,8 @@
 		"cards": {
 			"accountData": "Account Data",
 			"currentBalance": "Current Balance",
+			"subscription": "Subscription",
+			"noPlan": "No plan",
 			"myApiKeys": "My API Keys",
 			"requestOverview": "Request Overview",
 			"totalRequests": "30d Requests",
@@ -155,7 +157,13 @@
 		"balanceAdd": "Add",
 		"balanceAddPlaceholder": "Amount to add (e.g. 10.50)",
 		"balanceCurrentHint": "Current: ${{amount}}",
-		"unlimited": "Unlimited"
+		"unlimited": "Unlimited",
+		"plan": "Plan",
+		"noPlan": "None",
+		"todaySpend": "Today Spend",
+		"todayCalls": "Today Calls",
+		"todaySummary": "Today {{spend}} · {{calls}} calls",
+		"viewLogs": "View logs"
 	},
 	"apiKeys": {
 		"title": "Token Management",
@@ -582,7 +590,15 @@
 		"language": "Language",
 		"languageDescription": "Choose your preferred language",
 		"theme": "Theme",
-		"themeDescription": "Choose your preferred color scheme"
+		"themeDescription": "Choose your preferred color scheme",
+		"billing": "Billing",
+		"billingDescription": "Your current balance and assigned subscription",
+		"currentBalance": "Current balance",
+		"plan": "Plan",
+		"grantAmount": "Grant amount",
+		"nextGrant": "Next reset",
+		"noPlan": "No subscription assigned",
+		"unrestrictedGroups": "No group restriction from this plan"
 	},
 	"modelMetadata": {
 		"title": "Model Database",
@@ -722,6 +738,7 @@
 		"filterModel": "Model",
 		"filterModelPlaceholder": "Filter models",
 		"filterUsername": "Username",
+		"filterUsernamePlaceholder": "All users",
 		"filterToken": "Token",
 		"allTokens": "All Tokens",
 		"filterStatus": "Status",

@@ -40,6 +40,7 @@ import {
 } from "@/components/ui/tooltip";
 import { useState } from "react";
 import { motion } from "framer-motion";
+import { formatUsdDecimal } from "@/lib/exact-decimal";
 import { cn, getGravatarUrl } from "@/lib/utils";
 import { MonoizeLogo } from "@/components/MonoizeLogo";
 import { springs } from "@/components/ui/motion";
@@ -131,6 +132,12 @@ function Sidebar({
   const isAdmin = user?.role === "super_admin" || user?.role === "admin";
 
   const roleLabel = t(`roles.${user?.role || "user"}`);
+  const balanceLabel = user?.balance_unlimited
+    ? t("users.unlimited")
+    : formatUsdDecimal(user?.balance_usd, 2);
+  const accountSummary = user?.billing_plan?.name
+    ? `${user.billing_plan.name} · ${balanceLabel}`
+    : balanceLabel;
   const navItems = [
     { to: "/dashboard", icon: LayoutDashboard, label: t("nav.dashboard"), exact: true },
     { to: "/dashboard/tokens", icon: Key, label: t("nav.apiKeys") },
@@ -218,31 +225,44 @@ function Sidebar({
         <div className="mt-auto pt-3">
           <Separator className="mb-3" />
           <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                className={cn(
-                  "group w-full",
-                  collapsed ? "justify-center px-2" : "justify-start gap-3 px-2.5"
-                )}
-                size="sm"
-              >
-                <Avatar className="h-6 w-6 shrink-0">
-                  {user?.email && (
-                    <AvatarImage src={getGravatarUrl(user.email, 48) ?? undefined} alt={user?.username} />
-                  )}
-                  <AvatarFallback className="text-xs">
-                    {user?.username?.[0]?.toUpperCase() || "U"}
-                  </AvatarFallback>
-                </Avatar>
-                {!collapsed && (
-                  <div className="flex min-w-0 flex-1 flex-col items-start leading-tight">
-                    <span className="truncate text-sm font-medium">{user?.username}</span>
-                    <span className="text-xs text-muted-foreground">{roleLabel}</span>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    className={cn(
+                      "group w-full",
+                      collapsed ? "justify-center px-2" : "justify-start gap-3 px-2.5"
+                    )}
+                    size="sm"
+                  >
+                    <Avatar className="h-6 w-6 shrink-0">
+                      {user?.email && (
+                        <AvatarImage src={getGravatarUrl(user.email, 48) ?? undefined} alt={user?.username} />
+                      )}
+                      <AvatarFallback className="text-xs">
+                        {user?.username?.[0]?.toUpperCase() || "U"}
+                      </AvatarFallback>
+                    </Avatar>
+                    {!collapsed && (
+                      <div className="flex min-w-0 flex-1 flex-col items-start leading-tight">
+                        <span className="truncate text-sm font-medium">{user?.username}</span>
+                        <span className="truncate text-xs text-muted-foreground">{accountSummary}</span>
+                      </div>
+                    )}
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              {collapsed && (
+                <TooltipContent side="right" sideOffset={8}>
+                  <div className="space-y-0.5">
+                    <p className="font-medium">{user?.username}</p>
+                    <p className="text-xs text-muted-foreground">{accountSummary}</p>
+                    <p className="text-xs text-muted-foreground">{roleLabel}</p>
                   </div>
-                )}
-              </Button>
-            </DropdownMenuTrigger>
+                </TooltipContent>
+              )}
+            </Tooltip>
             <DropdownMenuContent align={collapsed ? "center" : "start"} side={collapsed ? "right" : "top"} className="w-56">
               <DropdownMenuItem
                 onClick={() => {

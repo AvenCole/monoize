@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { ChevronDown, Eye, EyeOff, RefreshCw, Search } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -34,14 +35,22 @@ const REQUEST_LOGS_PAGE_SIZE = 100
 export function RequestLogsPage() {
 	const { t } = useTranslation()
 	const { user } = useAuth()
+	const [searchParams] = useSearchParams()
 	const isAdmin = user?.role === 'super_admin' || user?.role === 'admin'
+	const usernameFromQuery = isAdmin ? (searchParams.get('username')?.trim() ?? '') : ''
 
 	const [searchInput, setSearchInput] = useState('')
 	const [modelInput, setModelInput] = useState('')
-	const [usernameInput, setUsernameInput] = useState(user?.username ?? '')
+	const [usernameInput, setUsernameInput] = useState(usernameFromQuery)
+	const [appliedUsernameQuery, setAppliedUsernameQuery] = useState(usernameFromQuery)
 	const [filters, setFilters] = useState<RequestLogsFilter>(() => ({
-		username: user?.username
+		username: usernameFromQuery || undefined
 	}))
+	if (appliedUsernameQuery !== usernameFromQuery) {
+		setAppliedUsernameQuery(usernameFromQuery)
+		setUsernameInput(usernameFromQuery)
+		setFilters(prev => ({ ...prev, username: usernameFromQuery || undefined }))
+	}
 	const [showIp, setShowIp] = useState(false)
 	const [requestOffset, setRequestOffset] = useState(0)
 	const [loadedLogs, setLoadedLogs] = useState<RequestLog[]>([])
@@ -494,7 +503,7 @@ export function RequestLogsPage() {
 								{isAdmin && (
 									<Input
 										className='w-[140px] h-9'
-										placeholder={t('requestLogs.filterUsername')}
+										placeholder={t('requestLogs.filterUsernamePlaceholder')}
 										value={usernameInput}
 										onChange={e => setUsernameInput(e.target.value)}
 										onBlur={handleUsernameCommit}

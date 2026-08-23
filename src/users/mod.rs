@@ -700,6 +700,13 @@ pub struct DashboardAnalyticsRaw {
     pub today_calls: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct UserTodayUsage {
+    pub user_id: String,
+    pub today_calls: i64,
+    pub today_cost_nano_usd: i128,
+}
+
 pub use utils::{format_nano_to_usd, parse_nano_usd, parse_usd_to_nano};
 
 #[cfg(test)]

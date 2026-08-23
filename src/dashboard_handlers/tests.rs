@@ -571,6 +571,8 @@ async fn dashboard_user_allowed_groups_round_trip_through_store_and_response() {
         response.get("allowed_groups"),
         Some(&json!(["alpha", "gamma"]))
     );
+    assert_eq!(response.get("billing_plan"), Some(&json!(null)));
+    assert!(response.get("today_calls").is_none());
 }
 
 #[test]
@@ -594,6 +596,9 @@ fn user_response_serializes_allowed_groups() {
 
     let value = serde_json::to_value(UserResponse::from(user)).expect("response serializes");
     assert_eq!(value.get("allowed_groups"), Some(&json!(["alpha", "beta"])));
+    assert_eq!(value.get("billing_plan"), Some(&json!(null)));
+    assert!(value.get("today_calls").is_none());
+    assert!(value.get("today_cost_nano_usd").is_none());
 }
 
 #[tokio::test]

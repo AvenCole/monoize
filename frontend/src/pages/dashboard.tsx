@@ -11,8 +11,8 @@ import {
 } from "@/components/ui/chart";
 import { useAuth } from "@/hooks/use-auth";
 import { type DashboardAnalyticsBucket } from "@/lib/api";
-import { useDashboardAnalytics, useProviders, usePublicSettings, useRequestLogs, useStats } from "@/lib/swr";
-import { cn } from "@/lib/utils";
+import { useDashboardAnalytics, useProviders, usePublicSettings, useRequestLogs } from "@/lib/swr";
+import { cn, formatPeriodShort } from "@/lib/utils";
 import { PageWrapper, motion, transitions, springs, SharedTabIndicator } from "@/components/ui/motion";
 import { EmptyState } from "@/components/ui/empty-state";
 import { PageHeader } from "@/components/ui/page-header";
@@ -177,7 +177,6 @@ export function DashboardPage() {
   const [activeTab, setActiveTab] = useState<AnalysisTabId>("spendDistribution");
 
   const isAdmin = user?.role === "super_admin" || user?.role === "admin";
-  const { data: stats, isLoading: statsLoading } = useStats();
   const { error: providersError, isLoading: providersLoading } = useProviders({
     isPaused: () => !isAdmin,
     revalidateOnMount: isAdmin,
@@ -214,8 +213,7 @@ export function DashboardPage() {
     return { successRate, avgTtfb };
   }, [rawLogs]);
 
-  const loading = statsLoading
-    || logsLoading
+  const loading = logsLoading
     || summaryAnalyticsLoading
     || analysisAnalyticsLoading
     || publicSettingsLoading
@@ -238,12 +236,23 @@ export function DashboardPage() {
           {
             key: "balance",
             label: tt("dashboard.cards.currentBalance", "Current Balance"),
-            value: formatUsdDecimal(user?.balance_usd, 2),
+            value: user?.balance_unlimited
+              ? tt("users.unlimited", "Unlimited")
+              : formatUsdDecimal(user?.balance_usd, 2),
           },
           {
-            key: "myKeys",
-            label: tt("dashboard.cards.myApiKeys", "My API Keys"),
-            value: formatNumber(stats?.my_api_keys_count ?? 0),
+            key: "subscription",
+            label: tt("dashboard.cards.subscription", "Subscription"),
+            value: (() => {
+              const plan = user?.billing_plan;
+              if (!plan) return tt("dashboard.cards.noPlan", "No plan");
+              const amount = formatUsdDecimal(plan.grant_amount_usd, 2);
+              const period = formatPeriodShort(plan.period_seconds);
+              const label = `${plan.name} · ${amount}/${period}`;
+              return plan.enabled
+                ? label
+                : `${label} (${tt("common.disabled", "Disabled")})`;
+            })(),
           },
         ],
       },
@@ -300,8 +309,9 @@ export function DashboardPage() {
       summaryAnalytics,
       perfStats,
       totalRequests,
-      stats?.my_api_keys_count,
       user?.balance_usd,
+      user?.balance_unlimited,
+      user?.billing_plan,
       tt,
     ]
   );

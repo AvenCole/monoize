@@ -33,6 +33,9 @@ U1. User read model exposed by dashboard/auth APIs MUST include:
 - `balance_unlimited: boolean`
 - `email: string | null`
 - `allowed_groups: string[]`
+- `billing_plan_id: string | null`
+- `next_grant_at: string | null` (RFC 3339)
+- `billing_plan: object | null` as defined by `spec/billing-plan-subscriptions.spec.md` BP-U2
 
 U2. `balance_usd` MUST be computed from `balance_nano_usd` with nano precision and no binary floating conversion.
 

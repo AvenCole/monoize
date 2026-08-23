@@ -404,10 +404,12 @@ FL7. The top of the page MUST include a search bar and filter controls:
   - **Model filter**: text input accepting comma-separated model names (e.g. `gpt-4o, gpt-5`); applied on Enter or blur.
   - **Status filter**: dropdown with options `All`, `Pending`, `Success`, `Error`.
   - **Token filter**: dropdown listing all of the user's API keys by name; selecting one filters by `api_key_id`.
-  - **Username filter** (admin only): text input defaulting to the current user's username; applied on Enter or blur. Non-admin users do not see this control.
+  - **Username filter** (admin only): text input. The default value is empty, which MUST omit `username` from `GET /api/dashboard/request-logs` and therefore list every user's logs. Applied on Enter or blur. Non-admin users do not see this control.
   - **Time range filter**: dropdown with preset options `All Time`, `Last 1 Hour`, `Last 24 Hours`, `Last 7 Days`, `Last 30 Days`, `Today`, `Yesterday`, `This Month`, `Last Month`. Selecting a preset computes `time_from` / `time_to` as ISO 8601 strings in the browser's local timezone and sends them as query parameters to the API.
 
 FL7a. The filter-control area MUST display the total charge sum for the current filter conditions. The value MUST be formatted as regular USD currency with 6 fractional digits (e.g. `$1.234567`). The label MUST use the i18n key `requestLogs.totalCost`. The element MUST be displayed in the summary area (top-right) alongside the existing "Showing X-Y of Z" text.
+
+FL7b. `/dashboard/logs` MUST read the optional `username` query parameter. For an admin viewer, a non-empty `username` value MUST initialize the username filter to that exact string. An absent or empty `username` query parameter MUST initialize the filter to empty (all users). Non-admin viewers MUST ignore the query parameter.
 
 FL8. Column order (left to right): `created_at`, `request_id` (with adjacent status indicator), `model` (ModelBadge), `api_key_name`, `[username]` (admin), `[channel]` (admin, with tooltip showing provider context), `duration/ttfb/stream` (merged badges), `input_tokens` (input), `output_tokens` (output), `charge_nano_usd` (cost), `request_ip`.
 

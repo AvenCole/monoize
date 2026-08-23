@@ -18,6 +18,7 @@ async fn setup() -> TestContext {
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+        node: monoize::node_config::NodeSettings::primary_default(),
     })
     .await
     .expect("state loads");
@@ -190,4 +191,107 @@ async fn billing_plan_validation_and_assignment_error_codes() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(fetched["billing_plan_id"], json!(null));
+    assert_eq!(fetched["billing_plan"], json!(null));
+}
+
+#[tokio::test]
+async fn assigned_plan_is_embedded_on_user_and_me_payloads() {
+    let ctx = setup().await;
+
+    let (status, plan) = json_request(
+        &ctx,
+        Method::POST,
+        "/api/dashboard/billing-plans",
+        Some(json!({
+            "name": "Starter",
+            "grant_amount_usd": "10",
+            "period_seconds": 86400,
+            "allowed_groups": ["team-a"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+
+    let (status, user) = json_request(
+        &ctx,
+        Method::POST,
+        "/api/dashboard/users",
+        Some(json!({
+            "username": "subscriber",
+            "password": "password"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let user_id = user["id"].as_str().expect("user id").to_string();
+    assert_eq!(user["billing_plan"], json!(null));
+    assert!(user.get("today_calls").is_none());
+
+    let (status, assigned) = json_request(
+        &ctx,
+        Method::PUT,
+        &format!("/api/dashboard/users/{user_id}"),
+        Some(json!({ "billing_plan_id": plan_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(assigned["billing_plan_id"], json!(plan_id));
+    assert_eq!(assigned["billing_plan"]["name"], json!("Starter"));
+    assert_eq!(assigned["billing_plan"]["grant_amount_usd"], json!("10"));
+    assert_eq!(assigned["billing_plan"]["period_seconds"], json!(86400));
+    assert_eq!(
+        assigned["billing_plan"]["allowed_groups"],
+        json!(["team-a"])
+    );
+    assert_eq!(assigned["billing_plan"]["enabled"], json!(true));
+    assert!(assigned.get("today_calls").is_none());
+
+    let (status, listed) = json_request(&ctx, Method::GET, "/api/dashboard/users", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed_user = listed
+        .as_array()
+        .expect("users array")
+        .iter()
+        .find(|row| row["id"] == json!(user_id))
+        .expect("subscriber listed");
+    assert_eq!(listed_user["billing_plan"]["name"], json!("Starter"));
+    assert_eq!(listed_user["today_calls"], json!(0));
+    assert_eq!(listed_user["today_cost_nano_usd"], json!("0"));
+    assert_eq!(listed_user["today_cost_usd"], json!("0"));
+
+    let (status, login) = json_request(
+        &ctx,
+        Method::POST,
+        "/api/dashboard/auth/login",
+        Some(json!({
+            "username": "subscriber",
+            "password": "password"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(login["user"]["billing_plan"]["name"], json!("Starter"));
+    assert!(login["user"].get("today_calls").is_none());
+
+    let token = login["token"].as_str().expect("session token");
+    let resp = ctx
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/dashboard/auth/me")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let me: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(me["billing_plan"]["id"], json!(plan_id));
+    assert_eq!(me["billing_plan"]["name"], json!("Starter"));
+    assert!(me.get("today_calls").is_none());
 }

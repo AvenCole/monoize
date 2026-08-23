@@ -104,6 +104,8 @@
 		"cards": {
 			"accountData": "账户数据",
 			"currentBalance": "当前余额",
+			"subscription": "订阅套餐",
+			"noPlan": "未订阅",
 			"myApiKeys": "我的 API 密钥",
 			"requestOverview": "请求概览",
 			"totalRequests": "30 天请求数",
@@ -155,7 +157,13 @@
 		"balanceAdd": "增加",
 		"balanceAddPlaceholder": "增加金额（如 10.50）",
 		"balanceCurrentHint": "当前：${{amount}}",
-		"unlimited": "无限"
+		"unlimited": "无限",
+		"plan": "套餐",
+		"noPlan": "无",
+		"todaySpend": "今日消耗",
+		"todayCalls": "今日调用",
+		"todaySummary": "今日 {{spend}} · {{calls}} 次调用",
+		"viewLogs": "查看日志"
 	},
 	"apiKeys": {
 		"title": "令牌管理",
@@ -582,7 +590,15 @@
 		"language": "语言",
 		"languageDescription": "选择您的首选语言",
 		"theme": "主题",
-		"themeDescription": "选择您的首选配色方案"
+		"themeDescription": "选择您的首选配色方案",
+		"billing": "账单",
+		"billingDescription": "当前余额与已分配的订阅套餐",
+		"currentBalance": "当前余额",
+		"plan": "套餐",
+		"grantAmount": "发放额度",
+		"nextGrant": "下次重置",
+		"noPlan": "未分配订阅套餐",
+		"unrestrictedGroups": "该套餐不限制分组"
 	},
 	"modelMetadata": {
 		"title": "模型数据库",
@@ -722,6 +738,7 @@
 		"filterModel": "模型",
 		"filterModelPlaceholder": "模型筛选",
 		"filterUsername": "用户名",
+		"filterUsernamePlaceholder": "全部用户",
 		"filterToken": "令牌",
 		"allTokens": "全部令牌",
 		"filterStatus": "状态",

@@ -302,6 +302,12 @@ export async function createUserOptimistic(
     balance_usd: "0",
     balance_unlimited: false,
     allowed_groups: allowedGroups,
+    billing_plan_id: null,
+    next_grant_at: null,
+    billing_plan: null,
+    today_calls: 0,
+    today_cost_nano_usd: "0",
+    today_cost_usd: "0",
   };
   mutate(SWR_KEYS.USERS, [...currentUsers, tempUser], false);
 

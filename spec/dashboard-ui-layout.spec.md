@@ -16,6 +16,13 @@ DL2. Top header bar MUST NOT be rendered.
 
 DL3. User/account menu MUST be anchored at sidebar bottom.
 
+DL3a. The expanded sidebar account trigger MUST show the authenticated user's remaining
+balance on the second line (localized unlimited label when `balance_unlimited` is true;
+otherwise `balance_usd` formatted as USD with 2 fractional digits). When `billing_plan`
+is non-null, that second line MUST also include `billing_plan.name`. The collapsed
+sidebar MUST expose the same summary through the account-trigger tooltip. This display
+MUST use the session user object and MUST NOT call `GET /api/dashboard/billing-plans`.
+
 DL4. Mobile (`< lg`) MUST render sidebar via left sheet menu.
 
 DL5. Sidebar main navigation (always visible to authenticated users) MUST include exactly:
@@ -373,6 +380,9 @@ DH2. Each overview card in row B MUST contain:
 - card section title MUST be one typographic step smaller than row C section title.
 - card header/content vertical padding MUST be compact to avoid excessive top whitespace.
 
+DH2a. The account overview card MUST follow `spec/dashboard-home-overview.spec.md` DH-3a
+(balance and assigned subscription; not API-key count).
+
 DH3. The left analysis panel in row C MUST contain:
 
 - a title row with section name;
@@ -440,6 +450,45 @@ UP5. In the `/dashboard/users` list table, the username text and allowed-group b
 
 - If horizontal space is insufficient, the username text MAY truncate.
 - The allowed-group badge collection MUST remain single-line and MUST NOT move below the username.
+
+UP6. The users table MUST include columns for assigned billing plan, UTC-calendar-day spend,
+and UTC-calendar-day call count, in addition to the existing user/role/balance/status columns.
+
+UP7. The plan cell MUST render `billing_plan.name` when `billing_plan` is non-null, and a
+localized none label when `billing_plan` is null. A disabled plan MUST remain visible with a
+disabled marker.
+
+UP8. The today-spend cell MUST display `today_cost_nano_usd` as USD with 2 fractional digits
+using exact integer formatting (`BigInt`). A missing value MUST display as `$0.00`.
+
+UP9. The today-calls cell MUST display `today_calls` as a locale integer. A missing value MUST
+display as `0`.
+
+UP10. The users-page toolbar MUST display the UTC-calendar-day totals across the listed users:
+the sum of `today_cost_nano_usd` formatted as USD with 2 fractional digits, and the sum of
+`today_calls`. Both sums MUST be computed from the list payload with `BigInt` / integer
+arithmetic. The page MUST NOT fetch a second usage endpoint for those totals.
+
+UP11. Each user row MUST include an action that navigates to
+`/dashboard/logs?username={username}` with the row's exact username. That destination MUST
+initialize the request-log username filter as defined by `spec/request-logs.spec.md` FL7b.
+
+## 8. User Settings Page
+
+US1. `/settings` MUST render a read-only billing card sourced from the authenticated user
+object. The card MUST NOT call `GET /api/dashboard/billing-plans`.
+
+US2. The billing card MUST show:
+- current balance, or the localized unlimited label when `balance_unlimited` is true;
+- assigned plan name, or an explicit none label when `billing_plan` is null.
+
+US3. When `billing_plan` is non-null, the billing card MUST also show grant amount,
+period, `next_grant_at` when present, and `billing_plan.allowed_groups` (empty array
+renders as unrestricted).
+
+US4. The billing card MUST use the same skeleton/loading contract as the rest of `/settings`
+when the user object has not yet resolved. It MUST NOT require a page close/reopen to
+reflect a later `auth/me` refresh.
 
 ## 7. Token Management Page (UI)
 

@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::dashboard_handlers::auth::UserResponse;
+use crate::dashboard_handlers::auth::user_response_from_store;
 use crate::dashboard_handlers::session_helpers::{get_current_user, require_admin};
 use crate::error::{AppError, AppResult};
 use crate::monoize_routing::AffinityFailbackMode;
@@ -312,11 +312,15 @@ pub async fn get_dashboard_stats(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
+    let current_user = user_response_from_store(user_store, user)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+
     Ok(Json(json!({
         "user_count": user_count,
         "my_api_keys_count": my_api_keys_count,
         "providers_count": providers_count,
-        "current_user": UserResponse::from(user),
+        "current_user": current_user,
     })))
 }
 

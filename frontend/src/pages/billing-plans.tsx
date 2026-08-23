@@ -36,6 +36,7 @@ import {
   createBillingPlanOptimistic,
 } from "@/lib/swr";
 import type { BillingPlan } from "@/lib/api";
+import { formatPeriodShort } from "@/lib/utils";
 
 const NANO_PER_USD = 1_000_000_000n;
 
@@ -54,16 +55,6 @@ function parseUsdToNanoBigInt(usd: string): bigint | null {
   } catch {
     return null;
   }
-}
-
-function formatPeriod(seconds: number): string {
-  if (seconds % 86_400 === 0) {
-    const days = seconds / 86_400;
-    return `${days}d`;
-  }
-  if (seconds % 3_600 === 0) return `${seconds / 3_600}h`;
-  if (seconds % 60 === 0) return `${seconds / 60}m`;
-  return `${seconds}s`;
 }
 
 interface PlanFormState {
@@ -268,7 +259,7 @@ export function BillingPlansPage() {
       <motion.div
         initial={{ opacity: 0, y: 12 }}
         animate={{ opacity: 1, y: 0 }}
-        transition={transitions.default}
+        transition={transitions.normal}
         className="space-y-6"
       >
         <PageHeader
@@ -312,7 +303,7 @@ export function BillingPlansPage() {
                     <td className="px-4 py-3">
                       <span className="inline-flex items-center gap-1.5">
                         <CalendarClock className="h-3.5 w-3.5 text-muted-foreground" />
-                        {formatPeriod(plan.period_seconds)}
+                        {formatPeriodShort(plan.period_seconds)}
                       </span>
                     </td>
                     <td className="px-4 py-3">

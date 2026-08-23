@@ -1,5 +1,15 @@
 const API_BASE = "/api/dashboard";
 
+export interface UserBillingPlan {
+  id: string;
+  name: string;
+  grant_amount_nano_usd: string;
+  grant_amount_usd: string;
+  period_seconds: number;
+  allowed_groups: string[];
+  enabled: boolean;
+}
+
 export interface User {
   id: string;
   username: string;
@@ -14,6 +24,10 @@ export interface User {
   allowed_groups: string[];
   billing_plan_id?: string | null;
   next_grant_at?: string | null;
+  billing_plan?: UserBillingPlan | null;
+  today_calls?: number;
+  today_cost_nano_usd?: string;
+  today_cost_usd?: string;
 }
 
 export interface BillingPlan {

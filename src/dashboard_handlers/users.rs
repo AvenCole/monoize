@@ -1,16 +1,20 @@
 use crate::app::AppState;
-use crate::dashboard_handlers::auth::UserResponse;
+use crate::dashboard_handlers::auth::{UserResponse, user_response_from_store};
 use crate::dashboard_handlers::session_helpers::{
     is_reserved_internal_username, is_valid_username, require_admin,
 };
 use crate::error::{AppError, AppResult};
-use crate::users::{AdminUpdateUserInput, UserRole, canonicalize_groups, parse_usd_to_nano};
+use crate::users::{
+    AdminUpdateUserInput, UserRole, UserTodayUsage, canonicalize_groups, parse_usd_to_nano,
+};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use chrono::{NaiveTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateUserRequest {
@@ -53,8 +57,45 @@ pub async fn list_users(
         .list_users()
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    let plans = user_store
+        .list_billing_plans()
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    let today_start = Utc::now()
+        .date_naive()
+        .and_time(NaiveTime::MIN)
+        .and_utc()
+        .to_rfc3339();
+    let usage_rows = user_store
+        .get_users_today_usage(&today_start)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
-    let responses: Vec<UserResponse> = users.into_iter().map(UserResponse::from).collect();
+    let plan_by_id: HashMap<_, _> = plans
+        .into_iter()
+        .map(|plan| (plan.id.clone(), plan))
+        .collect();
+    let usage_by_id: HashMap<_, _> = usage_rows
+        .into_iter()
+        .map(|row| (row.user_id.clone(), row))
+        .collect();
+    let zero_usage = UserTodayUsage {
+        user_id: String::new(),
+        today_calls: 0,
+        today_cost_nano_usd: 0,
+    };
+
+    let responses: Vec<UserResponse> = users
+        .into_iter()
+        .map(|user| {
+            let plan = user
+                .billing_plan_id
+                .as_ref()
+                .and_then(|id| plan_by_id.get(id).cloned());
+            let today = usage_by_id.get(&user.id).unwrap_or(&zero_usage);
+            UserResponse::from_user(user, plan, Some(today))
+        })
+        .collect();
     Ok(Json(responses))
 }
 
@@ -73,7 +114,10 @@ pub async fn get_user(
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "not_found", "user not found"))?;
 
-    Ok(Json(UserResponse::from(user)))
+    let response = user_response_from_store(user_store, user)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    Ok(Json(response))
 }
 
 pub async fn create_user(
@@ -143,7 +187,10 @@ pub async fn create_user(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
-    Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
+    let response = user_response_from_store(user_store, user)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 pub async fn update_user(
@@ -265,7 +312,10 @@ pub async fn update_user(
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "not_found", "user not found"))?;
 
-    Ok(Json(UserResponse::from(updated_user)))
+    let response = user_response_from_store(user_store, updated_user)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    Ok(Json(response))
 }
 
 pub async fn delete_user(

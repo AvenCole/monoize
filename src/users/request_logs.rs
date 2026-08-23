@@ -1652,4 +1652,116 @@ impl UserStore {
             today_calls,
         })
     }
+
+    pub async fn get_users_today_usage(
+        &self,
+        today_start: &str,
+    ) -> Result<Vec<super::UserTodayUsage>, String> {
+        let is_sqlite = self.db.is_sqlite();
+        let today_start_unix_ms = chrono::DateTime::parse_from_rfc3339(today_start)
+            .map_err(|e| e.to_string())?
+            .timestamp_millis();
+        let charge_columns = charge_aggregate_columns(!is_sqlite);
+        let sql = format!(
+            "SELECT rl.user_id, {charge_columns}, COUNT(*) AS call_count \
+             FROM request_logs rl \
+             WHERE rl.created_at_unix_ms >= $1 \
+               AND rl.created_at_unix_ms IS NOT NULL \
+               AND rl.user_id IS NOT NULL \
+             GROUP BY rl.user_id"
+        );
+        let rows = self
+            .db
+            .read()
+            .query_all(self.db.stmt(&sql, vec![today_start_unix_ms.into()]))
+            .await
+            .map_err(|e| e.to_string())?;
+
+        rows.into_iter()
+            .map(|row| {
+                let user_id: String = row.try_get("", "user_id").map_err(|e| e.to_string())?;
+                let today_calls: i64 = row.try_get("", "call_count").map_err(|e| e.to_string())?;
+                let today_cost_nano_usd = decode_charge_aggregate(&row, !is_sqlite)?
+                    .parse::<i128>()
+                    .map_err(|_| {
+                        "request log charge is outside the signed i128 domain".to_string()
+                    })?;
+                Ok(super::UserTodayUsage {
+                    user_id,
+                    today_calls,
+                    today_cost_nano_usd,
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod today_usage_tests {
+    use crate::db::DbPool;
+    use crate::migration::Migrator;
+    use crate::users::{UserRole, UserStore};
+    use chrono::{NaiveTime, Utc};
+    use sea_orm::ConnectionTrait;
+    use sea_orm_migration::MigratorTrait;
+
+    #[tokio::test]
+    async fn groups_today_usage_by_user_and_ignores_prior_days() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let (log_tx, _) = tokio::sync::broadcast::channel(1);
+        let store = UserStore::new(db.clone(), log_tx)
+            .await
+            .expect("store creates");
+        let alice = store
+            .create_user("alice_usage", "password12", UserRole::User, &[])
+            .await
+            .expect("alice created");
+        let bob = store
+            .create_user("bob_usage", "password12", UserRole::User, &[])
+            .await
+            .expect("bob created");
+
+        let today_start = Utc::now().date_naive().and_time(NaiveTime::MIN).and_utc();
+        let today_ms = today_start.timestamp_millis() + 3_600_000;
+        let yesterday_ms = today_start.timestamp_millis() - 3_600_000;
+
+        for (id, user_id, charge, created_ms) in [
+            ("log-a1", alice.id.as_str(), "1000", today_ms),
+            ("log-a2", alice.id.as_str(), "2500", today_ms + 1),
+            ("log-a-old", alice.id.as_str(), "999999", yesterday_ms),
+            ("log-b1", bob.id.as_str(), "7", today_ms),
+        ] {
+            db.write()
+                .await
+                .execute(db.stmt(
+                    "INSERT INTO request_logs (id, user_id, model, is_stream, status, created_at, created_at_unix_ms, charge_nano_usd) VALUES ($1, $2, 'm', 0, 'success', $3, $4, $5)",
+                    vec![
+                        id.into(),
+                        user_id.into(),
+                        today_start.to_rfc3339().into(),
+                        created_ms.into(),
+                        charge.into(),
+                    ],
+                ))
+                .await
+                .expect("log inserted");
+        }
+
+        let rows = store
+            .get_users_today_usage(&today_start.to_rfc3339())
+            .await
+            .expect("usage query succeeds");
+        let by_user: std::collections::BTreeMap<_, _> = rows
+            .into_iter()
+            .map(|row| (row.user_id, (row.today_calls, row.today_cost_nano_usd)))
+            .collect();
+        assert_eq!(by_user.get(&alice.id), Some(&(2, 3500)));
+        assert_eq!(by_user.get(&bob.id), Some(&(1, 7)));
+    }
 }

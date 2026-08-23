@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { Plus, Trash2, Pencil, Shield, ShieldCheck, User as UserIcon, Mail, X, PlusCircle } from "lucide-react";
+import { Plus, Trash2, Pencil, Shield, ShieldCheck, User as UserIcon, Mail, X, PlusCircle, ScrollText } from "lucide-react";
 import { GroupsBadge } from "@/components/GroupsBadge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -52,8 +53,9 @@ import {
   deleteUserOptimistic,
 } from "@/lib/swr";
 import type { User } from "@/lib/api";
+import { formatNanoUsd, formatUsdDecimal, isSignedIntegerString } from "@/lib/exact-decimal";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
-import { getGravatarUrl } from "@/lib/utils";
+import { formatPeriodShort, getGravatarUrl } from "@/lib/utils";
 import { PageWrapper, motion, transitions } from "@/components/ui/motion";
 import { PageHeader } from "@/components/ui/page-header";
 import { TablePageSkeleton } from "@/components/ui/page-skeleton";
@@ -100,13 +102,6 @@ const roleIcons = {
   admin: Shield,
   user: UserIcon,
 };
-
-function formatPeriodShort(seconds: number): string {
-  if (seconds % 86_400 === 0) return `${seconds / 86_400}d`;
-  if (seconds % 3_600 === 0) return `${seconds / 3_600}h`;
-  if (seconds % 60 === 0) return `${seconds / 60}m`;
-  return `${seconds}s`;
-}
 
 const roleVariants = {
   super_admin: "destructive" as const,
@@ -280,10 +275,23 @@ function AllowedGroupsInput({
 
 export function UsersPage() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const { user: currentUser } = useAuth();
   const { data: users = [], isLoading } = useUsers();
   const { data: groupSuggestions = [], isLoading: groupsLoading } = useDashboardGroups();
   const { data: billingPlans = [] } = useBillingPlans();
+  const todayTotals = useMemo(() => {
+    let calls = 0;
+    let cost = 0n;
+    for (const user of users) {
+      calls += user.today_calls ?? 0;
+      const raw = user.today_cost_nano_usd ?? "0";
+      if (isSignedIntegerString(raw)) {
+        cost += BigInt(raw);
+      }
+    }
+    return { calls, cost };
+  }, [users]);
   const [createOpen, setCreateOpen] = useState(false);
   const [editUser, setEditUser] = useState<User | null>(null);
   const [formData, setFormData] = useState({
@@ -797,6 +805,11 @@ export function UsersPage() {
               <h2 className="text-base font-semibold">{t("users.allUsers")}</h2>
               <p className="text-sm text-muted-foreground">
                 {t("users.usersTotal", { count: users.length })}
+                {" · "}
+                {t("users.todaySummary", {
+                  spend: formatNanoUsd(todayTotals.cost, 2),
+                  calls: todayTotals.calls.toLocaleString(),
+                })}
               </p>
             </div>
           )}
@@ -817,7 +830,7 @@ export function UsersPage() {
                   <table
                     {...props}
                     className="w-full caption-bottom text-sm"
-                    style={{ minWidth: "64rem" }}
+                    style={{ minWidth: "80rem" }}
                   />
                 ),
                 TableHead: (props) => (
@@ -842,13 +855,22 @@ export function UsersPage() {
                     {t("users.role")}
                   </VirtualTableHeaderCell>
                   <VirtualTableHeaderCell>
+                    {t("users.plan")}
+                  </VirtualTableHeaderCell>
+                  <VirtualTableHeaderCell>
+                    {t("users.balance")}
+                  </VirtualTableHeaderCell>
+                  <VirtualTableHeaderCell>
+                    {t("users.todaySpend")}
+                  </VirtualTableHeaderCell>
+                  <VirtualTableHeaderCell>
+                    {t("users.todayCalls")}
+                  </VirtualTableHeaderCell>
+                  <VirtualTableHeaderCell>
                     {t("common.created")}
                   </VirtualTableHeaderCell>
                   <VirtualTableHeaderCell>
                     {t("users.lastLogin")}
-                  </VirtualTableHeaderCell>
-                  <VirtualTableHeaderCell>
-                    Balance
                   </VirtualTableHeaderCell>
                   <VirtualTableHeaderCell>
                     {t("common.status")}
@@ -887,12 +909,33 @@ export function UsersPage() {
                         </Badge>
                       </div>
                     </VirtualTableCell>
+                    <VirtualTableCell>
+                      {user.billing_plan ? (
+                        <Badge
+                          variant={user.billing_plan.enabled ? "secondary" : "outline"}
+                          className="max-w-[12rem] truncate"
+                        >
+                          {user.billing_plan.name}
+                          {!user.billing_plan.enabled ? ` (${t("common.disabled")})` : ""}
+                        </Badge>
+                      ) : (
+                        <span className="text-sm text-muted-foreground">{t("users.noPlan")}</span>
+                      )}
+                    </VirtualTableCell>
+                    <VirtualTableCell className="tabular-nums">
+                      {user.balance_unlimited
+                        ? t("users.unlimited")
+                        : formatUsdDecimal(user.balance_usd, 2)}
+                    </VirtualTableCell>
+                    <VirtualTableCell className="tabular-nums">
+                      {formatNanoUsd(user.today_cost_nano_usd, 2)}
+                    </VirtualTableCell>
+                    <VirtualTableCell className="tabular-nums">
+                      {(user.today_calls ?? 0).toLocaleString()}
+                    </VirtualTableCell>
                     <VirtualTableCell>{formatDate(user.created_at)}</VirtualTableCell>
                     <VirtualTableCell>
                       {user.last_login_at ? formatDate(user.last_login_at) : t("common.never")}
-                    </VirtualTableCell>
-                    <VirtualTableCell>
-                      {user.balance_unlimited ? "Unlimited" : `$${user.balance_usd}`}
                     </VirtualTableCell>
                     <VirtualTableCell>
                       <div className="flex items-center gap-2">
@@ -908,6 +951,16 @@ export function UsersPage() {
                     </VirtualTableCell>
                     <VirtualTableCell>
                       <div className="flex items-center gap-1">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          title={t("users.viewLogs")}
+                          onClick={() =>
+                            navigate(`/dashboard/logs?username=${encodeURIComponent(user.username)}`)
+                          }
+                        >
+                          <ScrollText className="h-4 w-4" />
+                        </Button>
                         {canEdit(user) && (
                           <Button variant="ghost" size="icon" onClick={() => openEdit(user)}>
                             <Pencil className="h-4 w-4" />

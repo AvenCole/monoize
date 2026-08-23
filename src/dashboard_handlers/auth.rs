@@ -3,7 +3,9 @@ use crate::dashboard_handlers::session_helpers::{
     get_current_user, is_reserved_internal_username, is_valid_username,
 };
 use crate::error::{AppError, AppResult};
-use crate::users::{RegisterUserError, User, UserRole, format_nano_to_usd};
+use crate::users::{
+    BillingPlan, RegisterUserError, User, UserRole, UserStore, UserTodayUsage, format_nano_to_usd,
+};
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -30,6 +32,35 @@ pub struct AuthResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct UserBillingPlanResponse {
+    pub id: String,
+    pub name: String,
+    pub grant_amount_nano_usd: String,
+    pub grant_amount_usd: String,
+    pub period_seconds: i64,
+    pub allowed_groups: Vec<String>,
+    pub enabled: bool,
+}
+
+impl From<BillingPlan> for UserBillingPlanResponse {
+    fn from(plan: BillingPlan) -> Self {
+        let nano = plan
+            .grant_amount_nano_usd
+            .parse::<i128>()
+            .expect("UserStore must validate persisted plan amounts");
+        Self {
+            id: plan.id,
+            name: plan.name,
+            grant_amount_usd: format_nano_to_usd(nano),
+            grant_amount_nano_usd: plan.grant_amount_nano_usd,
+            period_seconds: plan.period_seconds,
+            allowed_groups: plan.allowed_groups,
+            enabled: plan.enabled,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 pub struct UserResponse {
     pub id: String,
     pub username: String,
@@ -45,14 +76,29 @@ pub struct UserResponse {
     pub allowed_groups: Vec<String>,
     pub billing_plan_id: Option<String>,
     pub next_grant_at: Option<String>,
+    pub billing_plan: Option<UserBillingPlanResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub today_calls: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub today_cost_nano_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub today_cost_usd: Option<String>,
 }
 
-impl From<User> for UserResponse {
-    fn from(u: User) -> Self {
+impl UserResponse {
+    pub fn from_user(u: User, plan: Option<BillingPlan>, today: Option<&UserTodayUsage>) -> Self {
         let balance_nano = u
             .balance_nano_usd
             .parse::<i128>()
             .expect("UserStore must validate persisted user balances");
+        let (today_calls, today_cost_nano_usd, today_cost_usd) = match today {
+            Some(row) => (
+                Some(row.today_calls),
+                Some(row.today_cost_nano_usd.to_string()),
+                Some(format_nano_to_usd(row.today_cost_nano_usd)),
+            ),
+            None => (None, None, None),
+        };
         Self {
             id: u.id,
             username: u.username,
@@ -67,8 +113,33 @@ impl From<User> for UserResponse {
             allowed_groups: u.allowed_groups,
             billing_plan_id: u.billing_plan_id,
             next_grant_at: u.next_grant_at.map(|d| d.to_rfc3339()),
+            billing_plan: plan.map(UserBillingPlanResponse::from),
+            today_calls,
+            today_cost_nano_usd,
+            today_cost_usd,
         }
     }
+}
+
+impl From<User> for UserResponse {
+    fn from(u: User) -> Self {
+        Self::from_user(u, None, None)
+    }
+}
+
+pub async fn user_response_from_store(
+    store: &UserStore,
+    user: User,
+) -> Result<UserResponse, String> {
+    let plan = match user.billing_plan_id.as_deref() {
+        Some(id) => store.get_billing_plan_by_id(id).await?,
+        None => None,
+    };
+    Ok(UserResponse::from_user(user, plan, None))
+}
+
+fn map_user_response_error(error: String) -> AppError {
+    AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error)
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,9 +224,12 @@ pub async fn register(
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
     let cookie = build_session_cookie(&session.token, session_ttl_days);
+    let user = user_response_from_store(user_store, user)
+        .await
+        .map_err(map_user_response_error)?;
     let body = Json(AuthResponse {
         token: session.token,
-        user: user.into(),
+        user,
     });
     Ok(([(axum::http::header::SET_COOKIE, cookie)], body).into_response())
 }
@@ -228,9 +302,12 @@ pub async fn login(
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
 
     let cookie = build_session_cookie(&session.token, session_ttl_days);
+    let user = user_response_from_store(user_store, user)
+        .await
+        .map_err(map_user_response_error)?;
     let body = Json(AuthResponse {
         token: session.token,
-        user: user.into(),
+        user,
     });
     Ok(([(axum::http::header::SET_COOKIE, cookie)], body).into_response())
 }
@@ -267,7 +344,10 @@ pub async fn get_me(
     headers: HeaderMap,
 ) -> AppResult<impl IntoResponse> {
     let user = get_current_user(&headers, &state).await?;
-    Ok(Json(UserResponse::from(user)))
+    let response = user_response_from_store(&state.user_store, user)
+        .await
+        .map_err(map_user_response_error)?;
+    Ok(Json(response))
 }
 
 pub async fn update_me(
@@ -300,7 +380,10 @@ pub async fn update_me(
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "not_found", "user not found"))?;
 
-    Ok(Json(UserResponse::from(updated_user)))
+    let response = user_response_from_store(user_store, updated_user)
+        .await
+        .map_err(map_user_response_error)?;
+    Ok(Json(response))
 }
 
 fn extract_client_ip(headers: &HeaderMap) -> Option<String> {

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Save, User, Lock, Globe, Mail } from "lucide-react";
+import { Save, User, Lock, Globe, Mail, Coins } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -19,7 +19,9 @@ import { PageWrapper, StaggerList, StaggerItem, motion, transitions } from "@/co
 import { PageHeader } from "@/components/ui/page-header";
 import { setLanguage, getCurrentLanguage } from "@/i18n";
 import { updateMeOptimistic } from "@/lib/swr";
-import { getGravatarUrl } from "@/lib/utils";
+import { formatUsdDecimal } from "@/lib/exact-decimal";
+import { formatPeriodShort, getGravatarUrl } from "@/lib/utils";
+import { GroupsBadge } from "@/components/GroupsBadge";
 import { toast } from "sonner";
 
 export function UserSettingsPage() {
@@ -132,6 +134,72 @@ export function UserSettingsPage() {
                   {savingEmail ? t("common.saving") : savedEmail ? t("common.saved") : t("common.save")}
                 </Button>
               </div>
+            </CardContent>
+          </Card>
+        </StaggerItem>
+
+        <StaggerItem>
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Coins className="h-5 w-5" />
+                {t("userSettings.billing")}
+              </CardTitle>
+              <CardDescription>{t("userSettings.billingDescription")}</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <p className="text-sm text-muted-foreground">{t("userSettings.currentBalance")}</p>
+                  <p className="text-xl font-semibold tabular-nums">
+                    {user?.balance_unlimited
+                      ? t("users.unlimited")
+                      : formatUsdDecimal(user?.balance_usd, 2)}
+                  </p>
+                </div>
+                <div className="space-y-1">
+                  <p className="text-sm text-muted-foreground">{t("userSettings.plan")}</p>
+                  <p className="text-xl font-semibold">
+                    {user?.billing_plan
+                      ? user.billing_plan.name
+                      : t("userSettings.noPlan")}
+                  </p>
+                  {user?.billing_plan && !user.billing_plan.enabled && (
+                    <p className="text-xs text-muted-foreground">{t("common.disabled")}</p>
+                  )}
+                </div>
+              </div>
+              {user?.billing_plan && (
+                <>
+                  <Separator />
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div className="space-y-1">
+                      <p className="text-sm text-muted-foreground">{t("userSettings.grantAmount")}</p>
+                      <p className="font-medium tabular-nums">
+                        {formatUsdDecimal(user.billing_plan.grant_amount_usd, 2)}
+                        {" / "}
+                        {formatPeriodShort(user.billing_plan.period_seconds)}
+                      </p>
+                    </div>
+                    <div className="space-y-1">
+                      <p className="text-sm text-muted-foreground">{t("userSettings.nextGrant")}</p>
+                      <p className="font-medium">
+                        {user.next_grant_at
+                          ? new Date(user.next_grant_at).toLocaleString()
+                          : t("common.never")}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <p className="text-sm text-muted-foreground">{t("users.allowedGroups")}</p>
+                    {user.billing_plan.allowed_groups.length > 0 ? (
+                      <GroupsBadge groups={user.billing_plan.allowed_groups} />
+                    ) : (
+                      <p className="text-sm">{t("userSettings.unrestrictedGroups")}</p>
+                    )}
+                  </div>
+                </>
+              )}
             </CardContent>
           </Card>
         </StaggerItem>

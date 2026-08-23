@@ -154,3 +154,52 @@ MUST be canonical (sorted, deduplicated).
 BP-U1. User responses returned by dashboard endpoints MUST include
 `billing_plan_id: Option<String>` and `next_grant_at: Option<String>` (RFC 3339; both are
 `null` when no plan is assigned).
+
+BP-U2. Every dashboard user JSON object from login, register,
+`GET /api/dashboard/auth/me`, `PUT /api/dashboard/auth/me`,
+`GET /api/dashboard/stats` field `current_user`, `POST /api/dashboard/users`,
+`GET /api/dashboard/users`, `GET /api/dashboard/users/{user_id}`, and
+`PUT /api/dashboard/users/{user_id}` MUST include `billing_plan` as JSON `null` or:
+
+```json
+{
+  "id": "plan-uuid",
+  "name": "starter",
+  "grant_amount_nano_usd": "10000000000",
+  "grant_amount_usd": "10",
+  "period_seconds": 86400,
+  "allowed_groups": [],
+  "enabled": true
+}
+```
+
+`billing_plan` MUST be the current `billing_plans` row for `billing_plan_id`.
+If `billing_plan_id` is null, `billing_plan` MUST be null. If `billing_plan_id` is
+non-null and no matching plan row exists, `billing_plan` MUST be null.
+Non-admin callers MUST receive this object from auth/me and MUST NOT be required
+to call `GET /api/dashboard/billing-plans`.
+
+BP-U3. `GET /api/dashboard/users` MUST include these additional fields on every listed user:
+
+- `today_calls: integer` — COUNT of `request_logs` rows with that `user_id` and
+  `created_at_unix_ms >= UTC calendar-day start` (`today_start` equals
+  `UTC date of now at 00:00:00.000`, the same instant used by
+  `GET /api/dashboard/analytics`);
+- `today_cost_nano_usd: string` — SUM of canonical in-range `charge_nano_usd` for
+  those rows. Aggregation MUST follow `spec/request-logs.spec.md` RL-S2e;
+- `today_cost_usd: string` — `format_nano_to_usd(today_cost_nano_usd)` with no
+  binary floating conversion.
+
+A listed user with no matching logs MUST have `today_calls = 0` and
+`today_cost_nano_usd = "0"`. These three fields MUST be omitted from login,
+register, me, stats `current_user`, create, get-by-id, and update responses.
+
+BP-U4. `GET /api/dashboard/users` MUST compute BP-U3 with one set-based
+`GROUP BY user_id` query. It MUST NOT issue one request-log query per listed user.
+It MUST resolve `billing_plan` objects with at most one billing-plan list (or an
+equivalent set-based join), not one plan lookup per listed user.
+
+BP-U5. A canonical stored charge outside the signed `i128` domain, or a per-user
+or cross-user sum outside that domain, MUST return HTTP `500` with code
+`internal_error`. Non-canonical stored charge text MUST not contribute to
+`today_cost_nano_usd` and MUST still contribute to `today_calls`.
