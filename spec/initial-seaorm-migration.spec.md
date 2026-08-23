@@ -165,7 +165,7 @@ ISM4.5. `request_logs` columns:
 - `created_at` TEXT NOT NULL
 - `created_at_unix_ms` BIGINT NULL
 
-ISM4.5a. `request_logs` MUST contain exactly the 42 columns listed by ISM4.5. `request_logs.user_id` is a historical identifier and MUST NOT have a foreign key to `users`. Deleting a user MUST preserve all request-log rows for that user.
+ISM4.5a. The initial migration MUST create `request_logs` with exactly the 42 columns listed by ISM4.5. Later migrations MAY add nullable columns beyond these 42 via `ALTER TABLE ADD COLUMN` per `request-logs.spec.md` RL-S4 (currently `session_affinity_value`). `request_logs.user_id` is a historical identifier and MUST NOT have a foreign key to `users`. Deleting a user MUST preserve all request-log rows for that user.
 
 ISM4.6. `system_settings` columns:
 
