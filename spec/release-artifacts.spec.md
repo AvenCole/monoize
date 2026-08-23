@@ -38,7 +38,7 @@ RA-M2. Each row MUST compile on a runner whose native architecture and operating
 
 RA-M3. Matrix `fail-fast` MUST equal `false`. A failed row MUST NOT cancel another running row.
 
-RA-M4. A row MUST install the stable Rust toolchain with the row's target and Bun `1.3.14`.
+RA-M4. A row MUST install the stable Rust toolchain with the row's target and Bun `1.4.0`.
 
 RA-M5. A row MUST run `bun install --frozen-lockfile` in `frontend/` before the Rust build.
 

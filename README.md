@@ -179,6 +179,21 @@ Open `http://localhost:8080`. The first registered account becomes `super_admin`
 3. Map a logical model to the Channel.
 4. Create an API key.
 
+### Docker
+
+The published image supports Linux x86-64 and ARM64. Run it with a persistent SQLite volume:
+
+```bash
+docker run -d \
+  --name monoize \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -v monoize-data:/app/data \
+  ghcr.io/ikaleio/monoize:latest
+```
+
+Set `MONOIZE_DATABASE_DSN` with `-e` to use PostgreSQL or a non-default SQLite location.
+
 Call the logical model through any supported downstream protocol:
 
 ```bash

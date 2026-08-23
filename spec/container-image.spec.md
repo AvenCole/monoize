@@ -1,0 +1,98 @@
+# Container Image Specification
+
+## 0. Status
+
+- **Purpose:** Build, run, and publish the Monoize Linux container image.
+- **Scope:** Applies to `Dockerfile`, `.dockerignore`, `.github/workflows/release.yml`, `README.md`, and `README.zh-CN.md`.
+
+## 1. Runtime image
+
+CI-R1. The final image MUST contain the release-mode `monoize` executable with the embedded dashboard.
+
+CI-R2. The final image MUST NOT contain Rust, Bun, source files, build caches, or frontend dependencies.
+
+CI-R3. The final image MUST run `monoize` as a non-root user named `monoize`.
+
+CI-R4. The image working directory MUST be `/app`.
+
+CI-R5. The image MUST create `/app/data` and declare it as a volume. With the default database configuration, Monoize MUST store its SQLite database at `/app/data/monoize.db`.
+
+CI-R6. The image MUST expose TCP port `8080`. Monoize MUST retain `0.0.0.0:8080` as its default listen address.
+
+CI-R7. The image MUST define an HTTP health check for `http://127.0.0.1:8080/`. The health check MUST use a 30-second interval, a 5-second timeout, a 10-second start period, and three retries.
+
+CI-R8. The final image MUST include CA certificates so that Monoize can establish TLS connections to upstream services.
+
+CI-R9. The image MUST declare these Open Container Initiative labels:
+
+- `org.opencontainers.image.title=Monoize`;
+- `org.opencontainers.image.description` with a factual product description;
+- `org.opencontainers.image.source=https://github.com/Ikaleio/monoize`;
+- `org.opencontainers.image.licenses=MIT`;
+- `org.opencontainers.image.version` from the `VERSION` build argument;
+- `org.opencontainers.image.revision` from the `REVISION` build argument.
+
+## 2. Build inputs
+
+CI-B1. The build stage MUST use Rust `1.89.0` on Debian Bookworm.
+
+CI-B2. The build stage MUST use Bun `1.4.0`.
+
+CI-B3. Every base image reference MUST include a multi-platform manifest digest.
+
+CI-B4. The build MUST run `bun install --frozen-lockfile` before compiling Monoize.
+
+CI-B5. The build MUST run `cargo build --locked --release`.
+
+CI-B6. The Docker build context MUST exclude Git metadata, local databases, environment files, native build output, frontend dependencies, SDK test dependencies, and deployment backups.
+
+## 3. Publication authority and triggers
+
+CI-P1. The publication workflow MUST publish to `ghcr.io/<lowercase github.repository>`.
+
+CI-P2. The workflow MUST use `GITHUB_TOKEN` with `contents: read` and `packages: write`. It MUST NOT require a personal access token.
+
+CI-P3. The container jobs MUST be part of `.github/workflows/release.yml`. They MUST run on a published GitHub Release. A manual workflow run MUST run the container jobs only when `publish_container` is true.
+
+CI-P4. For a GitHub Release, the workflow MUST check out `github.event.release.tag_name`. The tag MUST pass the release-tag and Cargo-version validation in `scripts/package_release.py` before a container build starts.
+
+CI-P5. A manual run MUST accept a Git ref, a `publish_container` boolean, and one container tag. When `publish_container` is true, it MUST check out that ref and publish only that exact container tag.
+
+CI-P6. A manual container tag MUST match `^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`.
+
+CI-P7. Concurrent workflow runs that target the same publication tag MUST execute sequentially. A newer run MUST NOT cancel an active run.
+
+CI-P8. For a GitHub Release, the container build MUST start only after the workflow uploads all twelve native Release assets successfully.
+
+CI-P9. For a manual run with `publish_container = true`, the container build MUST start only after the six-platform native preflight and checksum verification succeed.
+
+## 4. Platforms and tags
+
+CI-M1. One publication MUST build exactly these platforms on native GitHub-hosted runners:
+
+| Platform | Runner |
+| --- | --- |
+| `linux/amd64` | `ubuntu-24.04` |
+| `linux/arm64` | `ubuntu-24.04-arm` |
+
+CI-M2. The platform build jobs MUST push content-addressed images. The merge job MUST create one manifest list from the two resulting digests.
+
+CI-M3. The merge job MUST run only after both platform builds succeed.
+
+CI-M4. A Release tag `vMAJOR.MINOR.PATCH` MUST publish these tags:
+
+- `vMAJOR.MINOR.PATCH`;
+- `MAJOR.MINOR.PATCH`;
+- `MAJOR.MINOR`;
+- `MAJOR`;
+- `latest`.
+
+CI-M5. The workflow MUST inspect the published manifest after it creates all tags. A manifest creation or inspection failure MUST fail the workflow.
+
+## 5. User documentation
+
+CI-D1. Both READMEs MUST document the same `docker run` command.
+
+CI-D2. The documented command MUST publish host port `8080`, mount a named volume at `/app/data`, and use `ghcr.io/ikaleio/monoize:latest`.
+
+CI-D3. Both READMEs MUST identify `MONOIZE_DATABASE_DSN` as the method to select PostgreSQL or a non-default SQLite location.

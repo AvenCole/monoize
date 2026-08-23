@@ -178,6 +178,21 @@ cargo build --release
 3. 把逻辑模型映射到该 Channel。
 4. 创建一个 API Key。
 
+### Docker
+
+发布镜像支持 Linux x86-64 和 ARM64。使用持久化 SQLite 数据卷启动：
+
+```bash
+docker run -d \
+  --name monoize \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -v monoize-data:/app/data \
+  ghcr.io/ikaleio/monoize:latest
+```
+
+如需使用 PostgreSQL 或非默认 SQLite 路径，请通过 `-e` 设置 `MONOIZE_DATABASE_DSN`。
+
 通过任意受支持的下游协议调用这个逻辑模型：
 
 ```bash
