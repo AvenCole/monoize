@@ -15,7 +15,14 @@ import { Textarea } from "@/components/ui/textarea";
 import type { TransformRegistryItem, TransformRuleConfig } from "@/lib/api";
 import { ModelsGlobInput } from "./models-glob-input";
 import { SchemaFormFields } from "./schema-form-fields";
-import { getSchemaObject, validateTransformRule } from "./transform-schema";
+import {
+  getSchemaObject,
+  isJsonValuedProperty,
+  isRequiredSchemaKey,
+  jsonFieldInitialText,
+  parseJsonConfigField,
+  validateTransformRule,
+} from "./transform-schema";
 
 type TransformItemConfigDialogProps = {
   open: boolean;
@@ -104,17 +111,16 @@ function TransformItemConfigDialogInner({
     if (raw === undefined) {
       return true;
     }
-    try {
-      const parsed = JSON.parse(raw);
-      updateConfigField(key, parsed);
-      return true;
-    } catch {
+    const parsed = parseJsonConfigField(raw, isRequiredSchemaKey(schema, key));
+    if (parsed.kind === "error") {
       setFieldErrors((prev) => ({
         ...prev,
         [key]: t("transforms.validationInvalidJson"),
       }));
       return false;
     }
+    updateConfigField(key, parsed.kind === "omit" ? undefined : parsed.value);
+    return true;
   };
 
   const validateAndSave = () => {
@@ -124,14 +130,18 @@ function TransformItemConfigDialogInner({
     };
 
     for (const [key, raw] of Object.entries(rawJsonInputs)) {
-      try {
-        candidate.config[key] = JSON.parse(raw);
-      } catch {
+      const parsed = parseJsonConfigField(raw, isRequiredSchemaKey(schema, key));
+      if (parsed.kind === "error") {
         setFieldErrors((prev) => ({
           ...prev,
           [key]: t("transforms.validationInvalidJson"),
         }));
         return;
+      }
+      if (parsed.kind === "omit") {
+        delete candidate.config[key];
+      } else {
+        candidate.config[key] = parsed.value;
       }
     }
 
@@ -202,6 +212,8 @@ function TransformItemConfigDialogInner({
                 config={draftRule.config}
                 errors={fieldErrors}
                 rawJsonInputs={rawJsonInputs}
+                jsonFieldPlaceholder={t("transforms.jsonFieldPlaceholder")}
+                jsonFieldOptionalHint={t("transforms.jsonFieldOptionalHint")}
                 onFieldChange={updateConfigField}
                 onRawJsonInputChange={(key, value) =>
                   setRawJsonInputs((prev) => ({ ...prev, [key]: value }))
@@ -254,14 +266,10 @@ function buildRawJsonInputs(
   const properties = schema?.properties ?? {};
   const rawByKey: Record<string, string> = {};
   for (const [key, property] of Object.entries(properties)) {
-    if (property?.type || Array.isArray(property?.enum)) {
+    if (!isJsonValuedProperty(property)) {
       continue;
     }
-    rawByKey[key] = JSON.stringify(
-      Object.prototype.hasOwnProperty.call(rule.config, key) ? rule.config[key] : null,
-      null,
-      2
-    );
+    rawByKey[key] = jsonFieldInitialText(rule.config, key);
   }
   return rawByKey;
 }

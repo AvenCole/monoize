@@ -171,11 +171,11 @@ I6. Idempotency window is permanent: `billing_ledger.idempotency_key` values per
 
 ## 8. Schema change
 
-SC1. Migration `m20260823_000032_billing_ledger_delta_dedupe` MUST add nullable TEXT column `idempotency_key` to `billing_ledger` plus one partial unique index over it restricted to rows where it is not null, identically on SQLite and PostgreSQL. Pre-existing rows keep NULL. Writers other than ingest apply leave the column NULL. The down migration MUST drop the index then the column.
+SC1. Migration `m20260823_000033_billing_ledger_delta_dedupe` MUST add nullable TEXT column `idempotency_key` to `billing_ledger` plus one partial unique index over it restricted to rows where it is not null, identically on SQLite and PostgreSQL. Pre-existing rows keep NULL. Writers other than ingest apply leave the column NULL. The down migration MUST drop the index then the column.
 
 SC2. `state_records` gains no schema change; the config epoch row (E1) is created lazily by the first settings mutation.
 
-SC3. Migration `m20260823_000033_channel_egress_proxy` MUST add nullable TEXT column `proxy_url` to `monoize_channels`, defaulting to NULL (follow-global) for all existing rows, identically on SQLite and PostgreSQL. The down migration MUST drop the column.
+SC3. Migration `m20260823_000034_channel_egress_proxy` MUST add nullable TEXT column `proxy_url` to `monoize_channels`, defaulting to NULL (follow-global) for all existing rows, identically on SQLite and PostgreSQL. The down migration MUST drop the column.
 
 ## 9. Manual failover
 

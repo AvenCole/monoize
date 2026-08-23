@@ -38,8 +38,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260809_000029_sessions_expires_at_index::Migration),
             Box::new(m20260809_000030_normalize_billing_json_nulls::Migration),
             Box::new(m20260809_000031_request_logs_without_user_fk::Migration),
-            Box::new(m20260823_000032_billing_ledger_delta_dedupe::Migration),
-            Box::new(m20260823_000033_channel_egress_proxy::Migration),
+            Box::new(m20260823_000032_billing_plan_subscriptions::Migration),
+            Box::new(m20260823_000033_billing_ledger_delta_dedupe::Migration),
+            Box::new(m20260823_000034_channel_egress_proxy::Migration),
         ]
     }
 }
@@ -207,8 +208,9 @@ mod m20260809_000028_channel_model_name_index;
 mod m20260809_000029_sessions_expires_at_index;
 mod m20260809_000030_normalize_billing_json_nulls;
 mod m20260809_000031_request_logs_without_user_fk;
-mod m20260823_000032_billing_ledger_delta_dedupe;
-mod m20260823_000033_channel_egress_proxy;
+mod m20260823_000032_billing_plan_subscriptions;
+mod m20260823_000033_billing_ledger_delta_dedupe;
+mod m20260823_000034_channel_egress_proxy;
 
 #[cfg(test)]
 mod tests {

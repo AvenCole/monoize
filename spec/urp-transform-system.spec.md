@@ -324,6 +324,8 @@ SF-2. Config MUST contain `path` as a non-empty string and `value` as any JSON v
 
 SF-3. If `when_equals` is absent, `set_field` MUST write `value` at `path` without inspecting the current value.
 
+SF-3a. JSON `null` is a present `when_equals` value. It MUST NOT be treated as absent. When `when_equals` is JSON `null`, `set_field` MUST write `value` only when the current value at `path` is JSON `null`.
+
 SF-4. If `when_equals` is present, `set_field` MUST write `value` only when the current value at `path` is exactly equal to `when_equals` under JSON structural equality. A missing path or a different value MUST be a no-op and MUST NOT create intermediate objects.
 
 SF-5. On a request, a path that starts with `reasoning.` MUST target `request.reasoning.extra_body`. Every other path MUST target `request.extra_body`.

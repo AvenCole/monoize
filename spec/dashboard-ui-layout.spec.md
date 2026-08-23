@@ -90,6 +90,21 @@ PL9. Provider transform config dialog MUST:
 - edit transform `config` using schema-driven fields from `/api/dashboard/transforms/registry`
 - block save when schema validation fails
 
+PL9b. A config schema property that has neither `type` nor `enum` is a JSON-valued field. The transform config dialog MUST render that field as a JSON text input.
+
+PL9c. When the transform config dialog opens, each JSON-valued field's text input MUST initialize as follows:
+1. If the existing rule config contains that key, the input text is `JSON.stringify(existingValue)` with two-space pretty-print.
+2. If the existing rule config does not contain that key, the input text is the empty string.
+The dialog MUST NOT initialize an absent JSON-valued field as the text `null`.
+
+PL9d. Saving a JSON-valued field MUST parse the trimmed input text with this procedure:
+1. If the trimmed input is empty and the property is not listed in schema `required`, the saved config MUST omit that key.
+2. If the trimmed input is empty and the property is listed in schema `required`, save MUST fail with the invalid-JSON error.
+3. If `JSON.parse` succeeds, the saved config MUST store the parsed JSON value at that key, including JSON `null`.
+4. If `JSON.parse` fails and the trimmed input does not start with `{`, `[`, or `"`, the saved config MUST store the trimmed input as a JSON string.
+5. Otherwise save MUST fail with the invalid-JSON error.
+Empty optional JSON-valued input MUST NOT fail save as invalid JSON.
+
 PL10. If a provider transform item type is not present in transform registry, editor MUST:
 
 - keep item visible with unknown marker
