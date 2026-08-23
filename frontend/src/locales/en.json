@@ -56,7 +56,8 @@
 		"logs": "Logs",
 		"models": "Models",
 		"marketplace": "Models",
-		"billingPlans": "Plans"
+		"billingPlans": "Plans",
+		"adminDashboard": "System Dashboard"
 	},
 	"roles": {
 		"super_admin": "Super Admin",
@@ -821,7 +822,9 @@
 		"timeRangeLastMonth": "Last Month",
 		"timeRangeFrom": "From: yyyy-MM-dd HH:mm:ss",
 		"timeRangeTo": "To: yyyy-MM-dd HH:mm:ss",
-		"toggleFilters": "Toggle Filters"
+		"toggleFilters": "Toggle Filters",
+		"visibleWindowTps": "Visible Window TPS",
+		"sessionAffinity": "Session Affinity"
 	},
 	"billingPlans": {
 		"title": "Billing Plans",
@@ -853,5 +856,51 @@
 		"resetSuccess": "Reset {{count}} subscriber(s)",
 		"none": "No plan",
 		"nextReset": "{{name}} — next reset {{time}}"
+	},
+	"adminDashboard": {
+		"title": "System Dashboard",
+		"subtitle": "System status, user usage ranking, model/channel health and replica status",
+		"systemStatus": "System Status",
+		"nodeRole": "Node role",
+		"version": "Version",
+		"uptime": "Uptime",
+		"startedAt": "Started at",
+		"listen": "Listen",
+		"metricsPath": "Metrics path",
+		"database": "Database",
+		"upstreamProxy": "Egress proxy",
+		"pendingRequestLogs": "Pending request logs",
+		"sseConnections": "SSE connections",
+		"routingRevision": "Routing revision",
+		"replicaStatus": "Replica Status",
+		"ingestEnabled": "Replica ingest",
+		"enabled": "Enabled",
+		"disabled": "Disabled",
+		"noReplicaToken": "No replica token configured; there is nothing to monitor.",
+		"spoolPendingCount": "Spool pending files",
+		"spoolPendingBytes": "Spool pending bytes",
+		"usageRanking": "User Usage Ranking (24h)",
+		"username": "User",
+		"calls": "Calls",
+		"cost": "Cost",
+		"noUsage": "No usage in the last 24 hours",
+		"channelHealth": "Model / Channel Health",
+		"channel": "Channel",
+		"weight": "Weight",
+		"affinity": "Affinity",
+		"status": "Status",
+		"lastProbe": "Last probe",
+		"healthy": "Healthy",
+		"unhealthy": "Unhealthy",
+		"coolingDown": "Cooling down",
+		"noChannels": "No channels configured",
+		"healthEntries": "Tracked health entries",
+		"affinityEntries": "Affinity bindings",
+		"refresh": "Refresh",
+		"retry": "Retry",
+		"autoRefresh": "Auto refresh 10s",
+		"unauthorized": "Administrator access required",
+		"unauthorizedDescription": "This page is only available to administrators.",
+		"loadFailed": "Failed to load system overview"
 	}
 }

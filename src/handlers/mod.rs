@@ -269,6 +269,7 @@ pub async fn create_response(
                 downstream,
                 request_id.clone(),
                 request_ip.clone(),
+                extract_client_session_id(&headers),
                 capture.clone(),
             ),
         );
@@ -285,6 +286,7 @@ pub async fn create_response(
         DownstreamProtocol::Responses,
         request_id,
         request_ip,
+        extract_client_session_id(&headers),
         capture,
     )
     .await?;
@@ -330,6 +332,7 @@ pub async fn create_chat_completions(
                 downstream,
                 request_id.clone(),
                 request_ip.clone(),
+                extract_client_session_id(&headers),
                 capture.clone(),
             ),
         );
@@ -345,6 +348,7 @@ pub async fn create_chat_completions(
         DownstreamProtocol::ChatCompletions,
         request_id,
         request_ip,
+        extract_client_session_id(&headers),
         capture,
     )
     .await?;
@@ -402,6 +406,7 @@ async fn create_messages_inner(
                 downstream,
                 request_id.clone(),
                 request_ip.clone(),
+                extract_client_session_id(&headers),
                 capture.clone(),
             ),
         );
@@ -417,6 +422,7 @@ async fn create_messages_inner(
         DownstreamProtocol::AnthropicMessages,
         request_id,
         request_ip,
+        extract_client_session_id(&headers),
         capture,
     )
     .await?;
@@ -523,7 +529,8 @@ pub async fn create_embeddings(
     let request_ip = extract_client_ip(&headers);
     let started_at = std::time::Instant::now();
     let routing_stub = build_embeddings_routing_stub(&logical_model, max_multiplier);
-    let attempts = build_monoize_attempts(&state, &routing_stub, &auth).await?;
+    let mut attempts = build_monoize_attempts(&state, &routing_stub, &auth).await?;
+    attach_client_session_id(&mut attempts, extract_client_session_id(&headers));
     ensure_balance_before_forward_for_attempts(&state, &auth, &attempts).await?;
     let _pending_request_log_guard = insert_pending_request_log(
         &state,
@@ -828,6 +835,12 @@ struct MonoizeAttempt {
     extra_headers: Option<std::collections::BTreeMap<String, String>>,
     /// CM-AFF-2: derive per-request session affinity for this Channel.
     session_affinity_auto: bool,
+    /// CM-AFF-1a: client-supplied session id (codex-style `session_id` or
+    /// `x-session-affinity` header) passed through to the upstream.
+    client_session_id: Option<String>,
+    /// CM-AFF-4: the effective `x-session-affinity` value sent upstream, for
+    /// request-log persistence.
+    session_affinity_value: Option<String>,
 }
 
 fn reasoning_envelope_provider_type(provider_type: ProviderType) -> &'static str {

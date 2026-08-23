@@ -6,6 +6,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { LoginPage } from "@/pages/login";
 import { DashboardLayout } from "@/pages/layout";
 import { DashboardPage } from "@/pages/dashboard";
+import { AdminDashboardPage } from "@/pages/admin-dashboard";
 import { ProvidersPage } from "@/pages/providers";
 import { ApiKeysPage } from "@/pages/api-keys";
 import { UsersPage } from "@/pages/users";
@@ -34,6 +35,7 @@ function App() {
           {/* Dashboard routes - admin panel */}
           <Route path="/dashboard" element={<DashboardLayout />}>
             <Route index element={<DashboardPage />} />
+            <Route path="admin" element={<AdminDashboardPage />} />
             <Route path="providers" element={<ProvidersPage />} />
             <Route path="tokens" element={<ApiKeysPage />} />
             <Route path="logs" element={<RequestLogsPage />} />

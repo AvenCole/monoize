@@ -31,49 +31,66 @@ function requestLog(overrides: Partial<RequestLog> = {}): RequestLog {
 }
 
 describe('computeTps', () => {
-	test('displays short samples without a minimum duration or token threshold', () => {
+	test('pairs the total output numerator with the wall-clock generation window', () => {
 		const result = computeTps(
 			requestLog({
-				tokens: { output: 4 },
+				tokens: { output: 30 },
+				timing: { duration_ms: 1200, ttfb_ms: 200 }
+			})
+		)
+
+		expect(result.state).toBe('display')
+		if (result.state === 'display') {
+			expect(result.average).toEqual({ value: 30, tokens: 30, denominatorMs: 1000 })
+			expect(result.visible).toBeNull()
+		}
+	})
+
+	test('shows the visible-window TPS beside the average when a visible basis exists', () => {
+		const result = computeTps(
+			requestLog({
+				tokens: { output: 30 },
+				timing: {
+					duration_ms: 1200,
+					ttfb_ms: 200,
+					visible_output_tokens: 12,
+					visible_generation_ms: 500
+				}
+			})
+		)
+
+		expect(result.state).toBe('display')
+		if (result.state === 'display') {
+			expect(result.average).toEqual({ value: 30, tokens: 30, denominatorMs: 1000 })
+			expect(result.visible).toEqual({ value: 24, tokens: 12, denominatorMs: 500 })
+		}
+	})
+
+	test('falls back to the visible basis when no output total exists', () => {
+		const result = computeTps(
+			requestLog({
 				timing: { visible_output_tokens: 4, visible_generation_ms: 250 }
 			})
 		)
 
-		expect(result).toEqual({
-			state: 'display',
-			value: 16,
-			tokens: 4,
-			denominatorMs: 250
-		})
-	})
-
-	test('prefers non-reasoning usage tokens over the visible byte estimate', () => {
-		const result = computeTps(
-			requestLog({
-				tokens: { output: 30, reasoning: 10 },
-				timing: { visible_output_tokens: 12, visible_generation_ms: 500 }
-			})
-		)
-
 		expect(result.state).toBe('display')
 		if (result.state === 'display') {
-			expect(result.tokens).toBe(20)
-			expect(result.value).toBe(40)
+			expect(result.average).toEqual({ value: 16, tokens: 4, denominatorMs: 250 })
+			expect(result.visible).toBeNull()
 		}
 	})
 
-	test('falls back from a zero visible window to duration minus TTFB', () => {
+	test('uses duration when TTFB is absent', () => {
 		const result = computeTps(
 			requestLog({
 				tokens: { output: 12 },
-				timing: { duration_ms: 900, ttfb_ms: 300, visible_generation_ms: 0 }
+				timing: { duration_ms: 900 }
 			})
 		)
 
 		expect(result.state).toBe('display')
 		if (result.state === 'display') {
-			expect(result.denominatorMs).toBe(600)
-			expect(result.value).toBe(20)
+			expect(result.average).toEqual({ value: 12 / 0.9, tokens: 12, denominatorMs: 900 })
 		}
 	})
 

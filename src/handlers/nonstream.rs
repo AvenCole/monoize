@@ -137,6 +137,7 @@ pub(super) async fn execute_nonstream_typed(
     downstream: DownstreamProtocol,
     request_id: Option<String>,
     request_ip: Option<String>,
+    client_session_id: Option<String>,
     capture: RequestCaptureContext,
 ) -> AppResult<(urp::UrpResponse, String)> {
     execute_nonstream_typed_with_validator(
@@ -147,6 +148,7 @@ pub(super) async fn execute_nonstream_typed(
         downstream,
         request_id,
         request_ip,
+        client_session_id,
         capture,
         None,
         None,
@@ -163,6 +165,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
     downstream: DownstreamProtocol,
     request_id: Option<String>,
     request_ip: Option<String>,
+    client_session_id: Option<String>,
     capture: RequestCaptureContext,
     response_validator: Option<fn(&urp::UrpResponse) -> AppResult<()>>,
     task_state: Option<&AdmittedRequestTaskState>,
@@ -179,7 +182,8 @@ pub(super) async fn execute_nonstream_typed_with_validator(
     let original_req = req.clone();
     let logical_model = req.model.clone();
     let routing_stub = build_routing_stub(&req, max_multiplier);
-    let attempts = build_monoize_attempts(state, &routing_stub, auth).await?;
+    let mut attempts = build_monoize_attempts(state, &routing_stub, auth).await?;
+    attach_client_session_id(&mut attempts, client_session_id);
     ensure_balance_before_forward_for_attempts(state, auth, &attempts).await?;
     let pending_request_log_guard = insert_pending_request_log(
         state,
@@ -200,7 +204,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
     let mut last_failed_attempt: Option<MonoizeAttempt> = None;
     let mut tried_providers: Vec<TriedProvider> = Vec::new();
     let mut execution_state = AttemptExecutionState::default();
-    for attempt in attempts {
+    for mut attempt in attempts {
         if !execution_state.provider_budget_remaining(&attempt) {
             continue;
         }
@@ -370,6 +374,9 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     .stream_idle_timeout_ms
                     .max(1);
                 let http = client_http_for_attempt(state, &attempt)?;
+                let extra_headers = attempt_extra_headers(&attempt, &upstream_body);
+                attempt.session_affinity_value =
+                    resolve_session_affinity_value(&attempt, &upstream_body);
                 let call = upstream::call_upstream_raw_with_timeout_and_headers(
                     &http,
                     &provider,
@@ -377,7 +384,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     &path,
                     &upstream_body,
                     attempt.request_timeout_ms.saturating_mul(10).max(600_000),
-                    &attempt_extra_headers(&attempt, &upstream_body),
+                    &extra_headers,
                 )
                 .await;
                 match call {
@@ -464,6 +471,9 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     }
                 };
                 let http = client_http_for_attempt(state, &attempt)?;
+                let extra_headers = attempt_extra_headers(&attempt, &upstream_body);
+                attempt.session_affinity_value =
+                    resolve_session_affinity_value(&attempt, &upstream_body);
                 match upstream::call_upstream_multipart_with_timeout_and_headers(
                     &http,
                     &provider,
@@ -471,7 +481,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     &path,
                     form,
                     attempt.request_timeout_ms,
-                    &attempt_extra_headers(&attempt, &upstream_body),
+                    &extra_headers,
                 )
                 .await
                 {
@@ -498,6 +508,9 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                 }
             } else {
                 let http = client_http_for_attempt(state, &attempt)?;
+                let extra_headers = attempt_extra_headers(&attempt, &upstream_body);
+                attempt.session_affinity_value =
+                    resolve_session_affinity_value(&attempt, &upstream_body);
                 upstream::call_upstream_with_timeout_and_headers(
                     &http,
                     &provider,
@@ -505,7 +518,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     &path,
                     &upstream_body,
                     attempt.request_timeout_ms,
-                    &attempt_extra_headers(&attempt, &upstream_body),
+                    &extra_headers,
                 )
                 .await
                 .map(|value| (Some(value), None))
@@ -1022,6 +1035,7 @@ pub(super) async fn forward_nonstream_typed(
     downstream: DownstreamProtocol,
     request_id: Option<String>,
     request_ip: Option<String>,
+    client_session_id: Option<String>,
     capture: RequestCaptureContext,
 ) -> AppResult<Value> {
     let (resp, logical_model) = execute_nonstream_typed(
@@ -1032,6 +1046,7 @@ pub(super) async fn forward_nonstream_typed(
         downstream,
         request_id,
         request_ip,
+        client_session_id,
         capture,
     )
     .await?;

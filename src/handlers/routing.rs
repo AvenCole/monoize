@@ -671,7 +671,20 @@ pub(super) async fn collect_provider_attempts(
             proxy_url: channel.proxy_url.clone(),
             extra_headers: channel.extra_headers.clone(),
             session_affinity_auto: channel.session_affinity_auto.unwrap_or(false),
+            client_session_id: None,
+            session_affinity_value: None,
         });
+    }
+}
+
+/// CM-AFF-1a: stamp every freshly built attempt with the client-supplied
+/// session id extracted from the incoming request headers.
+pub(super) fn attach_client_session_id(
+    attempts: &mut [MonoizeAttempt],
+    client_session_id: Option<String>,
+) {
+    for attempt in attempts {
+        attempt.client_session_id = client_session_id.clone();
     }
 }
 
@@ -829,9 +842,9 @@ pub(super) fn provider_extra_headers(
     }
 }
 
-/// CM-HDR-1 + CM-AFF-1/2: protocol headers first, then the Channel's static
-/// `extra_headers`, then a derived `x-session-affinity` when the Channel
-/// enables automatic session affinity and no explicit value was configured.
+/// CM-HDR-1 + CM-AFF-1/1a/2: protocol headers first, then the Channel's static
+/// `extra_headers`, then a client-supplied or derived `x-session-affinity`
+/// value when the Channel enables automatic session affinity.
 pub(super) fn attempt_extra_headers(
     attempt: &MonoizeAttempt,
     body: &serde_json::Value,
@@ -845,19 +858,55 @@ pub(super) fn attempt_extra_headers(
             out.push((name.clone(), value.clone()));
         }
     }
-    if attempt.session_affinity_auto
-        && !out
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("x-session-affinity"))
-        && let Some(value) = derive_session_affinity(body)
+    if !out
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("x-session-affinity"))
+        && let Some(value) = resolve_session_affinity_value(attempt, body)
     {
         out.push(("x-session-affinity".to_string(), value));
     }
     out
 }
 
+/// CM-AFF-1/1a/2 + CM-AFF-4: the single effective `x-session-affinity` value
+/// for one attempt. Priority: explicit static `extra_headers` entry, then the
+/// client-supplied session id, then body derivation.
+pub(super) fn resolve_session_affinity_value(
+    attempt: &MonoizeAttempt,
+    body: &serde_json::Value,
+) -> Option<String> {
+    if !attempt.session_affinity_auto {
+        return None;
+    }
+    if let Some(value) = attempt
+        .extra_headers
+        .as_ref()
+        .and_then(|headers| {
+            headers.iter().find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("x-session-affinity")
+                    .then_some(value.as_str())
+            })
+        })
+    {
+        return Some(value.to_string());
+    }
+    if let Some(client) = attempt.client_session_id.as_deref() {
+        return Some(client.to_string());
+    }
+    derive_session_affinity(body)
+}
+
 const SESSION_AFFINITY_MAX_KEY_CHARS: usize = 128;
-const SESSION_AFFINITY_HEX_LEN: usize = 16;
+
+/// Restrict a raw affinity value to printable ASCII, at most
+/// `SESSION_AFFINITY_MAX_KEY_CHARS` characters, after trimming.
+pub(super) fn sanitize_session_affinity(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| ('\u{20}'..='\u{7e}').contains(c))
+        .take(SESSION_AFFINITY_MAX_KEY_CHARS)
+        .collect()
+}
 
 /// CM-AFF-2: pure function of the request body. `prompt_cache_key` wins when
 /// present; otherwise a digest over the stable conversation head (instructions,
@@ -868,12 +917,7 @@ pub(super) fn derive_session_affinity(body: &serde_json::Value) -> Option<String
     use sha2::Digest;
 
     if let Some(key) = body.get("prompt_cache_key").and_then(Value::as_str) {
-        let sanitized: String = key
-            .trim()
-            .chars()
-            .filter(|c| ('\u{20}'..='\u{7e}').contains(c))
-            .take(SESSION_AFFINITY_MAX_KEY_CHARS)
-            .collect();
+        let sanitized = sanitize_session_affinity(key);
         if !sanitized.is_empty() {
             return Some(sanitized);
         }

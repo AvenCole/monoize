@@ -357,6 +357,7 @@ fn dummy_request_log() -> monoize::users::InsertRequestLog {
         affinity_hit: None,
         affinity_key_hash: None,
         affinity_target: None,
+        session_affinity_value: None,
         created_at: chrono::Utc::now(),
     }
 }

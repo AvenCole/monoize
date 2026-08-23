@@ -522,6 +522,7 @@ export interface RequestLog {
   reasoning_effort?: string;
   request_ip?: string;
   tried_providers?: Array<{ provider_id: string; channel_id: string; error: string }>;
+  session_affinity_value?: string | null;
   provider: RequestLogProvider;
   channel: RequestLogChannel;
   affinity?: RequestLogAffinity;
@@ -532,6 +533,63 @@ export interface RequestLog {
   billing: RequestLogBilling;
   usage?: Record<string, unknown>;
   error: RequestLogError;
+}
+
+export interface AdminOverviewNode {
+  role: string;
+  version: string;
+  started_at: string;
+  uptime_seconds: number;
+  listen: string;
+  metrics_path: string;
+  database_backend: string;
+  database_dsn_redacted: string;
+  upstream_proxy_url?: string | null;
+}
+
+export interface AdminOverviewReplica {
+  ingest_enabled: boolean;
+  spool_pending_count: number;
+  spool_pending_bytes: number;
+}
+
+export interface AdminOverviewSystem {
+  pending_request_logs: number;
+  sse_connections: number;
+  channel_health_entries: number;
+  channel_affinity_entries: number;
+  routing_config_revision: string;
+}
+
+export interface AdminOverviewUserRanking {
+  user_id: string;
+  username?: string | null;
+  call_count: number;
+  cost_nano_usd: string;
+}
+
+export interface AdminOverviewChannelHealth {
+  provider_id: string;
+  provider_name: string;
+  channel_id: string;
+  channel_name: string;
+  enabled: boolean;
+  weight: number;
+  session_affinity_auto: boolean;
+  healthy: boolean;
+  last_success_at?: number | null;
+  cooldown_until?: number | null;
+  probe_success_count: number;
+  last_probe_at?: number | null;
+  cooldown_active: boolean;
+}
+
+export interface AdminOverview {
+  node: AdminOverviewNode;
+  replica: AdminOverviewReplica;
+  system: AdminOverviewSystem;
+  users_ranking: AdminOverviewUserRanking[];
+  channel_health: AdminOverviewChannelHealth[];
 }
 
 export interface DashboardAnalyticsBucket {
@@ -954,6 +1012,10 @@ class ApiClient {
     params.set("buckets", String(buckets));
     params.set("range_hours", String(rangeHours));
     return this.request(`/analytics?${params.toString()}`);
+  }
+
+  async getAdminOverview(): Promise<AdminOverview> {
+    return this.request("/admin/overview");
   }
 
   async testChannel(providerId: string, channelId: string, model?: string): Promise<ChannelTestResult> {

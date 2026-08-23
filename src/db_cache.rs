@@ -186,9 +186,9 @@ pub(crate) fn last_used_bulk_update(
 // RequestLogBatcher: buffers InsertRequestLog entries, flushes as batch INSERT
 // ---------------------------------------------------------------------------
 
-const REQUEST_LOG_INSERT_COLUMNS: usize = 42;
+const REQUEST_LOG_INSERT_COLUMNS: usize = 43;
 pub(crate) const REQUEST_LOG_INSERT_CHUNK_ENTRIES: usize = 20;
-const REQUEST_LOG_MIN_ENTRY_BYTES: u64 = 4_096;
+pub(crate) const REQUEST_LOG_MIN_ENTRY_BYTES: u64 = 4_096;
 const REQUEST_LOG_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const REQUEST_LOG_RETRY_MAX_DELAY: Duration = Duration::from_millis(1_000);
 const REQUEST_LOG_RESERVATION_UNARMED: u8 = 0;
@@ -208,6 +208,7 @@ const REQUEST_LOG_INSERT_PREFIX: &str = r#"INSERT INTO request_logs
         visible_generation_ms, visible_output_tokens, tps_mode,
         request_ip, reasoning_effort, tried_providers_json, request_kind,
         effective_provider_type, affinity_hit, affinity_key_hash, affinity_target,
+        session_affinity_value,
         created_at, created_at_unix_ms)
        VALUES "#;
 
@@ -267,6 +268,7 @@ pub struct SpoolRequestLog {
     pub affinity_hit: Option<bool>,
     pub affinity_key_hash: Option<String>,
     pub affinity_target: Option<String>,
+    pub session_affinity_value: Option<String>,
     pub created_at: String,
     pub created_at_unix_ms: i64,
 }
@@ -314,6 +316,7 @@ impl SpoolRequestLog {
             affinity_hit: log.affinity_hit,
             affinity_key_hash: log.affinity_key_hash.clone(),
             affinity_target: log.affinity_target.clone(),
+            session_affinity_value: log.session_affinity_value.clone(),
             created_at: log.created_at.to_rfc3339(),
             created_at_unix_ms: log.created_at.timestamp_millis(),
         }
@@ -432,6 +435,7 @@ fn request_log_insert_values(log: &SpoolRequestLog) -> Vec<sea_orm::Value> {
             .unwrap_or(SeaValue::Int(None)),
         log.affinity_key_hash.clone().into(),
         log.affinity_target.clone().into(),
+        log.session_affinity_value.clone().into(),
         log.created_at.clone().into(),
         log.created_at_unix_ms.into(),
     ]
@@ -2065,6 +2069,7 @@ mod tests {
             affinity_hit: Some(true),
             affinity_key_hash: Some("hash".to_string()),
             affinity_target: Some("target".to_string()),
+            session_affinity_value: Some("ses-1".to_string()),
             created_at: "2026-08-09T00:00:00+00:00".to_string(),
             created_at_unix_ms: 1_786_233_600_000,
         }
@@ -2112,6 +2117,7 @@ mod tests {
             affinity_hit: None,
             affinity_key_hash: None,
             affinity_target: None,
+            session_affinity_value: None,
             created_at: Utc::now(),
         }
     }
@@ -2242,7 +2248,7 @@ mod tests {
             .map(|chunk| request_log_insert_chunk(chunk.iter()).1.len())
             .collect::<Vec<_>>();
 
-        assert_eq!(bind_counts, vec![840, 840, 42]);
+        assert_eq!(bind_counts, vec![860, 860, 43]);
         assert!(bind_counts.into_iter().all(|count| count <= 999));
     }
 

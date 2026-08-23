@@ -44,7 +44,7 @@ pub async fn compact_response(
     let routing_request = urp::decode::openai_responses::decode_request(&body)
         .map_err(|message| AppError::new(StatusCode::BAD_REQUEST, "invalid_request", message))?;
     let routing_stub = build_routing_stub(&routing_request, max_multiplier);
-    let attempts = build_monoize_attempts_for_provider_type(
+    let mut attempts = build_monoize_attempts_for_provider_type(
         &state,
         &routing_stub,
         &auth,
@@ -58,6 +58,7 @@ pub async fn compact_response(
             format!("model '{logical_model}' has no Responses provider"),
         ));
     }
+    attach_client_session_id(&mut attempts, extract_client_session_id(&headers));
     ensure_balance_before_forward_for_attempts(&state, &auth, &attempts).await?;
 
     let request_id = extract_request_id(&headers);
@@ -91,7 +92,7 @@ pub async fn compact_response(
     let mut tried_providers = Vec::new();
     let mut execution_state = AttemptExecutionState::default();
 
-    for attempt in attempts {
+    for mut attempt in attempts {
         if !execution_state.provider_budget_remaining(&attempt) {
             continue;
         }
@@ -111,6 +112,9 @@ pub async fn compact_response(
             }
             let provider = build_channel_provider_config(&attempt);
             let http = client_http_for_attempt(&state, &attempt)?;
+            let extra_headers = attempt_extra_headers(&attempt, &upstream_body);
+            attempt.session_affinity_value =
+                resolve_session_affinity_value(&attempt, &upstream_body);
             let result = upstream::call_upstream_with_timeout_and_headers(
                 &http,
                 &provider,
@@ -118,7 +122,7 @@ pub async fn compact_response(
                 "/v1/responses/compact",
                 &upstream_body,
                 attempt.request_timeout_ms,
-                &attempt_extra_headers(&attempt, &upstream_body),
+                &extra_headers,
             )
             .await;
 

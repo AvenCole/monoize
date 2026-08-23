@@ -173,6 +173,8 @@ impl Drop for RequestLogLifecycle {
 #[derive(Clone)]
 pub struct AppState {
     pub runtime: Arc<RuntimeConfig>,
+    /// Process start instant, captured once when this state is built.
+    pub started_at: chrono::DateTime<chrono::Utc>,
     pub auth: AuthState,
     pub http: reqwest::Client,
     pub http_clients: HttpClients,
@@ -892,6 +894,7 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
 
     Ok(AppState {
         runtime: Arc::new(runtime),
+        started_at: chrono::Utc::now(),
         auth,
         http,
         http_clients,
@@ -1400,6 +1403,7 @@ fn build_active_probe_interrupted_log(
         affinity_hit: None,
         affinity_key_hash: None,
         affinity_target: None,
+        session_affinity_value: None,
         created_at,
     }
 }
@@ -1530,6 +1534,7 @@ async fn persist_active_probe_request_log(
         affinity_hit: None,
         affinity_key_hash: None,
         affinity_target: None,
+        session_affinity_value: None,
         created_at,
     };
 
@@ -2112,5 +2117,9 @@ fn build_dashboard_api_router() -> Router<AppState> {
         .route(
             "/dashboard/analytics",
             get(crate::dashboard_handlers::get_dashboard_analytics),
+        )
+        .route(
+            "/dashboard/admin/overview",
+            get(crate::dashboard_handlers::get_admin_overview),
         )
 }

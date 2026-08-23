@@ -3,12 +3,19 @@ import { formatNanoUsd, isSignedIntegerString } from '@/lib/exact-decimal'
 
 type TimingValue = number | string | null | undefined
 
+export type TpsBasis = {
+	value: number
+	tokens: number
+	denominatorMs: number
+}
+
 export type ComputedTps =
 	| {
 			state: 'display'
-			value: number
-			tokens: number
-			denominatorMs: number
+			/** Wall-clock generation throughput: total output tokens over the generation window (FL4a-1/2). */
+			average: TpsBasis | null
+			/** Visible-text throughput over the visible generation window (FL4a-5). */
+			visible: TpsBasis | null
 	  }
 	| {
 			state: 'unavailable'
@@ -117,42 +124,60 @@ function parseTimingMs(value: TimingValue): number | null {
 	return null
 }
 
-function tpsFromBasis(tokens: number | null, denominatorMs: number | null): ComputedTps {
+function tpsFromBasis(tokens: number | null, denominatorMs: number | null): TpsBasis | null {
 	if (tokens == null || tokens <= 0 || denominatorMs == null || denominatorMs <= 0) {
-		return { state: 'unavailable' }
+		return null
 	}
 	return {
-		state: 'display',
 		value: tokens / (denominatorMs / 1000),
 		tokens,
 		denominatorMs
 	}
 }
 
-function legacyOutputTokens(log: RequestLog): number | null {
+/** FL4a-1: the total output token count for the Average TPS numerator. */
+function totalOutputTokens(log: RequestLog): number | null {
 	const usageOutput = asObject(asObject(log.usage)?.output)
-	const outputTotal = readTokenCount(usageOutput, 'total_tokens') ?? log.tokens.output ?? null
-	if (outputTotal == null) return null
-	const reasoning = readTokenCount(usageOutput, 'reasoning_tokens') ?? log.tokens.reasoning ?? null
-	return reasoning == null ? outputTotal : Math.max(outputTotal - reasoning, 0)
+	return readTokenCount(usageOutput, 'total_tokens') ?? log.tokens.output ?? null
+}
+
+function visibleOutputTokens(log: RequestLog): number | null {
+	return readNumber(log.timing.visible_output_tokens)
 }
 
 export function computeTps(log: RequestLog): ComputedTps {
-	const outputTokens = legacyOutputTokens(log)
-	const visibleTokens = readNumber(log.timing.visible_output_tokens)
-	const visibleGenerationMs = parseTimingMs(log.timing.visible_generation_ms)
 	const durationMs = getDurationMs(log)
 	const ttfbMs = getTtfbMs(log)
-	const fallbackDenominatorMs =
-		durationMs == null ? null
-		: ttfbMs != null && durationMs > ttfbMs ? durationMs - ttfbMs
+	const visibleGenerationMs = parseTimingMs(log.timing.visible_generation_ms)
+
+	// FL4a-2: the Average TPS generation window is the wall-clock span from
+	// first upstream chunk to stream end (duration - ttfb), falling back to the
+	// full duration when TTFB is unknown.
+	const averageWindowMs =
+		durationMs != null && ttfbMs != null && durationMs > ttfbMs ?
+			durationMs - ttfbMs
 		: durationMs
-	const denominatorMs =
-		visibleGenerationMs != null && visibleGenerationMs > 0 ?
-			visibleGenerationMs
-		: fallbackDenominatorMs
-	const tokens = outputTokens != null && outputTokens > 0 ? outputTokens : visibleTokens
-	return tpsFromBasis(tokens, denominatorMs)
+
+	const outputTotal = totalOutputTokens(log)
+	const visibleTokens = visibleOutputTokens(log)
+
+	let average: TpsBasis | null = null
+	if (outputTotal != null) {
+		average = tpsFromBasis(outputTotal, averageWindowMs)
+	} else {
+		// FL4a-1: when no output-token total exists, fall back to the visible
+		// token count paired with the visible generation window.
+		average = tpsFromBasis(visibleTokens, visibleGenerationMs)
+	}
+
+	// FL4a-5: the visible-window row is only shown when a visible basis exists.
+	const visible =
+		outputTotal != null ? tpsFromBasis(visibleTokens, visibleGenerationMs) : null
+
+	if (!average && !visible) {
+		return { state: 'unavailable' }
+	}
+	return { state: 'display', average, visible }
 }
 
 export function billingValueTranslationKey(

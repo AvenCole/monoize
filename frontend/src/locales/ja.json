@@ -56,7 +56,8 @@
 		"logs": "ログ",
 		"models": "モデルデータベース",
 		"marketplace": "モデルマーケット",
-		"billingPlans": "プラン"
+		"billingPlans": "プラン",
+		"adminDashboard": "システムダッシュボード"
 	},
 	"roles": {
 		"super_admin": "スーパー管理者",
@@ -817,7 +818,9 @@
 		"timeRangeLastMonth": "先月",
 		"timeRangeFrom": "開始: yyyy-MM-dd HH:mm:ss",
 		"timeRangeTo": "終了: yyyy-MM-dd HH:mm:ss",
-		"toggleFilters": "フィルターの表示/非表示"
+		"toggleFilters": "フィルターの表示/非表示",
+		"visibleWindowTps": "生成ウィンドウ TPS",
+		"sessionAffinity": "セッションアフィニティ"
 	},
 	"billingPlans": {
 		"title": "課金プラン",
@@ -849,5 +852,51 @@
 		"resetSuccess": "{{count}} 人のサブスクライバーをリセットしました",
 		"none": "プランなし",
 		"nextReset": "{{name}} — 次回リセット {{time}}"
+	},
+	"adminDashboard": {
+		"title": "システムダッシュボード",
+		"subtitle": "システム状態、ユーザー使用ランキング、モデル/チャンネル健全性、レプリカ状態",
+		"systemStatus": "システム状態",
+		"nodeRole": "ノードロール",
+		"version": "バージョン",
+		"uptime": "稼働時間",
+		"startedAt": "起動時刻",
+		"listen": "リッスン",
+		"metricsPath": "メトリクスパス",
+		"database": "データベース",
+		"upstreamProxy": "エグレスプロキシ",
+		"pendingRequestLogs": "保留中のログ",
+		"sseConnections": "SSE接続数",
+		"routingRevision": "ルーティング設定リビジョン",
+		"replicaStatus": "レプリカ状態",
+		"ingestEnabled": "レプリカ取り込み",
+		"enabled": "有効",
+		"disabled": "無効",
+		"noReplicaToken": "レプリカトークンが未設定のため監視対象はありません。",
+		"spoolPendingCount": "未送信ファイル数",
+		"spoolPendingBytes": "未送信バイト数",
+		"usageRanking": "ユーザー使用ランキング（24時間）",
+		"username": "ユーザー",
+		"calls": "呼び出し数",
+		"cost": "コスト",
+		"noUsage": "過去24時間の使用なし",
+		"channelHealth": "モデル / チャンネル健全性",
+		"channel": "チャンネル",
+		"weight": "重み",
+		"affinity": "アフィニティ",
+		"status": "状態",
+		"lastProbe": "最終プローブ",
+		"healthy": "正常",
+		"unhealthy": "異常",
+		"coolingDown": "クールダウン",
+		"noChannels": "チャンネル未設定",
+		"healthEntries": "健全性エントリ",
+		"affinityEntries": "アフィニティバインディング",
+		"refresh": "更新",
+		"retry": "再試行",
+		"autoRefresh": "10秒ごとに自動更新",
+		"unauthorized": "管理者権限が必要",
+		"unauthorizedDescription": "このページは管理者のみアクセスできます。",
+		"loadFailed": "システム概要の読み込みに失敗"
 	}
 }

@@ -69,6 +69,7 @@ pub async fn create_image_generation(
         n,
         request_id,
         request_ip,
+        extract_client_session_id(&headers),
     )
     .await;
 
@@ -247,6 +248,7 @@ pub async fn create_image_edit(
         n,
         request_id,
         request_ip,
+        extract_client_session_id(&headers),
     )
     .await;
 
@@ -362,6 +364,7 @@ async fn fan_out_subrequests(
     n: usize,
     request_id: Option<String>,
     request_ip: Option<String>,
+    client_session_id: Option<String>,
 ) -> Vec<Result<(urp::UrpResponse, String), AppError>> {
     let mut join_set = tokio::task::JoinSet::new();
     let mut task_contexts = HashMap::new();
@@ -390,6 +393,7 @@ async fn fan_out_subrequests(
             .clone()
             .map(|id| if n > 1 { format!("{id}:img:{i}") } else { id });
         let rip = request_ip.clone();
+        let task_session_id = client_session_id.clone();
         let task_state = Arc::new(AdmittedRequestTaskState::new(std::time::Instant::now()));
         let task_state_for_task = task_state.clone();
         let task_request_id = rid.clone();
@@ -403,6 +407,7 @@ async fn fan_out_subrequests(
                 max_multiplier,
                 rid,
                 rip,
+                task_session_id,
                 &task_state_for_task,
             )
             .await
@@ -479,10 +484,12 @@ async fn execute_image_subrequest_typed(
     max_multiplier: Option<Multiplier>,
     request_id: Option<String>,
     request_ip: Option<String>,
+    client_session_id: Option<String>,
     task_state: &AdmittedRequestTaskState,
 ) -> AppResult<(urp::UrpResponse, String)> {
     let routing_stub = build_routing_stub(&req, max_multiplier);
-    let attempts = build_monoize_attempts(state, &routing_stub, auth).await?;
+    let mut attempts = build_monoize_attempts(state, &routing_stub, auth).await?;
+    attach_client_session_id(&mut attempts, client_session_id.clone());
     let all_responses = !attempts.is_empty()
         && attempts
             .iter()
@@ -497,6 +504,7 @@ async fn execute_image_subrequest_typed(
             max_multiplier,
             request_id,
             request_ip,
+            client_session_id,
             task_state,
         )
         .await;
@@ -510,6 +518,7 @@ async fn execute_image_subrequest_typed(
         super::DownstreamProtocol::Responses,
         request_id,
         request_ip,
+        client_session_id,
         super::RequestCaptureContext {
             raw_input: Value::Object(serde_json::Map::new()),
             session: None,
@@ -556,6 +565,7 @@ async fn execute_stream_collected_image_typed(
     max_multiplier: Option<Multiplier>,
     request_id: Option<String>,
     request_ip: Option<String>,
+    client_session_id: Option<String>,
     task_state: &AdmittedRequestTaskState,
 ) -> AppResult<(urp::UrpResponse, String)> {
     let started_at = task_state.started_at();
@@ -563,7 +573,8 @@ async fn execute_stream_collected_image_typed(
     let original_req = req.clone();
     let logical_model = req.model.clone();
     let routing_stub = build_routing_stub(&req, max_multiplier);
-    let attempts = build_monoize_attempts(state, &routing_stub, auth).await?;
+    let mut attempts = build_monoize_attempts(state, &routing_stub, auth).await?;
+    attach_client_session_id(&mut attempts, client_session_id);
     ensure_balance_before_forward_for_attempts(state, auth, &attempts).await?;
     let pending_request_log_guard = insert_pending_request_log(
         state,

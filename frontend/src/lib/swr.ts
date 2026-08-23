@@ -6,6 +6,7 @@ import type {
   ApiKey,
   DashboardStats,
   DashboardAnalytics,
+  AdminOverview,
   ConfigOverview,
   SystemSettings,
   PublicSystemSettings,
@@ -64,6 +65,7 @@ export const SWR_KEYS = {
   BILLING_PLANS: "/dashboard/billing-plans",
   REQUEST_LOGS: "/dashboard/request-logs",
   ANALYTICS: "/dashboard/analytics",
+  ADMIN_OVERVIEW: "/dashboard/admin/overview",
 } as const;
 
 export function providerDetailSWRKey(providerId: string) {
@@ -231,6 +233,15 @@ export function useDashboardAnalytics(buckets = 8, rangeHours = 24, config?: SWR
     () => api.getDashboardAnalytics(buckets, rangeHours),
     { ...defaultConfig, ...config }
   );
+}
+
+// Admin overview hook (admin dashboard; AD-ADF-7: 10s refresh, skeleton, retry)
+export function useAdminOverview(config?: SWRConfiguration) {
+  return useSWR<AdminOverview>(SWR_KEYS.ADMIN_OVERVIEW, () => api.getAdminOverview(), {
+    ...defaultConfig,
+    refreshInterval: 10000,
+    ...config
+  });
 }
 
 // Mutation helpers with optimistic updates

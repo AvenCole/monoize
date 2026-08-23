@@ -17,6 +17,7 @@ import {
   Database,
   Store,
   CalendarClock,
+  Gauge,
 } from "lucide-react";
 import { useAuth } from "@/hooks/use-auth";
 import { useTheme } from "@/hooks/use-theme";
@@ -147,6 +148,7 @@ function Sidebar({
   ];
 
   const adminNavItems = [
+    { to: "/dashboard/admin", icon: Gauge, label: t("nav.adminDashboard") },
     { to: "/dashboard/providers", icon: Server, label: t("nav.providers") },
     { to: "/dashboard/models", icon: Database, label: t("nav.models") },
     { to: "/dashboard/plans", icon: CalendarClock, label: t("nav.billingPlans") },

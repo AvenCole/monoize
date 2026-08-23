@@ -227,6 +227,13 @@ impl DeltaSpool {
         self.list_json_files().len()
     }
 
+    /// `(pending file count, total pending bytes)` over the durable spool.
+    pub fn pending_stats(&self) -> (usize, u64) {
+        let files = self.list_json_files();
+        let bytes = files.iter().map(|(_, size)| *size).sum();
+        (files.len(), bytes)
+    }
+
     pub fn dir_display(&self) -> String {
         self.dir.display().to_string()
     }

@@ -51,6 +51,7 @@ A request log row has:
 - `affinity_hit: boolean?` (true when request routing used an eligible affinity binding; false when affinity was evaluated but no binding was used; null when affinity did not run)
 - `affinity_key_hash: string?` (short hash of the affinity cache key; raw affinity key material MUST NOT be stored)
 - `affinity_target: string?` (`provider_id/channel_id` for the affinity target when present)
+- `session_affinity_value: string?` (the exact `x-session-affinity` header value sent to the upstream when per-channel automatic session affinity produced one, per `channel-management.spec.md` CM-AFF-4; null when disabled or no value was produced)
 - `created_at: RFC3339 string`
 - `created_at_unix_ms: integer?` (the same creation instant as Unix epoch milliseconds; nullable only for legacy rows whose text timestamp could not be backfilled)
 
@@ -75,7 +76,7 @@ RL1a-2. When provider/channel metadata for an in-flight request becomes known, t
 
 RL1a-3. The server MUST maintain an in-memory map of current SSE-only `pending` snapshots keyed by `request_id`. Creating or updating a `pending` snapshot MUST upsert that key before broadcasting the snapshot. Enqueuing a terminal `success` or `error` row with the same `request_id` MUST remove that key from the map before broadcasting the terminal row. The map is process-local and starts empty after process startup.
 
-RL1a-4. Pending and terminal snapshots MUST include `effective_provider_type`, `affinity_hit`, `affinity_key_hash`, and `affinity_target` when those values are known.
+RL1a-4. Pending and terminal snapshots MUST include `effective_provider_type`, `affinity_hit`, `affinity_key_hash`, `affinity_target`, and `session_affinity_value` when those values are known.
 
 RL1b. The lifecycle row MUST transition from `"pending"` to exactly one terminal status:
 
@@ -347,7 +348,7 @@ RL-S3c. On SQLite and PostgreSQL, every column outside the 42-column data model 
 
 RL-S3d. Every schema inspection, data update, table rebuild, constraint change, column change, and index change performed by migration `m20260809_000031_request_logs_without_user_fk` MUST execute in one database transaction per backend. If a required RL-S3b source column is absent or any statement fails, the original table, rows, constraints, and indexes MUST remain unchanged. Running the up migration twice against a successful output MUST leave the same rows, 42-column schema, four ordinary indexes, and no user foreign key. The down migration MUST be a no-op because an intervening request-log row may contain a deleted `user_id` that cannot satisfy a restored foreign key.
 
-RL-S4. Outside the SQLite rebuild defined by RL-S3b, new columns (`request_id`, `channel_id`, `ttfb_ms`, `first_visible_output_ms`, `last_visible_output_ms`, `visible_generation_ms`, `visible_output_tokens`, `tps_mode`, `request_ip`, `usage_breakdown_json`, `billing_breakdown_json`, `error_code`, `error_message`, `error_http_status`, `tried_providers_json`) MUST be added via `ALTER TABLE ADD COLUMN` statements in migration logic. The RL-S3b SQLite rebuild MAY define an absent nullable canonical column directly on its replacement table. All such columns are nullable for existing rows.
+RL-S4. Outside the SQLite rebuild defined by RL-S3b, new columns (`request_id`, `channel_id`, `ttfb_ms`, `first_visible_output_ms`, `last_visible_output_ms`, `visible_generation_ms`, `visible_output_tokens`, `tps_mode`, `request_ip`, `usage_breakdown_json`, `billing_breakdown_json`, `error_code`, `error_message`, `error_http_status`, `tried_providers_json`, `session_affinity_value`) MUST be added via `ALTER TABLE ADD COLUMN` statements in migration logic. The RL-S3b SQLite rebuild MAY define an absent nullable canonical column directly on its replacement table. All such columns are nullable for existing rows.
 
 RL-S6. Migration `m20260809_000031_request_logs_without_user_fk` MUST converge legacy `prompt_tokens`/`completion_tokens`/`cached_tokens` and canonical `input_tokens`/`output_tokens`/`cache_read_tokens` according to RL-S3b-2, then remove the three legacy columns. New usage detail columns (`cache_creation_tokens`, `tool_prompt_tokens`, `accepted_prediction_tokens`, `rejected_prediction_tokens`) MUST be nullable for migrated rows whose source schema did not contain those columns.
 
@@ -386,15 +387,17 @@ FL4. The `duration_ms`, `ttfb_ms`, and `is_stream` fields MUST be merged into a 
 
 FL4b. The frontend MUST treat request-log timing values as numeric-compatible inputs. For badge rendering and tooltip math, it MUST accept canonical fields `duration_ms` and `ttfb_ms`, and it MUST also accept the compatibility aliases `durationMs`, `elapsed_ms`, or `latency_ms` (total duration) and `ttfbMs`, `first_token_ms`, or `firstTokenMs` (TTFB) when those aliases are present. String values that parse to finite numbers MUST be rendered identically to numeric values.
 FL4c. Backend request-log API responses MUST include compatibility aliases for timing fields (`durationMs`, `elapsed_ms`, `latency_ms`, `ttfbMs`, `first_token_ms`, `firstTokenMs`) with values equal to canonical `duration_ms` / `ttfb_ms`, so updated frontend builds do not rely on client-side fallback only.
-FL4a. Hovering, focusing, or activating the timing badge row MUST show a tooltip containing a duration detail row with the total duration. The tooltip MUST include an "Average TPS" (tokens per second) metric when both the TPS numerator and generation window defined by FL4a-1 and FL4a-2 are greater than zero. Activation MUST work on touch devices; activating outside the tooltip or pressing Escape MUST close it.
+FL4a. Hovering, focusing, or activating the timing badge row MUST show a tooltip containing a duration detail row with the total duration and a TTFB detail row when TTFB is present. The tooltip MUST include an "Average TPS" (tokens per second) metric when both the TPS numerator and generation window defined by FL4a-1 and FL4a-2 are greater than zero, and a "Visible window TPS" metric when the basis defined by FL4a-5 exists. Activation MUST work on touch devices; activating outside the tooltip or pressing Escape MUST close it.
 
-FL4a-1. The TPS numerator MUST prefer `output_tokens - reasoning_tokens`, clamped at zero, when an output-token total is present. `usage_breakdown_json.output.total_tokens` and `usage_breakdown_json.output.reasoning_tokens` MUST take precedence over their scalar-column equivalents. When the preferred numerator is absent or zero, the numerator MUST fall back to a positive `visible_output_tokens` value.
+FL4a-1. The Average TPS numerator MUST be the total output token count: `usage_breakdown_json.output.total_tokens` takes precedence over scalar `output_tokens`. Reasoning tokens MUST NOT be subtracted. When neither total is present, the numerator MUST fall back to a positive `visible_output_tokens` value, and in that case the generation window MUST be the visible window defined in FL4a-5 instead of FL4a-2.
 
-FL4a-2. The generation window MUST prefer a positive `visible_generation_ms` value. When that value is absent or zero, the generation window MUST fall back to `duration_ms - ttfb_ms` when both values are present and `duration_ms > ttfb_ms`; otherwise it MUST fall back to a positive `duration_ms` value.
+FL4a-2. The Average TPS generation window MUST be `duration_ms - ttfb_ms` when both values are present and `duration_ms > ttfb_ms`; otherwise a positive `duration_ms` value. This window represents wall-clock generation time and therefore pairs with the total output token count of FL4a-1.
 
 FL4a-3. The UI MUST compute `TPS = numerator / (generation_window_ms / 1000)`. Every displayed value MUST use two decimal places, the unit `t/s`, and the `~` prefix because either the numerator, the generation window, or both may be approximate. The UI MUST NOT impose a minimum token count or minimum generation-window duration.
 
-FL4a-4. When the numerator or generation window is absent or not greater than zero, the tooltip MUST omit the Average TPS row. It MUST NOT render an insufficient-sample state. When TPS is displayed, the tooltip MUST render exactly one localized generation-window row and MUST NOT expose `tps_mode` or legacy/exact/estimated basis labels.
+FL4a-4. When the numerator or generation window is absent or not greater than zero, the tooltip MUST omit the Average TPS row. It MUST NOT render an insufficient-sample state. The tooltip MUST NOT expose `tps_mode` or legacy/exact/estimated basis labels. Because the Average TPS window is the wall-clock span bounded by the duration and TTFB rows, the tooltip MUST NOT render an additional generation-window row for Average TPS.
+
+FL4a-5. When `visible_generation_ms > 0` and `visible_output_tokens > 0`, the tooltip MUST additionally render a localized "Visible window TPS" row computed as `visible_output_tokens / (visible_generation_ms / 1000)` with the same two-decimal `~`-prefixed `t/s` format, followed by exactly one localized generation-window row showing `visible_generation_ms` formatted per the shared duration format. When the visible basis is absent, both rows MUST be omitted. The visible basis MUST NOT be combined with the total output numerator of FL4a-1.
 
 FL5. The `api_key_name` column header MUST be "Token" (referring to the API key name, not the literal token value).
 
@@ -481,6 +484,8 @@ FL27a. In the request-logs table, the visible Input and Output token cell values
 FL27b. If neither the usage-breakdown totals nor the scalar token columns are available for a row, the UI MUST render a localized unavailable placeholder (`-`) in the visible Input and Output cells instead of `0`. This placeholder state represents "usage unavailable", not zero token consumption.
 
 FL27c. When FL27b applies, hovering the Input or Output cell MUST show the standard token-detail tooltip shell with a localized unavailable message rather than an empty numeric breakdown.
+
+FL27d. The visible Input cell MUST render a secondary line below the primary token count when the row has a positive cached-input token count. The cached-input value MUST prefer `usage_breakdown_json.input.cached_tokens` and fall back to scalar `cache_read_tokens`. The secondary line MUST be visually subordinate (smaller, muted, or both) and MUST render the localized cached-token label (`requestLogs.cachedTokens`) followed by the formatted count, e.g. `缓存 47,872`. When no positive cached-input value exists, the secondary line MUST be omitted; a missing value MUST NOT render as `0` or `-`. Hovering the Input cell MUST continue to show the full FL27 breakdown tooltip, and the secondary line MUST NOT interfere with the FL27 hover surface.
 
 FL28. For rows with `status = "error"`, hovering the request-id/status indicator MUST show error details from `error_code`, `error_message`, and `error_http_status` when present.
 

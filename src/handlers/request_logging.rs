@@ -178,6 +178,7 @@ fn broadcast_pending_snapshot(
     affinity_hit: Option<bool>,
     affinity_key_hash: Option<&str>,
     affinity_target: Option<&str>,
+    session_affinity_value: Option<&str>,
     created_at: chrono::DateTime<Utc>,
 ) {
     let Some(user_id) = auth.user_id.as_deref() else {
@@ -230,6 +231,7 @@ fn broadcast_pending_snapshot(
         affinity_hit,
         affinity_key_hash: affinity_key_hash.map(ToOwned::to_owned),
         affinity_target: affinity_target.map(ToOwned::to_owned),
+        session_affinity_value: session_affinity_value.map(ToOwned::to_owned),
         created_at,
     };
 
@@ -295,6 +297,7 @@ pub(super) async fn insert_pending_request_log(
         model,
         is_stream,
         request_ip,
+        None,
         None,
         None,
         None,
@@ -383,6 +386,7 @@ pub(super) async fn update_pending_channel_info(
         attempt.affinity_hit,
         attempt.affinity_key_hash.as_deref(),
         attempt.affinity_target.as_deref(),
+        attempt.session_affinity_value.as_deref(),
         request_created_at(started_at),
     );
 }
@@ -423,6 +427,7 @@ pub(super) fn spawn_request_log(
     let affinity_hit = attempt.affinity_hit;
     let affinity_key_hash = attempt.affinity_key_hash.clone();
     let affinity_target = attempt.affinity_target.clone();
+    let session_affinity_value = attempt.session_affinity_value.clone();
     let model = model.to_string();
     let duration_ms = started_at.elapsed().as_millis() as u64;
     let created_at = request_created_at(started_at);
@@ -540,6 +545,7 @@ pub(super) fn spawn_request_log(
         affinity_hit,
         affinity_key_hash,
         affinity_target,
+        session_affinity_value,
         created_at,
     };
     spawn_claimed_terminal_log(
@@ -582,6 +588,7 @@ pub(super) fn spawn_request_log_error(
     let affinity_hit = attempt.affinity_hit;
     let affinity_key_hash = attempt.affinity_key_hash.clone();
     let affinity_target = attempt.affinity_target.clone();
+    let session_affinity_value = attempt.session_affinity_value.clone();
     let duration_ms = started_at.elapsed().as_millis() as u64;
     let created_at = request_created_at(started_at);
     let names = crate::users::RequestLogNameSnapshots {
@@ -645,6 +652,7 @@ pub(super) fn spawn_request_log_error(
         affinity_hit,
         affinity_key_hash,
         affinity_target,
+        session_affinity_value,
         created_at,
     };
     spawn_claimed_terminal_log(
@@ -687,6 +695,7 @@ pub(super) fn spawn_request_log_stream_terminal_error(
     let affinity_hit = attempt.affinity_hit;
     let affinity_key_hash = attempt.affinity_key_hash.clone();
     let affinity_target = attempt.affinity_target.clone();
+    let session_affinity_value = attempt.session_affinity_value.clone();
     let duration_ms = started_at.elapsed().as_millis() as u64;
     let created_at = request_created_at(started_at);
     let names = crate::users::RequestLogNameSnapshots {
@@ -742,6 +751,7 @@ pub(super) fn spawn_request_log_stream_terminal_error(
         affinity_hit,
         affinity_key_hash,
         affinity_target,
+        session_affinity_value,
         created_at,
     };
     spawn_claimed_terminal_log(
@@ -837,6 +847,7 @@ pub(super) fn spawn_request_log_error_no_attempt(
         affinity_hit: None,
         affinity_key_hash: None,
         affinity_target: None,
+        session_affinity_value: None,
         created_at,
     };
     spawn_claimed_terminal_log(
@@ -864,8 +875,8 @@ mod admission_tests {
         let batcher = crate::db_cache::RequestLogBatcher::new_with_limits(
             2,
             temp.path().to_path_buf(),
-            4_096,
-            1_024,
+            crate::db_cache::REQUEST_LOG_MIN_ENTRY_BYTES * 2,
+            crate::db_cache::REQUEST_LOG_MIN_ENTRY_BYTES,
             broadcast,
             Arc::new(dashmap::DashMap::new()),
         );
@@ -1018,6 +1029,7 @@ mod admission_tests {
             affinity_hit: None,
             affinity_key_hash: None,
             affinity_target: None,
+            session_affinity_value: None,
             created_at: chrono::Utc::now(),
         }
     }

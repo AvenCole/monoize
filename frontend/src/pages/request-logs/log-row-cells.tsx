@@ -309,13 +309,17 @@ export function LogRowCells({
 		outputDetailRows.push([t('requestLogs.imageTokens'), formatTokenCount(outputImage)])
 	}
 
-	const tpsValue =
-		computedTps.state === 'display' ?
-			`~${computedTps.value.toFixed(2)} t/s`
+	const averageTpsValue =
+		computedTps.state === 'display' && computedTps.average ?
+			`~${computedTps.average.value.toFixed(2)} t/s`
 		:	null
-	const tpsDenominator =
-		computedTps.state === 'display' ?
-			formatDuration(computedTps.denominatorMs)
+	const visibleTpsValue =
+		computedTps.state === 'display' && computedTps.visible ?
+			`~${computedTps.visible.value.toFixed(2)} t/s`
+		:	null
+	const visibleTpsWindow =
+		computedTps.state === 'display' && computedTps.visible ?
+			formatDuration(computedTps.visible.denominatorMs)
 		:	null
 	const durationBadge =
 		duration ?
@@ -359,24 +363,32 @@ export function LogRowCells({
 					<span className='font-mono'>{duration}</span>
 				</div>
 			)}
-			{tpsValue && computedTps.state === 'display' && (
-				<div className='flex items-center justify-between gap-3'>
-					<span className='text-muted-foreground'>{t('requestLogs.avgTps')}</span>
-					<span className='font-mono'>{tpsValue}</span>
-				</div>
-			)}
-			{tpsDenominator && computedTps.state === 'display' && (
-				<div className='flex items-center justify-between gap-3'>
-					<span className='text-muted-foreground'>
-						{t('requestLogs.tpsGenerationWindow')}
-					</span>
-					<span className='font-mono'>{tpsDenominator}</span>
-				</div>
-			)}
 			{ttfb && (
 				<div className='flex items-center justify-between gap-3'>
 					<span className='text-muted-foreground'>{t('requestLogs.ttfb')}</span>
 					<span className='font-mono'>{ttfb}</span>
+				</div>
+			)}
+			{averageTpsValue && (
+				<div className='flex items-center justify-between gap-3'>
+					<span className='text-muted-foreground'>{t('requestLogs.avgTps')}</span>
+					<span className='font-mono'>{averageTpsValue}</span>
+				</div>
+			)}
+			{visibleTpsValue && (
+				<div className='flex items-center justify-between gap-3'>
+					<span className='text-muted-foreground'>
+						{t('requestLogs.visibleWindowTps')}
+					</span>
+					<span className='font-mono'>{visibleTpsValue}</span>
+				</div>
+			)}
+			{visibleTpsWindow && (
+				<div className='flex items-center justify-between gap-3'>
+					<span className='text-muted-foreground'>
+						{t('requestLogs.tpsGenerationWindow')}
+					</span>
+					<span className='font-mono'>{visibleTpsWindow}</span>
 				</div>
 			)}
 		</div>
@@ -595,6 +607,11 @@ export function LogRowCells({
 												{t('requestLogs.channel')}: {channelDisplay}
 											</div>
 										)}
+										{log.session_affinity_value && (
+											<div>
+												{t('requestLogs.sessionAffinity')}: {log.session_affinity_value}
+											</div>
+										)}
 										{log.upstream_model && log.upstream_model !== log.model && (
 											<div>
 												{t('requestLogs.upstreamModel')}: {log.upstream_model}
@@ -639,8 +656,13 @@ export function LogRowCells({
 				<TooltipProvider delayDuration={200}>
 					<Tooltip onOpenChange={inputTooltipOpenChange}>
 						<TooltipTrigger asChild>
-							<span className='cursor-default'>
-								{formatTokenCount(inputTokensForDisplay)}
+							<span className='inline-flex cursor-default flex-col items-end leading-4'>
+								<span>{formatTokenCount(inputTokensForDisplay)}</span>
+								{inputCached ? (
+									<span className='text-[10px] text-success'>
+										{t('requestLogs.cachedTokens')} {formatTokenCount(inputCached)}
+									</span>
+								) : null}
 							</span>
 						</TooltipTrigger>
 						<TooltipContent>

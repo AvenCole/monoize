@@ -2299,6 +2299,7 @@ async fn execute_nonstream_typed_keeps_bad_gateway_when_groups_filter_every_chan
         DownstreamProtocol::ChatCompletions,
         None,
         None,
+        None,
         RequestCaptureContext {
             raw_input: json!({}),
             session: None,
@@ -2435,7 +2436,100 @@ fn affinity_test_attempt(
         proxy_url: None,
         extra_headers: None,
         session_affinity_auto: false,
+        client_session_id: None,
+        session_affinity_value: None,
     }
+}
+
+#[test]
+fn session_affinity_resolution_priority_matches_spec() {
+    let body = serde_json::json!({
+        "prompt_cache_key": "from-cache-key",
+        "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    });
+    let base = affinity_test_attempt(
+        "p",
+        "c",
+        crate::monoize_routing::AffinityFailbackMode::Sticky,
+        0,
+    );
+
+    // Disabled channels produce no value (CM-AFF-4 null).
+    assert_eq!(resolve_session_affinity_value(&base, &body), None);
+
+    // Auto-enabled without client header derives from the body.
+    let mut auto = base.clone();
+    auto.session_affinity_auto = true;
+    assert_eq!(
+        resolve_session_affinity_value(&auto, &body).as_deref(),
+        Some("from-cache-key")
+    );
+
+    // CM-AFF-1a: client session id wins over derivation.
+    let mut client = auto.clone();
+    client.client_session_id = Some("client-ses-1".to_string());
+    assert_eq!(
+        resolve_session_affinity_value(&client, &body).as_deref(),
+        Some("client-ses-1")
+    );
+
+    // CM-AFF-1: explicit static header wins over client and derivation.
+    let mut explicit = client.clone();
+    explicit.extra_headers = Some(std::collections::BTreeMap::from([(
+        "x-session-affinity".to_string(),
+        "static-1".to_string(),
+    )]));
+    assert_eq!(
+        resolve_session_affinity_value(&explicit, &body).as_deref(),
+        Some("static-1")
+    );
+
+    // The header set applies the resolved value exactly once.
+    let headers = attempt_extra_headers(&explicit, &body);
+    assert_eq!(
+        headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-session-affinity"))
+            .count(),
+        1
+    );
+    assert!(headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("x-session-affinity") && value == "static-1"
+    }));
+}
+
+#[test]
+fn client_session_id_header_extraction_prefers_codex_session_id() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-session-affinity", "ses-a".parse().unwrap());
+    headers.insert("session_id", "codex-b".parse().unwrap());
+    assert_eq!(
+        extract_client_session_id(&headers).as_deref(),
+        Some("codex-b")
+    );
+
+    let mut only_affinity = HeaderMap::new();
+    only_affinity.insert("x-session-affinity", "ses-a".parse().unwrap());
+    assert_eq!(
+        extract_client_session_id(&only_affinity).as_deref(),
+        Some("ses-a")
+    );
+
+    let empty = HeaderMap::new();
+    assert_eq!(extract_client_session_id(&empty), None);
+}
+
+#[test]
+fn session_affinity_sanitizer_strips_controls_and_truncates() {
+    let dirty = format!("  ok{}junk", "x".repeat(200));
+    let sanitized = sanitize_session_affinity(&dirty);
+    assert!(sanitized.starts_with("ok"));
+    assert_eq!(sanitized.len(), 128);
+    assert!(sanitized
+        .chars()
+        .all(|c| ('\u{20}'..='\u{7e}').contains(&c)));
+
+    assert_eq!(sanitize_session_affinity("\u{7}\u{7}"), "");
 }
 
 #[test]

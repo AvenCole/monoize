@@ -117,7 +117,7 @@ function optionalPositiveInteger(value: string): number | null {
 	return value.trim() ? Number(value) : null
 }
 
-function channelInput(channel: ChannelRow) {
+function channelInput(channel: ChannelRow, c: (zhText: string, enText: string) => string) {
 	return {
 		id: channel.id || undefined,
 		name: channel.name.trim(),
@@ -140,12 +140,12 @@ function channelInput(channel: ChannelRow) {
 		affinity_failback_mode_override: channel.affinity_failback_mode_override,
 		affinity_failback_delay_seconds_override: optionalPositiveInteger(channel.affinity_failback_delay_seconds_override),
 		proxy_url: channel.proxy_url.trim() || null,
-		extra_headers: parseExtraHeaders(channel.extra_headers),
+		extra_headers: parseExtraHeaders(channel.extra_headers, c),
 		session_affinity_auto: channel.session_affinity_auto
 	}
 }
 
-function parseExtraHeaders(raw: string): Record<string, string> | null {
+function parseExtraHeaders(raw: string, c: (zhText: string, enText: string) => string): Record<string, string> | null {
 	const text = raw.trim()
 	if (!text) return null
 	let parsed: unknown
@@ -164,7 +164,7 @@ function parseExtraHeaders(raw: string): Record<string, string> | null {
 	return Object.keys(out).length > 0 ? out : null
 }
 
-function buildInput(form: ProviderForm): CreateProviderInput {
+function buildInput(form: ProviderForm, c: (zhText: string, enText: string) => string): CreateProviderInput {
 	return {
 		name: form.name.trim(),
 		enabled: form.enabled,
@@ -174,7 +174,7 @@ function buildInput(form: ProviderForm): CreateProviderInput {
 		channel_retry_interval_ms: form.channel_retry_interval_ms,
 		circuit_breaker_enabled: form.circuit_breaker_enabled,
 		per_model_circuit_break: form.per_model_circuit_break,
-		channels: form.channels.map(channelInput),
+		channels: form.channels.map(channel => channelInput(channel, c)),
 		transforms: form.transforms,
 		api_type_overrides: form.api_type_overrides,
 		active_probe_enabled_override: form.active_probe_enabled_override,
@@ -295,7 +295,7 @@ export function ProviderDialog({
 		}
 		setSaving(true)
 		try {
-			const input = buildInput(form)
+			const input = buildInput(form, c)
 			if (isEdit && current) {
 				await updateProviderOptimistic(current.id, input, providers)
 			} else {
@@ -498,11 +498,22 @@ function Field({ label, hint, children, className }: { label: string; hint?: str
 }
 
 function ProviderBasics({ form, setForm, c }: { form: ProviderForm; setForm: React.Dispatch<React.SetStateAction<ProviderForm>>; c: (zh: string, en: string) => string }) {
+	// The groups field keeps raw text while typing and canonicalizes on blur,
+	// because comma-splitting on every keystroke makes commas impossible to
+	// enter and erases in-progress entries. The component remounts on section
+	// switches, so the initializer re-reads the canonical form value.
+	const [groupsText, setGroupsText] = useState(form.groups.join(', '))
+	const commitGroups = () => {
+		const next = groupsText.split(',').map(value => value.trim().toLowerCase()).filter(Boolean)
+		const canonical = [...new Set(next)].sort()
+		setForm(previous => ({ ...previous, groups: canonical }))
+		setGroupsText(canonical.join(', '))
+	}
 	return <div className='mx-auto flex w-full max-w-3xl flex-col gap-6 p-4 sm:p-6'>
 		<SectionHeading title={c('Provider 基础信息', 'Provider basics')} description={c('Provider 负责公共路由策略；模型和上游地址在 Channel 中配置。', 'Providers own shared routing policy. Models and upstream endpoints are configured per channel.')} />
 		<div className='grid gap-5 rounded-xl border bg-card p-4 sm:grid-cols-2 sm:p-5'>
 			<Field label={c('名称', 'Name')} className='sm:col-span-2'><Input value={form.name} onChange={event => setForm(previous => ({ ...previous, name: event.target.value }))} placeholder='OpenAI production' /></Field>
-			<Field label={c('访问组', 'Groups')} hint={c('逗号分隔；留空表示公开 Provider。', 'Comma-separated. Empty means public provider.')}><Input value={form.groups.join(', ')} onChange={event => setForm(previous => ({ ...previous, groups: event.target.value.split(',').map(value => value.trim().toLowerCase()).filter(Boolean) }))} placeholder='premium, internal' /></Field>
+			<Field label={c('访问组', 'Groups')} hint={c('逗号分隔；留空表示公开 Provider。', 'Comma-separated. Empty means public provider.')}><Input value={groupsText} onChange={event => setGroupsText(event.target.value)} onBlur={commitGroups} placeholder='premium, internal' /></Field>
 			<Field label={c('额外字段白名单', 'Extra fields allowlist')} hint={c('逗号分隔，应用到全部 Channel。', 'Comma-separated and shared by all channels.')}><Input value={form.extra_fields_whitelist} onChange={event => setForm(previous => ({ ...previous, extra_fields_whitelist: event.target.value }))} placeholder='service_tier, metadata' /></Field>
 		</div>
 	</div>

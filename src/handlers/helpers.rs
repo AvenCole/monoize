@@ -85,6 +85,22 @@ pub(super) fn extract_request_id(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// CM-AFF-1a: read the client-supplied session-affinity value. `session_id`
+/// (codex-style) wins over `x-session-affinity`. Values are sanitized per the
+/// shared affinity sanitizer; an empty result means "absent".
+pub(super) fn extract_client_session_id(headers: &HeaderMap) -> Option<String> {
+    for name in ["session_id", "x-session-affinity"] {
+        if let Some(raw) = headers.get(name).and_then(|value| value.to_str().ok()) {
+            let sanitized =
+                crate::handlers::routing::sanitize_session_affinity(raw);
+            if !sanitized.is_empty() {
+                return Some(sanitized);
+            }
+        }
+    }
+    None
+}
+
 pub(super) fn read_max_multiplier_from_extra(req: &urp::UrpRequest) -> Option<Multiplier> {
     req.extra_body
         .get("max_multiplier")

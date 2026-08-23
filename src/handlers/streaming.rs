@@ -162,6 +162,7 @@ pub(super) async fn forward_stream_typed(
     downstream: DownstreamProtocol,
     request_id: Option<String>,
     request_ip: Option<String>,
+    client_session_id: Option<String>,
     capture: RequestCaptureContext,
 ) -> AppResult<
     impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static,
@@ -176,7 +177,8 @@ pub(super) async fn forward_stream_typed(
     let original_req = req.clone();
     let logical_model = req.model.clone();
     let routing_stub = build_routing_stub(&req, max_multiplier);
-    let attempts = build_monoize_attempts(&state, &routing_stub, &auth).await?;
+    let mut attempts = build_monoize_attempts(&state, &routing_stub, &auth).await?;
+    attach_client_session_id(&mut attempts, client_session_id);
     ensure_balance_before_forward_for_attempts(&state, &auth, &attempts).await?;
     let pending_request_log_guard = insert_pending_request_log(
         &state,
@@ -191,7 +193,7 @@ pub(super) async fn forward_stream_typed(
 
     let mut execution_state = AttemptExecutionState::default();
 
-    for attempt in attempts {
+    for mut attempt in attempts {
         if !execution_state.provider_budget_remaining(&attempt) {
             continue;
         }
@@ -342,6 +344,8 @@ pub(super) async fn forward_stream_typed(
                             return Err(err);
                         }
                     };
+                attempt.session_affinity_value =
+                    resolve_session_affinity_value(&attempt, &upstream_body);
                 let provider = build_channel_provider_config(&attempt);
                 let path =
                     upstream_path_for_model(attempt.provider_type, &req_attempt.model, false);
@@ -743,6 +747,8 @@ pub(super) async fn forward_stream_typed(
                         return Err(err);
                     }
                 };
+            attempt.session_affinity_value =
+                resolve_session_affinity_value(&attempt, &upstream_body);
             let estimated_input_tokens = estimated_tokens_from_utf8_bytes(
                 u64::try_from(upstream_body.to_string().len()).unwrap_or(u64::MAX),
             );

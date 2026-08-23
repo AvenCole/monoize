@@ -570,6 +570,7 @@ async fn request_log_batcher_broadcasts_immediately_before_flush() {
         affinity_hit: None,
         affinity_key_hash: None,
         affinity_target: None,
+        session_affinity_value: None,
         request_kind: None,
         created_at: chrono::Utc::now(),
     };
@@ -1138,6 +1139,7 @@ async fn request_log_retention_deletes_only_rows_older_than_ninety_days() {
             affinity_hit: None,
             affinity_key_hash: None,
             affinity_target: None,
+            session_affinity_value: None,
             request_kind: None,
             created_at: old_created_at,
         })
@@ -1186,6 +1188,7 @@ async fn request_log_retention_deletes_only_rows_older_than_ninety_days() {
             affinity_hit: None,
             affinity_key_hash: None,
             affinity_target: None,
+            session_affinity_value: None,
             request_kind: None,
             created_at: new_created_at,
         })

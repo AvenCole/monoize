@@ -1180,6 +1180,7 @@ fn request_log_timing_serializes_compatibility_aliases() {
         reasoning_effort: None,
         request_ip: None,
         tried_providers: None,
+        session_affinity_value: Some("ses-1".to_string()),
         provider: RequestLogProvider {
             id: Some("provider-1".to_string()),
             name: Some("Provider".to_string()),
@@ -1303,7 +1304,7 @@ async fn sqlite_migration_creates_request_log_retention_indexes() {
         .expect("request-log column count exists")
         .try_get("", "column_count")
         .expect("request-log column count decodes");
-    assert_eq!(request_log_columns, 42);
+    assert_eq!(request_log_columns, 43);
 
     let request_log_foreign_keys = db
         .read()

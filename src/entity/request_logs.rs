@@ -68,6 +68,8 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub affinity_target: Option<String>,
     #[sea_orm(column_type = "Text")]
+    pub session_affinity_value: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub created_at: String,
     pub created_at_unix_ms: Option<i64>,
 }

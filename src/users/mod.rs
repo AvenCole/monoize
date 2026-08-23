@@ -478,6 +478,7 @@ pub struct InsertRequestLog {
     pub affinity_hit: Option<bool>,
     pub affinity_key_hash: Option<String>,
     pub affinity_target: Option<String>,
+    pub session_affinity_value: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -576,6 +577,7 @@ pub struct RequestLogRow {
     pub reasoning_effort: Option<String>,
     pub request_ip: Option<String>,
     pub tried_providers: Option<Value>,
+    pub session_affinity_value: Option<String>,
     pub provider: RequestLogProvider,
     pub channel: RequestLogChannel,
     pub affinity: RequestLogAffinity,
@@ -603,6 +605,7 @@ impl InsertRequestLog {
             reasoning_effort: self.reasoning_effort.clone(),
             request_ip: self.request_ip.clone(),
             tried_providers: self.tried_providers_json.clone(),
+            session_affinity_value: self.session_affinity_value.clone(),
             provider: RequestLogProvider {
                 id: self.provider_id.clone(),
                 name: self.names.provider_name.clone(),
@@ -705,6 +708,14 @@ pub struct UserTodayUsage {
     pub user_id: String,
     pub today_calls: i64,
     pub today_cost_nano_usd: i128,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserUsageRankingRow {
+    pub user_id: String,
+    pub username: Option<String>,
+    pub call_count: i64,
+    pub cost_nano_usd: i128,
 }
 
 pub use utils::{format_nano_to_usd, parse_nano_usd, parse_usd_to_nano};

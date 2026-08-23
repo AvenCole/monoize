@@ -56,7 +56,8 @@
 		"logs": "日誌",
 		"models": "模型資料庫",
 		"marketplace": "模型廣場",
-		"billingPlans": "訂閱方案"
+		"billingPlans": "訂閱方案",
+		"adminDashboard": "系統儀表板"
 	},
 	"roles": {
 		"super_admin": "超級管理員",
@@ -818,7 +819,9 @@
 		"timeRangeLastMonth": "上月",
 		"timeRangeFrom": "起: yyyy-MM-dd HH:mm:ss",
 		"timeRangeTo": "止: yyyy-MM-dd HH:mm:ss",
-		"toggleFilters": "展開/收起篩選"
+		"toggleFilters": "展開/收起篩選",
+		"visibleWindowTps": "生成視窗 TPS",
+		"sessionAffinity": "工作階段親和"
 	},
 	"billingPlans": {
 		"title": "訂閱方案",
@@ -850,5 +853,51 @@
 		"resetSuccess": "已重置 {{count}} 位訂閱使用者的週期額度",
 		"none": "不綁定方案",
 		"nextReset": "{{name}} — 下次重置 {{time}}"
+	},
+	"adminDashboard": {
+		"title": "系統儀表板",
+		"subtitle": "系統狀態、使用者用量排行、模型/渠道健康度與從機狀態",
+		"systemStatus": "系統狀態",
+		"nodeRole": "節點角色",
+		"version": "版本",
+		"uptime": "運行時間",
+		"startedAt": "啟動時間",
+		"listen": "監聽位址",
+		"metricsPath": "指標路徑",
+		"database": "資料庫",
+		"upstreamProxy": "出口代理",
+		"pendingRequestLogs": "待處理日誌",
+		"sseConnections": "SSE 連線數",
+		"routingRevision": "路由設定版本",
+		"replicaStatus": "從機狀態",
+		"ingestEnabled": "從機上報接入",
+		"enabled": "已啟用",
+		"disabled": "已停用",
+		"noReplicaToken": "未設定從機權杖，無需監控。",
+		"spoolPendingCount": "待傳送檔案數",
+		"spoolPendingBytes": "待傳送位元組數",
+		"usageRanking": "使用者用量排行（24 小時）",
+		"username": "使用者",
+		"calls": "呼叫數",
+		"cost": "費用",
+		"noUsage": "最近 24 小時無用量",
+		"channelHealth": "模型 / 渠道健康度",
+		"channel": "渠道",
+		"weight": "權重",
+		"affinity": "親和",
+		"status": "狀態",
+		"lastProbe": "最近探測",
+		"healthy": "健康",
+		"unhealthy": "不健康",
+		"coolingDown": "冷卻中",
+		"noChannels": "未設定渠道",
+		"healthEntries": "健康狀態條目",
+		"affinityEntries": "親和綁定",
+		"refresh": "重新整理",
+		"retry": "重試",
+		"autoRefresh": "10 秒自動重新整理",
+		"unauthorized": "需要管理員權限",
+		"unauthorizedDescription": "此頁面僅管理員可存取。",
+		"loadFailed": "系統概覽載入失敗"
 	}
 }
