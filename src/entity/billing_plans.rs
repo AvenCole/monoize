@@ -10,8 +10,8 @@ pub struct Model {
     pub name: String,
     #[sea_orm(column_type = "Text")]
     pub grant_amount_nano_usd: String,
-    #[sea_orm(column_type = "BigInteger")]
-    pub period_seconds: i64,
+    #[sea_orm(column_type = "Text")]
+    pub schedule: String,
     #[sea_orm(column_type = "Text")]
     pub allowed_groups: String,
     pub enabled: i32,

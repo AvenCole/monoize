@@ -514,3 +514,16 @@ AK6a. Typed commits, chip removals, and suggestion clicks in the API-key `allowe
 AK7. The API key `allowed_groups` helper text MUST explain that an empty array means the key inherits the owning user's `allowed_groups`. If the authenticated dashboard user payload exposes `allowed_groups`, the dialog MUST render that value as a non-authoritative hint only. The frontend MUST NOT block save with client-side subset validation.
 
 AK8. If `POST /api/dashboard/tokens` or `PUT /api/dashboard/tokens/{key_id}` returns a validation error for `allowed_groups` subset rules, the frontend MUST surface the server-provided message in a toast and MUST keep the dialog open with the current draft state intact.
+
+## 9. Billing Plans Page
+
+BP-UI1. Each plan row on `/dashboard/plans` MUST include a Reset action in addition to
+edit and delete.
+
+BP-UI2. Activating Reset MUST open a confirmation dialog that names the plan. Confirming
+MUST call `POST /api/dashboard/billing-plans/{plan_id}/reset`. Cancel MUST call nothing.
+
+BP-UI3. After a successful reset, the users-list SWR cache and the session user cache
+MUST be revalidated so `/dashboard/users` and the sidebar balance reflect the new
+balances without a page close/reopen. On failure, the dialog MUST remain available and
+the UI MUST surface the server error.

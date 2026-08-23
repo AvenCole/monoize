@@ -55,7 +55,7 @@ import {
 import type { User } from "@/lib/api";
 import { formatNanoUsd, formatUsdDecimal, isSignedIntegerString } from "@/lib/exact-decimal";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
-import { formatPeriodShort, getGravatarUrl } from "@/lib/utils";
+import { getGravatarUrl } from "@/lib/utils";
 import { PageWrapper, motion, transitions } from "@/components/ui/motion";
 import { PageHeader } from "@/components/ui/page-header";
 import { TablePageSkeleton } from "@/components/ui/page-skeleton";
@@ -700,7 +700,7 @@ export function UsersPage() {
                         .map((plan) => (
                           <SelectItem key={plan.id} value={plan.id}>
                             {plan.name} · ${plan.grant_amount_usd}/
-                            {formatPeriodShort(plan.period_seconds)}
+                            {plan.schedule}
                             {!plan.enabled ? ` (${t("common.disabled")})` : ""}
                           </SelectItem>
                         ))}

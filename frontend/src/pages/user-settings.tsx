@@ -20,7 +20,7 @@ import { PageHeader } from "@/components/ui/page-header";
 import { setLanguage, getCurrentLanguage } from "@/i18n";
 import { updateMeOptimistic } from "@/lib/swr";
 import { formatUsdDecimal } from "@/lib/exact-decimal";
-import { formatPeriodShort, getGravatarUrl } from "@/lib/utils";
+import { getGravatarUrl } from "@/lib/utils";
 import { GroupsBadge } from "@/components/GroupsBadge";
 import { toast } from "sonner";
 
@@ -178,7 +178,7 @@ export function UserSettingsPage() {
                       <p className="font-medium tabular-nums">
                         {formatUsdDecimal(user.billing_plan.grant_amount_usd, 2)}
                         {" / "}
-                        {formatPeriodShort(user.billing_plan.period_seconds)}
+                        <span className="font-mono">{user.billing_plan.schedule}</span>
                       </p>
                     </div>
                     <div className="space-y-1">

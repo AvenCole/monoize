@@ -1953,6 +1953,10 @@ fn build_dashboard_api_router() -> Router<AppState> {
                 .delete(crate::dashboard_handlers::delete_billing_plan),
         )
         .route(
+            "/dashboard/billing-plans/{plan_id}/reset",
+            post(crate::dashboard_handlers::reset_billing_plan),
+        )
+        .route(
             "/dashboard/tokens",
             get(crate::dashboard_handlers::list_my_api_keys),
         )

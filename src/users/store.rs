@@ -121,6 +121,7 @@ const ALLOWED_API_KEY_RESPONSE_TRANSFORMS: &[&str] = &[
 struct LockedUserBalance {
     balance: i128,
     unlimited: bool,
+    enabled: bool,
 }
 
 struct LockedApiKeyBalance {
@@ -901,10 +902,12 @@ impl UserStore {
             .map_err(|error| error.message)?;
         let new_balance = parsed_balance.unwrap_or(current.balance);
         let new_unlimited = balance_unlimited.unwrap_or(current.unlimited);
+        let user_enabled = enabled.unwrap_or(current.enabled);
         let now = Utc::now().to_rfc3339();
         let mut set_clauses = Vec::new();
         let mut values: Vec<SeaValue> = Vec::new();
         let mut idx = 1usize;
+        let mut plan_grant: Option<(i128, String, String)> = None;
 
         if let Some(username) = username {
             set_clauses.push(format!("username = ${idx}"));
@@ -961,30 +964,42 @@ impl UserStore {
                     // Lock the plan row so assignment cannot race delete (BP-D3)
                     // and the anchor matches a surviving plan (BP-S1/BP-S3).
                     let plan_lock_sql = if self.db.is_postgres() {
-                        "SELECT period_seconds FROM billing_plans WHERE id = $1 FOR UPDATE"
+                        "SELECT schedule, grant_amount_nano_usd, name, enabled FROM billing_plans WHERE id = $1 FOR UPDATE"
                     } else {
-                        "SELECT period_seconds FROM billing_plans WHERE id = $1"
+                        "SELECT schedule, grant_amount_nano_usd, name, enabled FROM billing_plans WHERE id = $1"
                     };
                     let plan_row = tx
                         .query_one(self.db.stmt(plan_lock_sql, vec![plan_id.clone().into()]))
                         .await
                         .map_err(|e| e.to_string())?
                         .ok_or_else(|| "billing plan not found".to_string())?;
-                    let period_seconds: i64 = plan_row
-                        .try_get("", "period_seconds")
+                    let schedule: String = plan_row
+                        .try_get("", "schedule")
                         .map_err(|e| e.to_string())?;
-                    let anchor_ts = Utc::now()
-                        .timestamp()
-                        .checked_add(period_seconds)
-                        .ok_or_else(|| "next_grant_at overflow".to_string())?;
-                    let anchor = DateTime::from_timestamp(anchor_ts, 0)
-                        .ok_or_else(|| "next_grant_at overflow".to_string())?;
+                    let raw_amount: String = plan_row
+                        .try_get("", "grant_amount_nano_usd")
+                        .map_err(|e| e.to_string())?;
+                    let grant_amount = parse_nano_usd(&raw_amount)?;
+                    let plan_name: String =
+                        plan_row.try_get("", "name").map_err(|e| e.to_string())?;
+                    let plan_enabled = plan_row
+                        .try_get::<i32>("", "enabled")
+                        .map_err(|e| e.to_string())?
+                        == 1;
+                    let assignment_now = Utc::now();
+                    let anchor = super::plans::next_grant_after(&schedule, assignment_now)?;
                     set_clauses.push(format!("billing_plan_id = ${idx}"));
-                    values.push(plan_id.into());
+                    values.push(plan_id.clone().into());
                     idx += 1;
                     set_clauses.push(format!("next_grant_at = ${idx}"));
                     values.push(anchor.to_rfc3339().into());
                     idx += 1;
+                    if parsed_balance.is_none() && user_enabled && !new_unlimited && plan_enabled {
+                        set_clauses.push(format!("balance_nano_usd = ${idx}"));
+                        values.push(grant_amount.to_string().into());
+                        idx += 1;
+                        plan_grant = Some((grant_amount, plan_id, plan_name));
+                    }
                 }
                 None => {
                     set_clauses.push("billing_plan_id = NULL".to_string());
@@ -1028,10 +1043,31 @@ impl UserStore {
             .await
             .map_err(|error| error.message)?;
         }
+        if let Some((grant_amount, plan_id, plan_name)) = plan_grant.as_ref() {
+            let delta = grant_amount
+                .checked_sub(current.balance)
+                .ok_or_else(|| "balance overflow".to_string())?;
+            self.insert_billing_ledger_tx(
+                &tx,
+                id,
+                "plan_grant",
+                delta,
+                Some(*grant_amount),
+                &serde_json::json!({
+                    "plan_id": plan_id,
+                    "plan_name": plan_name,
+                    "before_balance_nano_usd": current.balance.to_string(),
+                    "after_balance_nano_usd": grant_amount.to_string(),
+                }),
+                &now,
+            )
+            .await
+            .map_err(|error| error.message)?;
+        }
 
         tx.commit().await.map_err(|e| e.to_string())?;
         self.api_key_cache.invalidate_by_user_id(id);
-        if has_balance_change {
+        if has_balance_change || plan_grant.is_some() {
             self.balance_cache.invalidate(id);
         }
         if has_plan_change {
@@ -1665,9 +1701,9 @@ impl UserStore {
         user_id: &str,
     ) -> Result<LockedUserBalance, BillingError> {
         let sql = if self.db.is_postgres() {
-            "SELECT balance_nano_usd, balance_unlimited FROM users WHERE id = $1 FOR UPDATE"
+            "SELECT balance_nano_usd, balance_unlimited, enabled FROM users WHERE id = $1 FOR UPDATE"
         } else {
-            "SELECT balance_nano_usd, balance_unlimited FROM users WHERE id = $1"
+            "SELECT balance_nano_usd, balance_unlimited, enabled FROM users WHERE id = $1"
         };
         let row = tx
             .query_one(self.db.stmt(sql, vec![user_id.into()]))
@@ -1683,7 +1719,15 @@ impl UserStore {
             .try_get::<i32>("", "balance_unlimited")
             .map_err(|e| BillingError::new(BillingErrorKind::Internal, e.to_string()))?
             == 1;
-        Ok(LockedUserBalance { balance, unlimited })
+        let enabled = row
+            .try_get::<i32>("", "enabled")
+            .map_err(|e| BillingError::new(BillingErrorKind::Internal, e.to_string()))?
+            == 1;
+        Ok(LockedUserBalance {
+            balance,
+            unlimited,
+            enabled,
+        })
     }
 
     async fn lock_api_key_balance_tx(
@@ -1787,7 +1831,7 @@ impl UserStore {
             let user_rows = tx
                 .query_all(self.db.stmt(
                     &format!(
-                        "SELECT id, balance_nano_usd, balance_unlimited
+                        "SELECT id, balance_nano_usd, balance_unlimited, enabled
                          FROM users WHERE id IN ({user_placeholders})
                          ORDER BY id{user_lock_suffix}"
                     ),
@@ -1806,7 +1850,18 @@ impl UserStore {
                     .try_get::<i32>("", "balance_unlimited")
                     .map_err(|e| e.to_string())?
                     == 1;
-                user_balances.insert(user_id, LockedUserBalance { balance, unlimited });
+                let enabled = row
+                    .try_get::<i32>("", "enabled")
+                    .map_err(|e| e.to_string())?
+                    == 1;
+                user_balances.insert(
+                    user_id,
+                    LockedUserBalance {
+                        balance,
+                        unlimited,
+                        enabled,
+                    },
+                );
             }
             if user_balances.len() != user_ids.len() {
                 return Err("api key owner was not found".to_string());

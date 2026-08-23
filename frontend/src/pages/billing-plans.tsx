@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { CalendarClock, Coins, Pencil, Plus, Trash2 } from "lucide-react";
+import { CalendarClock, Coins, Pencil, Plus, RotateCcw, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -34,9 +34,9 @@ import {
   updateBillingPlanOptimistic,
   useBillingPlans,
   createBillingPlanOptimistic,
+  resetBillingPlanOptimistic,
 } from "@/lib/swr";
 import type { BillingPlan } from "@/lib/api";
-import { formatPeriodShort } from "@/lib/utils";
 
 const NANO_PER_USD = 1_000_000_000n;
 
@@ -60,7 +60,7 @@ function parseUsdToNanoBigInt(usd: string): bigint | null {
 interface PlanFormState {
   name: string;
   amount_usd: string;
-  period_seconds: string;
+  schedule: string;
   groups_text: string;
   enabled: boolean;
 }
@@ -68,7 +68,7 @@ interface PlanFormState {
 const EMPTY_FORM: PlanFormState = {
   name: "",
   amount_usd: "",
-  period_seconds: "86400",
+  schedule: "0 0 * * *",
   groups_text: "",
   enabled: true,
 };
@@ -77,7 +77,7 @@ function formFromPlan(plan: BillingPlan): PlanFormState {
   return {
     name: plan.name,
     amount_usd: plan.grant_amount_usd,
-    period_seconds: String(plan.period_seconds),
+    schedule: plan.schedule,
     groups_text: plan.allowed_groups.join(", "),
     enabled: plan.enabled,
   };
@@ -92,7 +92,9 @@ export function BillingPlansPage() {
   const [form, setForm] = useState<PlanFormState>(EMPTY_FORM);
   const [editTarget, setEditTarget] = useState<BillingPlan | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<BillingPlan | null>(null);
+  const [resetTarget, setResetTarget] = useState<BillingPlan | null>(null);
   const [saving, setSaving] = useState(false);
+  const [resetting, setResetting] = useState(false);
 
   const openCreate = () => {
     setForm(EMPTY_FORM);
@@ -101,13 +103,13 @@ export function BillingPlansPage() {
 
   const buildInput = () => {
     const amount = parseUsdToNanoBigInt(form.amount_usd);
-    const period = Number(form.period_seconds.trim());
+    const schedule = form.schedule.trim().split(/\s+/).filter(Boolean).join(" ");
     if (amount === null || amount < 0n) {
       toast.error(t("billingPlans.invalidAmount"));
       return null;
     }
-    if (!Number.isInteger(period) || period <= 0) {
-      toast.error(t("billingPlans.invalidPeriod"));
+    if (schedule.split(" ").length !== 5) {
+      toast.error(t("billingPlans.invalidSchedule"));
       return null;
     }
     const name = form.name.trim();
@@ -118,7 +120,7 @@ export function BillingPlansPage() {
     return {
       name,
       grant_amount_nano_usd: amount.toString(),
-      period_seconds: period,
+      schedule,
       allowed_groups: form.groups_text
         .split(",")
         .map((g) => g.trim().toLowerCase())
@@ -176,13 +178,29 @@ export function BillingPlansPage() {
     }
   };
 
+  const handleReset = async () => {
+    if (!resetTarget || resetting) return;
+    setResetting(true);
+    try {
+      const result = await resetBillingPlanOptimistic(resetTarget, (error) =>
+        toast.error(error.message)
+      );
+      toast.success(t("billingPlans.resetSuccess", { count: result.reset_count }));
+      setResetTarget(null);
+    } catch {
+      // optimistic helper already rolled back and toasted; keep dialog open
+    } finally {
+      setResetting(false);
+    }
+  };
+
   const toggleEnabled = async (plan: BillingPlan, enabled: boolean) => {
     await updateBillingPlanOptimistic(
       plan.id,
       {
         name: plan.name,
         grant_amount_nano_usd: plan.grant_amount_nano_usd,
-        period_seconds: plan.period_seconds,
+        schedule: plan.schedule,
         allowed_groups: plan.allowed_groups,
         enabled,
       },
@@ -217,15 +235,33 @@ export function BillingPlansPage() {
           </p>
         </div>
         <div className="grid gap-2">
-          <Label htmlFor="plan-period">{t("billingPlans.period")}</Label>
+          <Label htmlFor="plan-schedule">{t("billingPlans.schedule")}</Label>
           <Input
-            id="plan-period"
-            inputMode="numeric"
-            value={form.period_seconds}
-            onChange={(e) => setForm({ ...form, period_seconds: e.target.value })}
-            placeholder="86400"
+            id="plan-schedule"
+            value={form.schedule}
+            onChange={(e) => setForm({ ...form, schedule: e.target.value })}
+            placeholder="0 0 * * *"
+            className="font-mono"
           />
-          <p className="text-xs text-muted-foreground">{t("billingPlans.periodHelp")}</p>
+          <div className="flex flex-wrap gap-1.5">
+            {[
+              { value: "0 0 * * *", label: t("billingPlans.scheduleDaily") },
+              { value: "0 * * * *", label: t("billingPlans.scheduleHourly") },
+              { value: "0 0 * * 1", label: t("billingPlans.scheduleWeekly") },
+            ].map((preset) => (
+              <Button
+                key={preset.value}
+                type="button"
+                variant={form.schedule.trim() === preset.value ? "secondary" : "outline"}
+                size="sm"
+                className="h-7 px-2 text-xs"
+                onClick={() => setForm({ ...form, schedule: preset.value })}
+              >
+                {preset.label}
+              </Button>
+            ))}
+          </div>
+          <p className="text-xs text-muted-foreground">{t("billingPlans.scheduleHelp")}</p>
         </div>
         <div className="grid gap-2">
           <Label htmlFor="plan-groups">{t("users.allowedGroups")}</Label>
@@ -289,7 +325,7 @@ export function BillingPlansPage() {
                 <tr>
                   <th className="px-4 py-2.5 font-medium">{t("billingPlans.name")}</th>
                   <th className="px-4 py-2.5 font-medium">{t("billingPlans.amount")}</th>
-                  <th className="px-4 py-2.5 font-medium">{t("billingPlans.period")}</th>
+                  <th className="px-4 py-2.5 font-medium">{t("billingPlans.schedule")}</th>
                   <th className="px-4 py-2.5 font-medium">{t("users.allowedGroups")}</th>
                   <th className="px-4 py-2.5 font-medium">{t("billingPlans.enabled")}</th>
                   <th className="px-4 py-2.5" />
@@ -303,7 +339,7 @@ export function BillingPlansPage() {
                     <td className="px-4 py-3">
                       <span className="inline-flex items-center gap-1.5">
                         <CalendarClock className="h-3.5 w-3.5 text-muted-foreground" />
-                        {formatPeriodShort(plan.period_seconds)}
+                        <span className="font-mono">{plan.schedule}</span>
                       </span>
                     </td>
                     <td className="px-4 py-3">
@@ -317,6 +353,16 @@ export function BillingPlansPage() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center justify-end gap-1">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-8 px-2"
+                          title={t("billingPlans.reset")}
+                          onClick={() => setResetTarget(plan)}
+                        >
+                          <RotateCcw className="mr-1 h-4 w-4" />
+                          {t("billingPlans.reset")}
+                        </Button>
                         <Button
                           variant="ghost"
                           size="icon"
@@ -378,6 +424,34 @@ export function BillingPlansPage() {
               <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
               <AlertDialogAction onClick={handleDelete}>
                 {t("common.delete")}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        <AlertDialog
+          open={resetTarget !== null}
+          onOpenChange={(open) => {
+            if (!open && !resetting) setResetTarget(null);
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{t("billingPlans.resetTitle")}</AlertDialogTitle>
+              <AlertDialogDescription>
+                {t("billingPlans.resetDescription", { name: resetTarget?.name })}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={resetting}>{t("common.cancel")}</AlertDialogCancel>
+              <AlertDialogAction
+                disabled={resetting}
+                onClick={(event) => {
+                  event.preventDefault();
+                  void handleReset();
+                }}
+              >
+                {resetting ? t("common.loading") : t("billingPlans.reset")}
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>

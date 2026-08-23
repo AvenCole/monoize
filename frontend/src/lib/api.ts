@@ -5,7 +5,7 @@ export interface UserBillingPlan {
   name: string;
   grant_amount_nano_usd: string;
   grant_amount_usd: string;
-  period_seconds: number;
+  schedule: string;
   allowed_groups: string[];
   enabled: boolean;
 }
@@ -35,7 +35,7 @@ export interface BillingPlan {
   name: string;
   grant_amount_nano_usd: string;
   grant_amount_usd: string;
-  period_seconds: number;
+  schedule: string;
   allowed_groups: string[];
   enabled: boolean;
   created_at: string;
@@ -46,7 +46,7 @@ export interface BillingPlanInput {
   name: string;
   grant_amount_nano_usd?: string;
   grant_amount_usd?: string;
-  period_seconds: number;
+  schedule: string;
   allowed_groups?: string[];
   enabled?: boolean;
 }
@@ -720,6 +720,12 @@ class ApiClient {
   async deleteBillingPlan(id: string): Promise<{ success: boolean }> {
     await this.request(`/billing-plans/${id}`, { method: "DELETE" });
     return { success: true };
+  }
+
+  async resetBillingPlan(
+    id: string
+  ): Promise<{ success: boolean; reset_count: number }> {
+    return this.request(`/billing-plans/${id}/reset`, { method: "POST" });
   }
 
   async updateMe(updates: { email?: string | null }): Promise<User> {

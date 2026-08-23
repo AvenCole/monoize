@@ -78,12 +78,12 @@ async fn billing_plan_validation_and_assignment_error_codes() {
         Some(json!({
             "name": "bad-period",
             "grant_amount_usd": "1",
-            "period_seconds": 0
+            "schedule": "bad"
         })),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["code"], json!("invalid_period"));
+    assert_eq!(body["error"]["code"], json!("invalid_schedule"));
 
     let (status, body) = json_request(
         &ctx,
@@ -92,7 +92,7 @@ async fn billing_plan_validation_and_assignment_error_codes() {
         Some(json!({
             "name": "bad-amount",
             "grant_amount_nano_usd": "abc",
-            "period_seconds": 60
+            "schedule": "* * * * *"
         })),
     )
     .await;
@@ -106,7 +106,7 @@ async fn billing_plan_validation_and_assignment_error_codes() {
         Some(json!({
             "name": "zero",
             "grant_amount_usd": "0",
-            "period_seconds": 60,
+            "schedule": "* * * * *",
             "allowed_groups": ["team-a"],
             "enabled": false
         })),
@@ -125,7 +125,7 @@ async fn billing_plan_validation_and_assignment_error_codes() {
         Some(json!({
             "name": "zero",
             "grant_amount_nano_usd": "0",
-            "period_seconds": 60
+            "schedule": "* * * * *"
         })),
     )
     .await;
@@ -150,7 +150,7 @@ async fn billing_plan_validation_and_assignment_error_codes() {
         Some(json!({
             "name": "ZERO",
             "grant_amount_usd": "1",
-            "period_seconds": 60
+            "schedule": "* * * * *"
         })),
     )
     .await;
@@ -205,7 +205,7 @@ async fn assigned_plan_is_embedded_on_user_and_me_payloads() {
         Some(json!({
             "name": "Starter",
             "grant_amount_usd": "10",
-            "period_seconds": 86400,
+            "schedule": "0 0 * * *",
             "allowed_groups": ["team-a"]
         })),
     )
@@ -237,9 +237,11 @@ async fn assigned_plan_is_embedded_on_user_and_me_payloads() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(assigned["billing_plan_id"], json!(plan_id));
+    assert_eq!(assigned["balance_usd"], json!("10"));
+    assert_eq!(assigned["balance_nano_usd"], json!("10000000000"));
     assert_eq!(assigned["billing_plan"]["name"], json!("Starter"));
     assert_eq!(assigned["billing_plan"]["grant_amount_usd"], json!("10"));
-    assert_eq!(assigned["billing_plan"]["period_seconds"], json!(86400));
+    assert_eq!(assigned["billing_plan"]["schedule"], json!("0 0 * * *"));
     assert_eq!(
         assigned["billing_plan"]["allowed_groups"],
         json!(["team-a"])
@@ -294,4 +296,147 @@ async fn assigned_plan_is_embedded_on_user_and_me_payloads() {
     assert_eq!(me["billing_plan"]["id"], json!(plan_id));
     assert_eq!(me["billing_plan"]["name"], json!("Starter"));
     assert!(me.get("today_calls").is_none());
+}
+
+#[tokio::test]
+async fn reset_plan_refills_eligible_subscribers_only() {
+    let ctx = setup().await;
+
+    let (status, body) = json_request(
+        &ctx,
+        Method::POST,
+        "/api/dashboard/billing-plans/missing-plan/reset",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], json!("not_found"));
+
+    let (status, plan) = json_request(
+        &ctx,
+        Method::POST,
+        "/api/dashboard/billing-plans",
+        Some(json!({
+            "name": "Resettable",
+            "grant_amount_usd": "8",
+            "schedule": "0 0 * * *"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+
+    let (status, other_plan) = json_request(
+        &ctx,
+        Method::POST,
+        "/api/dashboard/billing-plans",
+        Some(json!({
+            "name": "Other",
+            "grant_amount_usd": "3",
+            "schedule": "0 0 * * *"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let other_plan_id = other_plan["id"]
+        .as_str()
+        .expect("other plan id")
+        .to_string();
+
+    let (status, subscriber) = json_request(
+        &ctx,
+        Method::POST,
+        "/api/dashboard/users",
+        Some(json!({
+            "username": "reset_sub",
+            "password": "password"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let subscriber_id = subscriber["id"].as_str().expect("user id").to_string();
+
+    let (status, outsider) = json_request(
+        &ctx,
+        Method::POST,
+        "/api/dashboard/users",
+        Some(json!({
+            "username": "reset_out",
+            "password": "password"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let outsider_id = outsider["id"].as_str().expect("user id").to_string();
+
+    let (status, assigned) = json_request(
+        &ctx,
+        Method::PUT,
+        &format!("/api/dashboard/users/{subscriber_id}"),
+        Some(json!({ "billing_plan_id": plan_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(assigned["balance_usd"], json!("8"));
+
+    let (status, _) = json_request(
+        &ctx,
+        Method::PUT,
+        &format!("/api/dashboard/users/{outsider_id}"),
+        Some(json!({ "billing_plan_id": other_plan_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, spent) = json_request(
+        &ctx,
+        Method::PUT,
+        &format!("/api/dashboard/users/{subscriber_id}"),
+        Some(json!({ "balance_usd": "1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(spent["balance_usd"], json!("1"));
+
+    let (status, spent_out) = json_request(
+        &ctx,
+        Method::PUT,
+        &format!("/api/dashboard/users/{outsider_id}"),
+        Some(json!({ "balance_usd": "1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(spent_out["balance_usd"], json!("1"));
+
+    let (status, reset) = json_request(
+        &ctx,
+        Method::POST,
+        &format!("/api/dashboard/billing-plans/{plan_id}/reset"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reset["success"], json!(true));
+    assert_eq!(reset["reset_count"], json!(1));
+
+    let (status, refilled) = json_request(
+        &ctx,
+        Method::GET,
+        &format!("/api/dashboard/users/{subscriber_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(refilled["balance_usd"], json!("8"));
+    assert_eq!(refilled["balance_nano_usd"], json!("8000000000"));
+
+    let (status, untouched) = json_request(
+        &ctx,
+        Method::GET,
+        &format!("/api/dashboard/users/{outsider_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(untouched["balance_usd"], json!("1"));
 }

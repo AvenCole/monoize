@@ -1,8 +1,11 @@
 use super::store::{parse_allowed_groups_json, serialize_allowed_groups_json};
 use crate::users::{UserStore, canonicalize_groups, parse_nano_usd};
 use chrono::{DateTime, Utc};
+use chrono_tz::Asia::Shanghai;
+use cron::Schedule;
 use sea_orm::{ConnectionTrait, TransactionTrait, Value as SeaValue};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 const DEFAULT_PLAN_GRANT_TICK_INTERVAL_SECS: u64 = 60;
 
@@ -25,7 +28,8 @@ pub struct BillingPlan {
     pub name: String,
     /// Signed integer nano-dollar string; balance resets to this amount each period.
     pub grant_amount_nano_usd: String,
-    pub period_seconds: i64,
+    /// Canonical 5-field Unix cron; evaluated in Asia/Shanghai.
+    pub schedule: String,
     /// Canonical group restriction layer; empty = unrestricted.
     pub allowed_groups: Vec<String>,
     pub enabled: bool,
@@ -40,7 +44,7 @@ pub struct BillingPlanInput {
     pub grant_amount_nano_usd: Option<String>,
     #[serde(default)]
     pub grant_amount_usd: Option<String>,
-    pub period_seconds: i64,
+    pub schedule: String,
     #[serde(default)]
     pub allowed_groups: Option<Vec<String>>,
     #[serde(default)]
@@ -50,7 +54,70 @@ pub struct BillingPlanInput {
 struct ValidatedPlan {
     name: String,
     amount: i128,
-    period_seconds: i64,
+    schedule: String,
+}
+
+pub(crate) fn canonicalize_plan_schedule(raw: &str) -> Result<String, String> {
+    let fields: Vec<&str> = raw.split_whitespace().collect();
+    if fields.len() != 5 || fields.iter().any(|field| field.is_empty()) {
+        return Err("invalid_schedule".to_string());
+    }
+    Ok(fields.join(" "))
+}
+
+fn map_unix_dow_atom(atom: &str) -> String {
+    match atom {
+        "0" | "7" => "1".to_string(),
+        "1" => "2".to_string(),
+        "2" => "3".to_string(),
+        "3" => "4".to_string(),
+        "4" => "5".to_string(),
+        "5" => "6".to_string(),
+        "6" => "7".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn map_unix_dow_field(field: &str) -> String {
+    field
+        .split(',')
+        .map(|part| match part.split_once('-') {
+            Some((start, end)) => {
+                format!("{}-{}", map_unix_dow_atom(start), map_unix_dow_atom(end))
+            }
+            None => map_unix_dow_atom(part),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn cron_schedule(canonical: &str) -> Result<Schedule, String> {
+    let fields: Vec<&str> = canonical.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Err("invalid_schedule".to_string());
+    }
+    let expression = format!(
+        "0 {} {} {} {} {}",
+        fields[0],
+        fields[1],
+        fields[2],
+        fields[3],
+        map_unix_dow_field(fields[4])
+    );
+    Schedule::from_str(&expression).map_err(|_| "invalid_schedule".to_string())
+}
+
+pub(crate) fn next_grant_after(
+    canonical: &str,
+    from: DateTime<Utc>,
+) -> Result<DateTime<Utc>, String> {
+    let schedule = cron_schedule(canonical)?;
+    let from_local = from.with_timezone(&Shanghai);
+    schedule
+        .after(&from_local)
+        .next()
+        .map(|when| when.with_timezone(&Utc))
+        .ok_or_else(|| "invalid_schedule".to_string())
 }
 
 fn map_grant_amount_error(_: String) -> String {
@@ -62,9 +129,8 @@ fn validate_plan_input(input: &BillingPlanInput) -> Result<ValidatedPlan, String
     if name.is_empty() || name.chars().count() > 100 {
         return Err("invalid_plan_name".to_string());
     }
-    if input.period_seconds <= 0 {
-        return Err("invalid_period".to_string());
-    }
+    let schedule = canonicalize_plan_schedule(&input.schedule)?;
+    next_grant_after(&schedule, Utc::now())?;
     let amount = if let Some(raw) = input.grant_amount_nano_usd.as_deref() {
         let parsed = parse_nano_usd(raw).map_err(map_grant_amount_error)?;
         if raw.trim() != parsed.to_string() || parsed < 0 {
@@ -84,7 +150,7 @@ fn validate_plan_input(input: &BillingPlanInput) -> Result<ValidatedPlan, String
     Ok(ValidatedPlan {
         name: name.to_string(),
         amount,
-        period_seconds: input.period_seconds,
+        schedule,
     })
 }
 
@@ -96,9 +162,9 @@ fn is_plan_name_unique_violation(error: &str) -> bool {
 
 fn plan_lock_sql(is_postgres: bool) -> &'static str {
     if is_postgres {
-        "SELECT id, name, grant_amount_nano_usd, period_seconds, allowed_groups, enabled, created_at, updated_at FROM billing_plans WHERE id = $1 FOR UPDATE"
+        "SELECT id, name, grant_amount_nano_usd, schedule, allowed_groups, enabled, created_at, updated_at FROM billing_plans WHERE id = $1 FOR UPDATE"
     } else {
-        "SELECT id, name, grant_amount_nano_usd, period_seconds, allowed_groups, enabled, created_at, updated_at FROM billing_plans WHERE id = $1"
+        "SELECT id, name, grant_amount_nano_usd, schedule, allowed_groups, enabled, created_at, updated_at FROM billing_plans WHERE id = $1"
     }
 }
 
@@ -113,7 +179,7 @@ fn row_to_plan(row: &sea_orm::QueryResult) -> Result<BillingPlan, String> {
         id: row.try_get("", "id").map_err(sql_err)?,
         name: row.try_get("", "name").map_err(sql_err)?,
         grant_amount_nano_usd: row.try_get("", "grant_amount_nano_usd").map_err(sql_err)?,
-        period_seconds: row.try_get("", "period_seconds").map_err(sql_err)?,
+        schedule: row.try_get("", "schedule").map_err(sql_err)?,
         allowed_groups: parse_allowed_groups_json(
             Some(allowed_groups_raw.as_str()),
             "billing_plans.allowed_groups",
@@ -138,7 +204,7 @@ impl UserStore {
             .db
             .read()
             .query_all(self.db.stmt(
-                "SELECT id, name, grant_amount_nano_usd, period_seconds, allowed_groups, enabled, created_at, updated_at FROM billing_plans ORDER BY created_at ASC",
+                "SELECT id, name, grant_amount_nano_usd, schedule, allowed_groups, enabled, created_at, updated_at FROM billing_plans ORDER BY created_at ASC",
                 vec![],
             ))
             .await
@@ -151,7 +217,7 @@ impl UserStore {
             .db
             .read()
             .query_one(self.db.stmt(
-                "SELECT id, name, grant_amount_nano_usd, period_seconds, allowed_groups, enabled, created_at, updated_at FROM billing_plans WHERE id = $1",
+                "SELECT id, name, grant_amount_nano_usd, schedule, allowed_groups, enabled, created_at, updated_at FROM billing_plans WHERE id = $1",
                 vec![id.into()],
             ))
             .await
@@ -184,12 +250,12 @@ impl UserStore {
             }
             if let Err(error) = tx
                 .execute(self.db.stmt(
-                    "INSERT INTO billing_plans (id, name, grant_amount_nano_usd, period_seconds, allowed_groups, enabled, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
+                    "INSERT INTO billing_plans (id, name, grant_amount_nano_usd, schedule, allowed_groups, enabled, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
                     vec![
                         id.clone().into(),
                         plan.name.into(),
                         plan.amount.to_string().into(),
-                        SeaValue::BigInt(Some(plan.period_seconds)),
+                        plan.schedule.into(),
                         groups_json.into(),
                         SeaValue::Int(Some(if enabled { 1 } else { 0 })),
                         now.into(),
@@ -254,11 +320,11 @@ impl UserStore {
             // Plan edits affect only future evaluations; existing next_grant_at anchors stay.
             if let Err(error) = tx
                 .execute(self.db.stmt(
-                    "UPDATE billing_plans SET name = $1, grant_amount_nano_usd = $2, period_seconds = $3, allowed_groups = $4, enabled = $5, updated_at = $6 WHERE id = $7",
+                    "UPDATE billing_plans SET name = $1, grant_amount_nano_usd = $2, schedule = $3, allowed_groups = $4, enabled = $5, updated_at = $6 WHERE id = $7",
                     vec![
                         plan.name.into(),
                         plan.amount.to_string().into(),
-                        SeaValue::BigInt(Some(plan.period_seconds)),
+                        plan.schedule.into(),
                         groups_json.into(),
                         SeaValue::Int(Some(if enabled { 1 } else { 0 })),
                         Utc::now().to_rfc3339().into(),
@@ -359,7 +425,7 @@ impl UserStore {
             .db
             .read()
             .query_all(self.db.stmt(
-                "SELECT u.id AS user_id FROM users u JOIN billing_plans p ON p.id = u.billing_plan_id WHERE u.billing_plan_id IS NOT NULL AND u.next_grant_at IS NOT NULL AND u.enabled = 1 AND u.balance_unlimited = 0 AND p.enabled = 1 AND u.next_grant_at <= $1",
+                "SELECT u.id AS user_id FROM users u JOIN billing_plans p ON p.id = u.billing_plan_id WHERE u.billing_plan_id IS NOT NULL AND u.next_grant_at IS NOT NULL AND u.enabled = 1 AND u.balance_unlimited = 0 AND p.enabled = 1 AND (u.next_grant_at <= $1 OR NOT EXISTS (SELECT 1 FROM billing_ledger l WHERE l.user_id = u.id AND l.kind = 'plan_grant'))",
                 vec![now.to_rfc3339().into()],
             ))
             .await
@@ -368,7 +434,7 @@ impl UserStore {
         let mut granted = 0usize;
         for row in &due {
             let user_id: String = row.try_get("", "user_id").map_err(sql_err).map_err(|e| e)?;
-            match self.grant_user_once(&user_id).await {
+            match self.grant_user_once(&user_id, false).await {
                 Ok(true) => granted += 1,
                 Ok(false) => {}
                 Err(error) => tracing::warn!(user_id = %user_id, %error, "plan grant failed"),
@@ -377,17 +443,48 @@ impl UserStore {
         Ok(granted)
     }
 
+    pub async fn reset_billing_plan_grants(&self, plan_id: &str) -> Result<usize, String> {
+        if self.get_billing_plan_by_id(plan_id).await?.is_none() {
+            return Err("not_found".to_string());
+        }
+
+        let rows = self
+            .db
+            .read()
+            .query_all(self.db.stmt(
+                "SELECT id AS user_id FROM users WHERE billing_plan_id = $1 AND next_grant_at IS NOT NULL AND enabled = 1 AND balance_unlimited = 0",
+                vec![plan_id.into()],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut reset_count = 0usize;
+        for row in &rows {
+            let user_id: String = row.try_get("", "user_id").map_err(sql_err)?;
+            match self.grant_user_once(&user_id, true).await {
+                Ok(true) => reset_count += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(user_id = %user_id, plan_id = %plan_id, %error, "admin plan reset grant failed")
+                }
+            }
+        }
+        Ok(reset_count)
+    }
+
     /// Applies at most one grant for the user (BP-G5 catch-up rule). Returns
     /// false when the locked state no longer satisfies the due conditions.
-    async fn grant_user_once(&self, user_id: &str) -> Result<bool, String> {
+    /// `force` is the admin-reset path: skip due/plan-enabled checks and always
+    /// rewrite `next_grant_at` (BP-A12).
+    async fn grant_user_once(&self, user_id: &str, force: bool) -> Result<bool, String> {
         let execution_now = Utc::now();
         let write = self.db.write().await;
         let tx = write.begin().await.map_err(|e| e.to_string())?;
 
         let lock_sql = if self.db.is_postgres() {
-            "SELECT u.balance_unlimited, u.enabled, u.balance_nano_usd, u.next_grant_at, p.id AS plan_id, p.name AS plan_name, p.grant_amount_nano_usd, p.period_seconds, p.enabled AS plan_enabled FROM users u JOIN billing_plans p ON p.id = u.billing_plan_id WHERE u.id = $1 FOR UPDATE OF u"
+            "SELECT u.balance_unlimited, u.enabled, u.balance_nano_usd, u.next_grant_at, p.id AS plan_id, p.name AS plan_name, p.grant_amount_nano_usd, p.schedule, p.enabled AS plan_enabled FROM users u JOIN billing_plans p ON p.id = u.billing_plan_id WHERE u.id = $1 FOR UPDATE OF u"
         } else {
-            "SELECT u.balance_unlimited, u.enabled, u.balance_nano_usd, u.next_grant_at, p.id AS plan_id, p.name AS plan_name, p.grant_amount_nano_usd, p.period_seconds, p.enabled AS plan_enabled FROM users u JOIN billing_plans p ON p.id = u.billing_plan_id WHERE u.id = $1"
+            "SELECT u.balance_unlimited, u.enabled, u.balance_nano_usd, u.next_grant_at, p.id AS plan_id, p.name AS plan_name, p.grant_amount_nano_usd, p.schedule, p.enabled AS plan_enabled FROM users u JOIN billing_plans p ON p.id = u.billing_plan_id WHERE u.id = $1"
         };
         let row = tx
             .query_one(self.db.stmt(lock_sql, vec![user_id.into()]))
@@ -408,7 +505,7 @@ impl UserStore {
         let plan_name: String = row.try_get("", "plan_name").map_err(sql_err)?;
         let raw_amount: String = row.try_get("", "grant_amount_nano_usd").map_err(sql_err)?;
         let amount = parse_nano_usd(&raw_amount)?;
-        let period_seconds: i64 = row.try_get("", "period_seconds").map_err(sql_err)?;
+        let schedule: String = row.try_get("", "schedule").map_err(sql_err)?;
 
         let Some(next_grant_raw) = raw_next_grant_at.as_deref() else {
             return Ok(false);
@@ -416,33 +513,58 @@ impl UserStore {
         let next_grant_at = DateTime::parse_from_rfc3339(next_grant_raw)
             .map_err(sql_err)?
             .with_timezone(&Utc);
-        if unlimited != 0 || enabled != 1 || plan_enabled != 1 || next_grant_at > execution_now {
+        if unlimited != 0 || enabled != 1 {
             return Ok(false);
+        }
+        if !force && plan_enabled != 1 {
+            return Ok(false);
+        }
+        let due = next_grant_at <= execution_now;
+        if !force && !due {
+            let prior_grants: i64 = tx
+                .query_one(self.db.stmt(
+                    "SELECT COUNT(*) AS count FROM billing_ledger WHERE user_id = $1 AND kind = 'plan_grant'",
+                    vec![user_id.into()],
+                ))
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "missing plan_grant count row".to_string())?
+                .try_get("", "count")
+                .map_err(sql_err)?;
+            if prior_grants > 0 {
+                return Ok(false);
+            }
         }
 
         let new_balance = amount;
         let delta = new_balance
             .checked_sub(old_balance)
             .ok_or("balance overflow")?;
-        let next_anchor_ts = execution_now
-            .timestamp()
-            .checked_add(period_seconds)
-            .ok_or("next_grant_at overflow")?;
-        let next_anchor = DateTime::from_timestamp(next_anchor_ts, 0)
-            .ok_or("next_grant_at overflow")?
-            .to_rfc3339();
-
-        tx.execute(self.db.stmt(
-            "UPDATE users SET balance_nano_usd = $1, next_grant_at = $2, updated_at = $3 WHERE id = $4",
-            vec![
-                new_balance.to_string().into(),
-                next_anchor.into(),
-                execution_now.to_rfc3339().into(),
-                user_id.into(),
-            ],
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
+        if force || due {
+            let next_anchor = next_grant_after(&schedule, execution_now)?.to_rfc3339();
+            tx.execute(self.db.stmt(
+                "UPDATE users SET balance_nano_usd = $1, next_grant_at = $2, updated_at = $3 WHERE id = $4",
+                vec![
+                    new_balance.to_string().into(),
+                    next_anchor.into(),
+                    execution_now.to_rfc3339().into(),
+                    user_id.into(),
+                ],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        } else {
+            tx.execute(self.db.stmt(
+                "UPDATE users SET balance_nano_usd = $1, updated_at = $2 WHERE id = $3",
+                vec![
+                    new_balance.to_string().into(),
+                    execution_now.to_rfc3339().into(),
+                    user_id.into(),
+                ],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        }
 
         self.insert_billing_ledger_tx(
             &tx,
@@ -450,12 +572,22 @@ impl UserStore {
             "plan_grant",
             delta,
             Some(new_balance),
-            &serde_json::json!({
-                "plan_id": plan_id,
-                "plan_name": plan_name,
-                "before_balance_nano_usd": old_balance.to_string(),
-                "after_balance_nano_usd": new_balance.to_string(),
-            }),
+            &if force {
+                serde_json::json!({
+                    "plan_id": plan_id,
+                    "plan_name": plan_name,
+                    "source": "admin_reset",
+                    "before_balance_nano_usd": old_balance.to_string(),
+                    "after_balance_nano_usd": new_balance.to_string(),
+                })
+            } else {
+                serde_json::json!({
+                    "plan_id": plan_id,
+                    "plan_name": plan_name,
+                    "before_balance_nano_usd": old_balance.to_string(),
+                    "after_balance_nano_usd": new_balance.to_string(),
+                })
+            },
             &execution_now.to_rfc3339(),
         )
         .await
@@ -475,15 +607,16 @@ mod tests {
     use crate::users::{
         AdminUpdateUserInput, UserRole, UserStore, compute_effective_groups_with_plan,
     };
+    use chrono_tz::Asia::Shanghai;
     use sea_orm::ConnectionTrait;
     use sea_orm_migration::MigratorTrait;
 
-    fn plan_input(name: &str, amount_usd: &str, period_seconds: i64) -> BillingPlanInput {
+    fn plan_input(name: &str, amount_usd: &str, schedule: &str) -> BillingPlanInput {
         BillingPlanInput {
             name: name.to_string(),
             grant_amount_nano_usd: None,
             grant_amount_usd: Some(amount_usd.to_string()),
-            period_seconds,
+            schedule: schedule.to_string(),
             allowed_groups: None,
             enabled: None,
         }
@@ -502,18 +635,42 @@ mod tests {
     }
 
     #[test]
+    fn daily_shanghai_midnight_schedule_fires_at_next_local_midnight() {
+        use chrono::{DateTime, Datelike, Timelike, Utc};
+        let from = DateTime::parse_from_rfc3339("2026-08-23T10:15:00+08:00")
+            .expect("parses")
+            .with_timezone(&Utc);
+        let next = super::next_grant_after("0 0 * * *", from).expect("next fire");
+        let local = next.with_timezone(&Shanghai);
+        assert_eq!(local.hour(), 0);
+        assert_eq!(local.minute(), 0);
+        assert_eq!(local.date_naive().to_string(), "2026-08-24");
+        let sunday = super::next_grant_after(
+            "0 0 * * 0",
+            DateTime::parse_from_rfc3339("2026-08-23T10:15:00+08:00")
+                .expect("parses")
+                .with_timezone(&Utc),
+        )
+        .expect("unix sunday cron parses");
+        assert_eq!(
+            sunday.with_timezone(&Shanghai).weekday(),
+            chrono::Weekday::Sun,
+        );
+    }
+
+    #[test]
     fn plan_input_rejects_non_positive_period_and_negative_amounts() {
-        let mut input = plan_input("p", "5", 0);
+        let mut input = plan_input("p", "5", "not-a-cron");
         assert_eq!(
             validate_plan_input(&input).err(),
-            Some("invalid_period".to_string())
+            Some("invalid_schedule".to_string())
         );
-        input.period_seconds = -10;
+        input.schedule = "0 0 * *".to_string();
         assert_eq!(
             validate_plan_input(&input).err(),
-            Some("invalid_period".to_string())
+            Some("invalid_schedule".to_string())
         );
-        input.period_seconds = 86_400;
+        input.schedule = "0 0 * * *".to_string();
         input.grant_amount_usd = Some("-1".to_string());
         assert_eq!(
             validate_plan_input(&input).err(),
@@ -530,7 +687,7 @@ mod tests {
             validate_plan_input(&input).err(),
             Some("invalid_grant_amount".to_string())
         );
-        assert!(validate_plan_input(&plan_input("zero", "0", 60)).is_ok());
+        assert!(validate_plan_input(&plan_input("zero", "0", "* * * * *")).is_ok());
     }
 
     #[test]
@@ -564,17 +721,17 @@ mod tests {
     async fn plan_lifecycle_and_assignment_anchor() {
         let store = make_store().await;
         let plan = store
-            .create_billing_plan(plan_input("starter", "1", 3_600))
+            .create_billing_plan(plan_input("starter", "1", "0 * * * *"))
             .await
             .expect("create succeeds")
             .expect("name is unique");
         assert_eq!(plan.grant_amount_nano_usd, "1000000000");
-        assert_eq!(plan.period_seconds, 3_600);
+        assert_eq!(plan.schedule, "0 * * * *");
         assert!(plan.enabled);
 
         // Duplicate name rejected.
         match store
-            .create_billing_plan(plan_input("starter", "2", 60))
+            .create_billing_plan(plan_input("starter", "2", "* * * * *"))
             .await
             .expect("create runs")
         {
@@ -606,9 +763,20 @@ mod tests {
             .expect("user exists");
         let anchor = assigned.next_grant_at.expect("anchor set");
         assert_eq!(assigned.billing_plan_id.as_deref(), Some(plan.id.as_str()));
-        let expected = chrono::Utc::now() + chrono::Duration::seconds(3_600);
-        let skew = (expected - anchor).num_milliseconds().abs();
-        assert!(skew < 5_000, "anchor must be ~now+3600s, skew={skew}ms");
+        assert_eq!(assigned.balance_nano_usd, "1000000000");
+        let expected =
+            super::next_grant_after("0 * * * *", assigned.updated_at).expect("hourly next fire");
+        let expected_now =
+            super::next_grant_after("0 * * * *", chrono::Utc::now()).expect("hourly next fire now");
+        assert!(
+            anchor == expected || anchor == expected_now,
+            "anchor {anchor} must be the next hourly fire"
+        );
+        assert_eq!(
+            store.run_plan_grant_tick().await.expect("tick runs"),
+            0,
+            "immediate assignment grant must not be repeated on the next tick"
+        );
 
         // In-use plan cannot be deleted (BP-A4).
         match store
@@ -640,6 +808,7 @@ mod tests {
             .expect("user exists");
         assert!(unassigned.billing_plan_id.is_none());
         assert!(unassigned.next_grant_at.is_none());
+        assert_eq!(unassigned.balance_nano_usd, "1000000000");
 
         // Unknown plan id fails the whole update (BP-S3).
         let error = store
@@ -665,18 +834,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assignment_grants_immediately_only_when_predicates_hold() {
+        let store = make_store().await;
+        let enabled_plan = store
+            .create_billing_plan(plan_input("live", "4", "* * * * *"))
+            .await
+            .expect("create succeeds")
+            .expect("unique");
+        let disabled_plan = store
+            .create_billing_plan(BillingPlanInput {
+                name: "paused".to_string(),
+                grant_amount_nano_usd: None,
+                grant_amount_usd: Some("9".to_string()),
+                schedule: "* * * * *".to_string(),
+                allowed_groups: None,
+                enabled: Some(false),
+            })
+            .await
+            .expect("create succeeds")
+            .expect("unique");
+
+        let eligible = store
+            .create_user("grant_now", "password", UserRole::User, &[])
+            .await
+            .expect("user creates");
+        store
+            .admin_update_user_atomic(
+                &eligible.id,
+                AdminUpdateUserInput {
+                    billing_plan_id: Some(Some(enabled_plan.id.clone())),
+                    ..Default::default()
+                },
+                "actor",
+            )
+            .await
+            .expect("assigns");
+        let eligible = store
+            .get_user_by_id(&eligible.id)
+            .await
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(eligible.balance_nano_usd, "4000000000");
+
+        let unlimited = store
+            .create_user("grant_skip_unlim", "password", UserRole::User, &[])
+            .await
+            .expect("user creates");
+        store
+            .admin_update_user_atomic(
+                &unlimited.id,
+                AdminUpdateUserInput {
+                    balance_unlimited: Some(true),
+                    billing_plan_id: Some(Some(enabled_plan.id.clone())),
+                    ..Default::default()
+                },
+                "actor",
+            )
+            .await
+            .expect("assigns");
+        let unlimited = store
+            .get_user_by_id(&unlimited.id)
+            .await
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(unlimited.balance_nano_usd, "0");
+        assert!(unlimited.next_grant_at.is_some());
+
+        let disabled = store
+            .create_user("grant_skip_off", "password", UserRole::User, &[])
+            .await
+            .expect("user creates");
+        store
+            .admin_update_user_atomic(
+                &disabled.id,
+                AdminUpdateUserInput {
+                    enabled: Some(false),
+                    billing_plan_id: Some(Some(enabled_plan.id.clone())),
+                    ..Default::default()
+                },
+                "actor",
+            )
+            .await
+            .expect("assigns");
+        let disabled = store
+            .get_user_by_id(&disabled.id)
+            .await
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(disabled.balance_nano_usd, "0");
+        assert!(disabled.next_grant_at.is_some());
+
+        let paused = store
+            .create_user("grant_skip_paused", "password", UserRole::User, &[])
+            .await
+            .expect("user creates");
+        store
+            .admin_update_user_atomic(
+                &paused.id,
+                AdminUpdateUserInput {
+                    billing_plan_id: Some(Some(disabled_plan.id.clone())),
+                    ..Default::default()
+                },
+                "actor",
+            )
+            .await
+            .expect("assigns");
+        let paused = store
+            .get_user_by_id(&paused.id)
+            .await
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(paused.balance_nano_usd, "0");
+        assert!(paused.next_grant_at.is_some());
+
+        let explicit = store
+            .create_user("grant_skip_explicit", "password", UserRole::User, &[])
+            .await
+            .expect("user creates");
+        store
+            .admin_update_user_atomic(
+                &explicit.id,
+                AdminUpdateUserInput {
+                    balance_nano_usd: Some("123".to_string()),
+                    billing_plan_id: Some(Some(enabled_plan.id.clone())),
+                    ..Default::default()
+                },
+                "actor",
+            )
+            .await
+            .expect("assigns");
+        let explicit = store
+            .get_user_by_id(&explicit.id)
+            .await
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(explicit.balance_nano_usd, "123");
+    }
+
+    #[tokio::test]
+    async fn grant_tick_recovers_assigned_user_who_never_received_a_plan_grant() {
+        let store = make_store().await;
+        let plan = store
+            .create_billing_plan(plan_input("backfill", "5", "0 0 * * *"))
+            .await
+            .expect("create succeeds")
+            .expect("unique");
+        let user = store
+            .create_user("stale_sub", "password", UserRole::User, &[])
+            .await
+            .expect("user creates");
+        store
+            .admin_update_user_atomic(
+                &user.id,
+                AdminUpdateUserInput {
+                    balance_nano_usd: Some("0".to_string()),
+                    billing_plan_id: Some(Some(plan.id.clone())),
+                    ..Default::default()
+                },
+                "actor",
+            )
+            .await
+            .expect("old-style assignment without immediate grant");
+        let before = store
+            .get_user_by_id(&user.id)
+            .await
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(before.balance_nano_usd, "0");
+        let anchor = before.next_grant_at.expect("future anchor");
+        assert!(anchor > chrono::Utc::now());
+
+        let granted = store.run_plan_grant_tick().await.expect("tick runs");
+        assert_eq!(granted, 1);
+        let after = store
+            .get_user_by_id(&user.id)
+            .await
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(after.balance_nano_usd, "5000000000");
+        let kept = after.next_grant_at.expect("anchor kept");
+        assert_eq!(kept, anchor);
+        assert_eq!(store.run_plan_grant_tick().await.expect("second tick"), 0);
+    }
+
+    #[tokio::test]
     async fn create_plan_maps_validation_errors_as_inner_err() {
         let store = make_store().await;
-        match store.create_billing_plan(plan_input("p", "1", 0)).await {
-            Ok(Err(code)) if code == "invalid_period" => {}
-            other => panic!("expected inner invalid_period, got {other:?}"),
+        match store.create_billing_plan(plan_input("p", "1", "bad")).await {
+            Ok(Err(code)) if code == "invalid_schedule" => {}
+            other => panic!("expected inner invalid_schedule, got {other:?}"),
         }
         match store
             .create_billing_plan(BillingPlanInput {
                 name: "p".to_string(),
                 grant_amount_nano_usd: Some("abc".to_string()),
                 grant_amount_usd: None,
-                period_seconds: 60,
+                schedule: "* * * * *".to_string(),
                 allowed_groups: None,
                 enabled: None,
             })
@@ -686,7 +1039,7 @@ mod tests {
             other => panic!("expected inner invalid_grant_amount, got {other:?}"),
         }
         let zero = store
-            .create_billing_plan(plan_input("zero", "0", 60))
+            .create_billing_plan(plan_input("zero", "0", "* * * * *"))
             .await
             .expect("create runs")
             .expect("zero grant is valid");
@@ -697,12 +1050,12 @@ mod tests {
     async fn plan_name_is_unique_case_insensitively() {
         let store = make_store().await;
         store
-            .create_billing_plan(plan_input("Starter", "1", 60))
+            .create_billing_plan(plan_input("Starter", "1", "* * * * *"))
             .await
             .expect("create runs")
             .expect("name is unique");
         match store
-            .create_billing_plan(plan_input("starter", "2", 60))
+            .create_billing_plan(plan_input("starter", "2", "* * * * *"))
             .await
             .expect("create runs")
         {
@@ -720,7 +1073,7 @@ mod tests {
                 name: "restricted".to_string(),
                 grant_amount_nano_usd: None,
                 grant_amount_usd: Some("1".to_string()),
-                period_seconds: 60,
+                schedule: "* * * * *".to_string(),
                 allowed_groups: Some(vec!["team-a".to_string()]),
                 enabled: Some(false),
             })
@@ -734,7 +1087,7 @@ mod tests {
                     name: plan.name.clone(),
                     grant_amount_nano_usd: Some(plan.grant_amount_nano_usd.clone()),
                     grant_amount_usd: None,
-                    period_seconds: plan.period_seconds,
+                    schedule: plan.schedule,
                     allowed_groups: None,
                     enabled: None,
                 },
@@ -755,7 +1108,7 @@ mod tests {
     async fn grant_tick_resets_balance_and_schedules_next_period_once() {
         let store = make_store().await;
         let plan = store
-            .create_billing_plan(plan_input("daily", "2", 86_400))
+            .create_billing_plan(plan_input("daily", "2", "0 0 * * *"))
             .await
             .expect("create succeeds")
             .expect("unique");
@@ -825,7 +1178,7 @@ mod tests {
     async fn grant_tick_skips_unlimited_disabled_and_disabled_plans() {
         let store = make_store().await;
         let plan = store
-            .create_billing_plan(plan_input("weekly", "3", 604_800))
+            .create_billing_plan(plan_input("weekly", "3", "0 0 * * 0"))
             .await
             .expect("create succeeds")
             .expect("unique");
@@ -925,7 +1278,7 @@ mod tests {
                 name: "grouped".to_string(),
                 grant_amount_nano_usd: None,
                 grant_amount_usd: Some("1".to_string()),
-                period_seconds: 60,
+                schedule: "* * * * *".to_string(),
                 allowed_groups: Some(vec!["team-a".to_string()]),
                 enabled: None,
             })
@@ -983,5 +1336,222 @@ mod tests {
             &api_key.allowed_groups,
         );
         assert_eq!(effective, Some(vec!["team-a".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn admin_reset_grants_eligible_subscribers_and_skips_others() {
+        let store = make_store().await;
+        let plan_a = store
+            .create_billing_plan(plan_input("reset-a", "5", "0 0 * * *"))
+            .await
+            .expect("create a")
+            .expect("unique");
+        let plan_b = store
+            .create_billing_plan(plan_input("reset-b", "9", "0 0 * * *"))
+            .await
+            .expect("create b")
+            .expect("unique");
+        let disabled_plan = store
+            .create_billing_plan(BillingPlanInput {
+                name: "reset-disabled-plan".to_string(),
+                grant_amount_nano_usd: None,
+                grant_amount_usd: Some("7".to_string()),
+                schedule: "0 0 * * *".to_string(),
+                allowed_groups: None,
+                enabled: Some(false),
+            })
+            .await
+            .expect("create disabled plan")
+            .expect("unique");
+
+        for username in [
+            "reset-eligible",
+            "reset-unlimited",
+            "reset-disabled-user",
+            "reset-other-plan",
+            "reset-disabled-plan-user",
+        ] {
+            store
+                .create_user(username, "password", UserRole::User, &[])
+                .await
+                .expect("user creates");
+        }
+        let eligible = store
+            .get_user_by_username("reset-eligible")
+            .await
+            .expect("reads")
+            .expect("exists");
+        let unlimited = store
+            .get_user_by_username("reset-unlimited")
+            .await
+            .expect("reads")
+            .expect("exists");
+        let disabled_user = store
+            .get_user_by_username("reset-disabled-user")
+            .await
+            .expect("reads")
+            .expect("exists");
+        let other = store
+            .get_user_by_username("reset-other-plan")
+            .await
+            .expect("reads")
+            .expect("exists");
+        let disabled_plan_user = store
+            .get_user_by_username("reset-disabled-plan-user")
+            .await
+            .expect("reads")
+            .expect("exists");
+
+        for (user, plan_id) in [
+            (&eligible, &plan_a.id),
+            (&other, &plan_b.id),
+            (&disabled_plan_user, &disabled_plan.id),
+        ] {
+            store
+                .admin_update_user_atomic(
+                    &user.id,
+                    AdminUpdateUserInput {
+                        billing_plan_id: Some(Some(plan_id.clone())),
+                        ..Default::default()
+                    },
+                    "actor",
+                )
+                .await
+                .expect("assigns");
+        }
+        store
+            .admin_update_user_atomic(
+                &unlimited.id,
+                AdminUpdateUserInput {
+                    billing_plan_id: Some(Some(plan_a.id.clone())),
+                    balance_unlimited: Some(true),
+                    ..Default::default()
+                },
+                "actor",
+            )
+            .await
+            .expect("unlimited assign");
+        store
+            .admin_update_user_atomic(
+                &disabled_user.id,
+                AdminUpdateUserInput {
+                    billing_plan_id: Some(Some(plan_a.id.clone())),
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+                "actor",
+            )
+            .await
+            .expect("disabled assign");
+
+        store
+            .admin_update_user_atomic(
+                &eligible.id,
+                AdminUpdateUserInput {
+                    balance_nano_usd: Some("1000000000".to_string()),
+                    ..Default::default()
+                },
+                "actor",
+            )
+            .await
+            .expect("spend eligible");
+        store
+            .admin_update_user_atomic(
+                &other.id,
+                AdminUpdateUserInput {
+                    balance_nano_usd: Some("1000000000".to_string()),
+                    ..Default::default()
+                },
+                "actor",
+            )
+            .await
+            .expect("spend other");
+
+        let missing = store
+            .reset_billing_plan_grants("missing-plan")
+            .await
+            .expect_err("missing plan");
+        assert_eq!(missing, "not_found");
+
+        let empty = store
+            .create_billing_plan(plan_input("reset-empty", "1", "0 0 * * *"))
+            .await
+            .expect("create empty")
+            .expect("unique");
+        assert_eq!(
+            store
+                .reset_billing_plan_grants(&empty.id)
+                .await
+                .expect("empty reset"),
+            0
+        );
+
+        let reset = store
+            .reset_billing_plan_grants(&plan_a.id)
+            .await
+            .expect("reset a");
+        assert_eq!(reset, 1, "only the enabled non-unlimited subscriber");
+
+        let eligible_after = store
+            .get_user_by_id(&eligible.id)
+            .await
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(eligible_after.balance_nano_usd, "5000000000");
+        let next = eligible_after.next_grant_at.expect("anchor kept");
+        assert!(next > chrono::Utc::now());
+        assert_eq!(
+            store.run_plan_grant_tick().await.expect("tick after reset"),
+            0
+        );
+
+        let unlimited_after = store
+            .get_user_by_id(&unlimited.id)
+            .await
+            .expect("reads")
+            .expect("exists");
+        assert_ne!(unlimited_after.balance_nano_usd, "5000000000");
+
+        let disabled_after = store
+            .get_user_by_id(&disabled_user.id)
+            .await
+            .expect("reads")
+            .expect("exists");
+        assert_ne!(disabled_after.balance_nano_usd, "5000000000");
+
+        let other_after = store
+            .get_user_by_id(&other.id)
+            .await
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(other_after.balance_nano_usd, "1000000000");
+
+        let disabled_plan_reset = store
+            .reset_billing_plan_grants(&disabled_plan.id)
+            .await
+            .expect("reset disabled plan");
+        assert_eq!(disabled_plan_reset, 1);
+        let disabled_plan_user_after = store
+            .get_user_by_id(&disabled_plan_user.id)
+            .await
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(disabled_plan_user_after.balance_nano_usd, "7000000000");
+
+        let meta: String = {
+            let read = store.db.read();
+            let row = read
+                .query_one(store.db.stmt(
+                    "SELECT meta_json FROM billing_ledger WHERE user_id = $1 AND kind = 'plan_grant' ORDER BY created_at DESC LIMIT 1",
+                    vec![eligible.id.clone().into()],
+                ))
+                .await
+                .expect("ledger query")
+                .expect("row");
+            row.try_get("", "meta_json").expect("meta")
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&meta).expect("json");
+        assert_eq!(parsed["source"], serde_json::json!("admin_reset"));
+        assert_eq!(parsed["plan_id"], serde_json::json!(plan_a.id));
     }
 }

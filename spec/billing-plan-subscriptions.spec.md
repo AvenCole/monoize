@@ -15,7 +15,7 @@ subscriber may use. A plan is a named record; users reference at most one plan.
 | `id`                     | TEXT    | PRIMARY KEY, UUID v4 string                    |
 | `name`                   | TEXT    | NOT NULL, unique after `lower(trim(name))`, 1..100 chars after trimming |
 | `grant_amount_nano_usd`  | TEXT    | NOT NULL, canonical signed i128 decimal, >= 0   |
-| `period_seconds`         | BIGINT  | NOT NULL, > 0                                   |
+| `schedule`               | TEXT    | NOT NULL, 5-field Unix cron (see BP-D4)         |
 | `allowed_groups`         | TEXT    | NOT NULL, JSON array of strings, default `[]`   |
 | `enabled`                | INTEGER | NOT NULL, `0` or `1`, default `1`               |
 | `created_at`             | TEXT    | NOT NULL, RFC 3339 UTC                          |
@@ -24,6 +24,25 @@ subscriber may use. A plan is a named record; users reference at most one plan.
 BP-D1. `allowed_groups` MUST be canonicalized on every write path exactly like
 `users.allowed_groups`: trim each element, lowercase, drop empties, deduplicate, sort ascending.
 The empty array means "no group restriction from this layer".
+
+BP-D4. `schedule` is a 5-field Unix cron expression `minute hour day-of-month month day-of-week`.
+Write paths MUST trim the value, split on ASCII whitespace, require exactly five non-empty
+fields, and rejoin those fields with a single space. Evaluation timezone is `Asia/Shanghai`.
+`0 0 * * *` means 00:00 in `Asia/Shanghai` every day. `day-of-week` uses Unix numbering:
+`0` and `7` are Sunday. A value that does not parse, that has the wrong field count, or that
+has no fire time after an arbitrary UTC instant MUST be rejected.
+
+BP-D5. Migration `m20260823_000037_billing_plan_cron_schedule` MUST replace
+`billing_plans.period_seconds` with `billing_plans.schedule`. Existing rows MUST be converted:
+
+- `60` → `* * * * *`
+- `3600` → `0 * * * *`
+- `86400` → `0 0 * * *`
+- `604800` → `0 0 * * 0`
+- any other value → `0 0 * * *`
+
+The `period_seconds` column MUST NOT remain. Existing `users.next_grant_at` values MUST be
+left unchanged by the migration.
 
 ### 1.2 New `users` columns
 
@@ -49,13 +68,14 @@ the user management endpoints.
 - `GET /api/dashboard/billing-plans` — list all plans ordered by `created_at` ascending.
 - `POST /api/dashboard/billing-plans` — create a plan.
 - `PUT /api/dashboard/billing-plans/{plan_id}` — update a plan.
+- `POST /api/dashboard/billing-plans/{plan_id}/reset` — reset period quota for every eligible subscriber of the plan. Request body is empty.
 - `DELETE /api/dashboard/billing-plans/{plan_id}` — delete a plan.
 
 Create request body fields: `name: string`, one of `grant_amount_nano_usd: string` or
-`grant_amount_usd: string` (if both are provided, the nano value wins), `period_seconds: integer`,
+`grant_amount_usd: string` (if both are provided, the nano value wins), `schedule: string`,
 optional `allowed_groups: string[]` (omitted = `[]`), optional `enabled: boolean` (omitted = `true`).
 
-Update (`PUT`) request body fields: `name`, `period_seconds`, and a grant amount are required
+Update (`PUT`) request body fields: `name`, `schedule`, and a grant amount are required
 (same amount rules as create). Omitted `allowed_groups` and omitted `enabled` leave the stored
 values unchanged (BP-A8).
 
@@ -63,8 +83,7 @@ BP-A1. If `name` (trimmed) already exists on another plan when compared case-ins
 the server MUST return HTTP `409` with code `plan_name_exists`. Unique-constraint races MUST
 map to the same code, never HTTP `500`.
 
-BP-A2. If `period_seconds <= 0`, the server MUST return HTTP `400` with code `invalid_period`.
-Non-integer values are rejected at deserialization.
+BP-A2. If `schedule` fails BP-D4, the server MUST return HTTP `400` with code `invalid_schedule`.
 
 BP-A3. Invalid amounts (missing, non-canonical nano string, unparsable USD, negative, overflow)
 MUST return HTTP `400` with code `invalid_grant_amount`.
@@ -84,14 +103,49 @@ BP-A8. On `PUT`, omitted `enabled` MUST leave the stored enabled flag unchanged,
 `allowed_groups` MUST leave the stored group list unchanged. On `POST`, omitted
 `allowed_groups` is `[]` and omitted `enabled` is `true`.
 
+BP-A9. Reset of a nonexistent plan MUST return HTTP `404` with code `not_found`.
+
+BP-A10. Reset of an existing plan MUST return HTTP `200` with JSON
+`{ "success": true, "reset_count": N }` where `N` is the number of users whose grant
+committed in this request. `N = 0` is valid (no eligible subscribers). The plan row
+MUST NOT change. A disabled plan is still resettable.
+
+BP-A11. A user is eligible for reset of plan P if and only if ALL of the following hold
+at grant time: `billing_plan_id = P.id`, `next_grant_at IS NOT NULL`, `enabled = 1`,
+`balance_unlimited = 0`. Disabled users, unlimited users, unassigned users, and users
+assigned to a different plan MUST NOT change balance and MUST NOT receive a ledger row.
+
+BP-A12. For each eligible user, reset MUST execute the same atomic grant as BP-G3 with
+`execution_now` equal to the reset request time, even when `next_grant_at` is still in
+the future and even when `P.enabled = 0`. After a successful per-user grant,
+`next_grant_at` is the first fire of `P.schedule` strictly after `execution_now`, so
+the next scheduler tick MUST NOT grant that user again until that new anchor. The
+ledger `meta_json` MUST include `plan_id`, `plan_name`, and `"source": "admin_reset"`.
+
+BP-A13. A per-user grant failure MUST NOT abort remaining eligible users. `reset_count`
+counts only committed grants. Each committed grant MUST invalidate that user's
+in-process balance cache before the handler returns (BP-G4).
+
 ## 3. Plan assignment
 
 Assignment happens through `PUT /api/dashboard/users/{user_id}` with the new optional field
 `billing_plan_id: string | null` (absent = no change; `null` = unassign).
 
-BP-S1. Assigning a plan MUST set `next_grant_at = assignment_time + period_seconds` of the
-target plan in the same transaction as the rest of the user update. The user's current balance
-MUST NOT change at assignment time.
+BP-S1. Assigning a plan MUST, in the same transaction as the rest of the user update:
+set `next_grant_at` to the first fire of `P.schedule` strictly after `assignment_time`
+in timezone `Asia/Shanghai` (stored as RFC 3339 UTC); and, when every
+immediate-grant predicate below is true, reset `balance_nano_usd` to
+`P.grant_amount_nano_usd` (absolute reset, checked i128) and append one `billing_ledger`
+row with `kind = "plan_grant"` using the same fields as BP-G3.
+
+Immediate-grant predicates (all required):
+- the user's `enabled` after this update is `1`;
+- the user's `balance_unlimited` after this update is `0`;
+- the assigned plan has `enabled = 1`;
+- the same update does not set `balance_nano_usd` or `balance_usd`.
+
+If any predicate is false, assignment MUST still set `next_grant_at` and MUST NOT change
+the user's current balance.
 
 BP-S2. Unassigning (`null`) MUST clear `next_grant_at` to NULL in the same transaction.
 The user's current balance MUST NOT change.
@@ -99,7 +153,8 @@ The user's current balance MUST NOT change.
 BP-S3. Assigning a plan id that does not exist MUST fail the whole update with HTTP `400`,
 code `invalid_billing_plan`.
 
-BP-S4. Reassigning from plan P1 to plan P2 MUST set `next_grant_at = now + P2.period_seconds`.
+BP-S4. Reassigning from plan P1 to plan P2 MUST apply BP-S1 using P2, including the
+immediate grant when BP-S1 predicates hold.
 
 ## 4. Grant execution
 
@@ -115,7 +170,8 @@ BP-G3. One grant for user u assigned plan P MUST execute atomically in a single 
 lock the user row (row lock on PostgreSQL; single-writer serialization suffices on SQLite),
 re-read all BP-G2 conditions from the locked row, set
 `balance_nano_usd := P.grant_amount_nano_usd` (absolute reset, checked i128),
-`next_grant_at := execution_now + P.period_seconds`, `updated_at := execution_now`, and append
+`next_grant_at` to the first fire of `P.schedule` strictly after `execution_now` in
+`Asia/Shanghai` (RFC 3339 UTC), `updated_at := execution_now`, and append
 one `billing_ledger` row with `kind = "plan_grant"`,
 `delta_nano_usd = new_balance - old_balance`, `balance_after_nano_usd = new_balance`,
 `meta_json = {"plan_id": ..., "plan_name": ...}`.
@@ -123,16 +179,22 @@ one `billing_ledger` row with `kind = "plan_grant"`,
 BP-G4. After a grant commits, the in-process user balance cache entry for that user MUST be
 invalidated before the tick proceeds to other work.
 
-BP-G5. Catch-up rule: if multiple period boundaries elapsed while the scheduler was not
-running, exactly ONE grant executes per due user per tick, anchored forward from
-`execution_now` (`next_grant_at := execution_now + period_seconds`). Missed periods are not
-multiplied and not replayed.
+BP-G5. Catch-up rule: if multiple schedule fire times elapsed while the scheduler was not
+running, exactly ONE grant executes per due user per tick. `next_grant_at` is the first fire
+of `P.schedule` strictly after `execution_now`. Missed fire times are not multiplied and not
+replayed.
 
 BP-G6. Users with `balance_unlimited = 1` and disabled plans never receive grants and never
 produce `plan_grant` ledger rows. Disabled users are skipped entirely.
 
 BP-G7. Grant amounts of `0` are valid; they reset the balance to `"0"` and still produce a
 ledger row.
+
+BP-G8. A user who has an assigned enabled plan, is enabled, is not unlimited, and has never
+received a `plan_grant` ledger row MUST receive one grant on the next scheduler tick even
+when `next_grant_at` is still in the future. That grant MUST reset `balance_nano_usd` as in
+BP-G3 and MUST NOT change `next_grant_at`. This recovers subscribers assigned before BP-S1
+applied the first grant at assignment time.
 
 ## 5. Group composition
 
@@ -167,7 +229,7 @@ BP-U2. Every dashboard user JSON object from login, register,
   "name": "starter",
   "grant_amount_nano_usd": "10000000000",
   "grant_amount_usd": "10",
-  "period_seconds": 86400,
+  "schedule": "0 0 * * *",
   "allowed_groups": [],
   "enabled": true
 }

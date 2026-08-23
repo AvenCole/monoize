@@ -12,7 +12,7 @@ import {
 import { useAuth } from "@/hooks/use-auth";
 import { type DashboardAnalyticsBucket } from "@/lib/api";
 import { useDashboardAnalytics, useProviders, usePublicSettings, useRequestLogs } from "@/lib/swr";
-import { cn, formatPeriodShort } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 import { PageWrapper, motion, transitions, springs, SharedTabIndicator } from "@/components/ui/motion";
 import { EmptyState } from "@/components/ui/empty-state";
 import { PageHeader } from "@/components/ui/page-header";
@@ -247,8 +247,7 @@ export function DashboardPage() {
               const plan = user?.billing_plan;
               if (!plan) return tt("dashboard.cards.noPlan", "No plan");
               const amount = formatUsdDecimal(plan.grant_amount_usd, 2);
-              const period = formatPeriodShort(plan.period_seconds);
-              const label = `${plan.name} · ${amount}/${period}`;
+              const label = `${plan.name} · ${amount}/${plan.schedule}`;
               return plan.enabled
                 ? label
                 : `${label} (${tt("common.disabled", "Disabled")})`;

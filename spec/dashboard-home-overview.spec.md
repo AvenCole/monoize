@@ -24,7 +24,7 @@ DH-3. Each overview card MUST contain:
 
 DH-3a. Row B account card MUST use these two metrics, sourced from the authenticated user object (`GET /api/dashboard/auth/me` / session user), not from admin-only billing-plan endpoints:
 - metric 1 label = current balance. Value MUST be the localized unlimited label when `balance_unlimited` is true; otherwise `balance_usd` formatted as USD with 2 fractional digits.
-- metric 2 label = subscription. Value MUST be the localized no-plan label when `billing_plan` is null. When `billing_plan` is present, value MUST contain `billing_plan.name`, `billing_plan.grant_amount_usd`, and `billing_plan.period_seconds` (rendered as a compact period such as `1d` / `1h` / `30m` / `45s`).
+- metric 2 label = subscription. Value MUST be the localized no-plan label when `billing_plan` is null. When `billing_plan` is present, value MUST contain `billing_plan.name`, `billing_plan.grant_amount_usd`, and `billing_plan.schedule`.
 - The account card MUST NOT display `my_api_keys_count`.
 
 DH-4. Row C left panel MUST contain:

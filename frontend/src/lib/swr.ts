@@ -433,7 +433,7 @@ export async function createBillingPlanOptimistic(
     name: input.name,
     grant_amount_nano_usd: amounts.grant_amount_nano_usd,
     grant_amount_usd: amounts.grant_amount_usd,
-    period_seconds: input.period_seconds,
+    schedule: input.schedule,
     allowed_groups: input.allowed_groups ?? [],
     enabled: input.enabled ?? true,
     created_at: new Date().toISOString(),
@@ -503,6 +503,49 @@ export async function deleteBillingPlanOptimistic(
     mutate(SWR_KEYS.BILLING_PLANS);
   } catch (error) {
     mutate(SWR_KEYS.BILLING_PLANS, currentPlans, false);
+    if (onError && error instanceof Error) {
+      onError(error);
+    }
+    throw error;
+  }
+}
+
+export async function resetBillingPlanOptimistic(
+  plan: BillingPlan,
+  onError?: (error: Error) => void
+): Promise<{ success: boolean; reset_count: number }> {
+  let snapshot: User[] | undefined;
+  await mutate(
+    SWR_KEYS.USERS,
+    (current: User[] | undefined) => {
+      snapshot = current;
+      if (!current) return current;
+      return current.map((user) => {
+        if (
+          user.billing_plan_id !== plan.id ||
+          user.balance_unlimited ||
+          !user.enabled
+        ) {
+          return user;
+        }
+        return {
+          ...user,
+          balance_nano_usd: plan.grant_amount_nano_usd,
+          balance_usd: plan.grant_amount_usd,
+        };
+      });
+    },
+    false
+  );
+
+  try {
+    const result = await api.resetBillingPlan(plan.id);
+    mutate(SWR_KEYS.USERS);
+    mutate(SWR_KEYS.ME);
+    mutate(SWR_KEYS.STATS);
+    return result;
+  } catch (error) {
+    mutate(SWR_KEYS.USERS, snapshot, false);
     if (onError && error instanceof Error) {
       onError(error);
     }

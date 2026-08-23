@@ -29,7 +29,7 @@ pub use auth::{
 };
 pub use billing_plans::{
     BillingPlanResponse, CreateBillingPlanRequest, UpdateBillingPlanRequest, create_billing_plan,
-    delete_billing_plan, list_billing_plans, update_billing_plan,
+    delete_billing_plan, list_billing_plans, reset_billing_plan, update_billing_plan,
 };
 pub use billing_rates::{
     PricingProfilePatternsResponse, UpdatePricingProfilePatternsRequest, delete_billing_rate,

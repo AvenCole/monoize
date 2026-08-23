@@ -37,7 +37,7 @@ pub struct UserBillingPlanResponse {
     pub name: String,
     pub grant_amount_nano_usd: String,
     pub grant_amount_usd: String,
-    pub period_seconds: i64,
+    pub schedule: String,
     pub allowed_groups: Vec<String>,
     pub enabled: bool,
 }
@@ -53,7 +53,7 @@ impl From<BillingPlan> for UserBillingPlanResponse {
             name: plan.name,
             grant_amount_usd: format_nano_to_usd(nano),
             grant_amount_nano_usd: plan.grant_amount_nano_usd,
-            period_seconds: plan.period_seconds,
+            schedule: plan.schedule,
             allowed_groups: plan.allowed_groups,
             enabled: plan.enabled,
         }

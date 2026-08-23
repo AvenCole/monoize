@@ -13,7 +13,7 @@ pub struct CreateBillingPlanRequest {
     pub name: String,
     pub grant_amount_nano_usd: Option<String>,
     pub grant_amount_usd: Option<String>,
-    pub period_seconds: i64,
+    pub schedule: String,
     #[serde(default)]
     pub allowed_groups: Option<Vec<String>>,
     #[serde(default)]
@@ -25,7 +25,7 @@ pub struct UpdateBillingPlanRequest {
     pub name: String,
     pub grant_amount_nano_usd: Option<String>,
     pub grant_amount_usd: Option<String>,
-    pub period_seconds: i64,
+    pub schedule: String,
     #[serde(default)]
     pub allowed_groups: Option<Vec<String>>,
     #[serde(default)]
@@ -38,7 +38,7 @@ pub struct BillingPlanResponse {
     pub name: String,
     pub grant_amount_nano_usd: String,
     pub grant_amount_usd: String,
-    pub period_seconds: i64,
+    pub schedule: String,
     pub allowed_groups: Vec<String>,
     pub enabled: bool,
     pub created_at: String,
@@ -56,7 +56,7 @@ impl From<BillingPlan> for BillingPlanResponse {
             name: plan.name,
             grant_amount_usd: format_nano_to_usd(nano),
             grant_amount_nano_usd: plan.grant_amount_nano_usd,
-            period_seconds: plan.period_seconds,
+            schedule: plan.schedule,
             allowed_groups: plan.allowed_groups,
             enabled: plan.enabled,
             created_at: plan.created_at.to_rfc3339(),
@@ -69,7 +69,7 @@ fn plan_input(
     name: String,
     grant_amount_nano_usd: Option<String>,
     grant_amount_usd: Option<String>,
-    period_seconds: i64,
+    schedule: String,
     allowed_groups: Option<Vec<String>>,
     enabled: Option<bool>,
 ) -> BillingPlanInput {
@@ -77,7 +77,7 @@ fn plan_input(
         name,
         grant_amount_nano_usd,
         grant_amount_usd,
-        period_seconds,
+        schedule,
         allowed_groups,
         enabled,
     }
@@ -90,7 +90,7 @@ fn map_plan_inner_error(error: String) -> AppError {
             "plan_name_exists",
             "a billing plan with this name already exists",
         ),
-        "invalid_period" | "invalid_grant_amount" | "invalid_plan_name" => {
+        "invalid_schedule" | "invalid_grant_amount" | "invalid_plan_name" => {
             AppError::new(StatusCode::BAD_REQUEST, error.clone(), error)
         }
         "plan_in_use" => AppError::new(
@@ -131,7 +131,7 @@ pub async fn create_billing_plan(
             body.name,
             body.grant_amount_nano_usd,
             body.grant_amount_usd,
-            body.period_seconds,
+            body.schedule,
             body.allowed_groups,
             body.enabled,
         ))
@@ -155,7 +155,7 @@ pub async fn update_billing_plan(
         body.name,
         body.grant_amount_nano_usd,
         body.grant_amount_usd,
-        body.period_seconds,
+        body.schedule,
         body.allowed_groups,
         body.enabled,
     );
@@ -173,6 +173,32 @@ pub async fn update_billing_plan(
         })? {
         Ok(()) => Ok(Json(json!({ "success": true }))),
         Err(error) => Err(map_plan_inner_error(error)),
+    }
+}
+
+pub async fn reset_billing_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(plan_id): Path<String>,
+) -> AppResult<impl IntoResponse> {
+    crate::dashboard_handlers::session_helpers::require_admin(&headers, &state).await?;
+
+    match state
+        .user_store
+        .reset_billing_plan_grants(&plan_id)
+        .await
+        .map_err(|e| {
+            if e == "not_found" {
+                AppError::new(StatusCode::NOT_FOUND, "not_found", "plan not found")
+            } else {
+                AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e)
+            }
+        }) {
+        Ok(reset_count) => Ok(Json(json!({
+            "success": true,
+            "reset_count": reset_count,
+        }))),
+        Err(error) => Err(error),
     }
 }
 
