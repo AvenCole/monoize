@@ -3,7 +3,7 @@
 ## 0. Status
 
 - **Purpose:** Reduce SQLite write contention and query latency through in-memory batching, caching, and PRAGMA tuning.
-- **Scope:** Applies to the `db_cache` module and its integration with `UserStore`.
+- **Scope:** Applies to the `db_cache` module and its integration with `UserStore`. Flush-to-database behaviors (DPT-LU3/DPT-LU6, DPT-RL4) apply to the `primary` node role; on a `replica` they are replaced by the shipment pipeline of `primary-replica-deployment.spec.md` M4–M5 with buffering semantics preserved (PRP12 there).
 - **Dependencies:** `dashmap` (concurrent hash map), `tokio` (async runtime).
 
 ## 1. Module Structure

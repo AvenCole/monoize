@@ -80,6 +80,10 @@ Channel-level affinity override fields MAY be present:
 - `affinity_failback_mode_override: enum("sticky","prefer_higher_priority")?`
 - `affinity_failback_delay_seconds_override: integer? (>= 0)`
 
+Channel egress proxy field MAY be present:
+
+- `proxy_url: string | null`. `null`, absent, or empty means "follow global": the channel's upstream requests use the node-local proxy from `MONOIZE_UPSTREAM_PROXY_URL` (`primary-replica-deployment.spec.md` PX-series). A non-empty value is a custom absolute `http://` or `https://` proxy URL used only by this Channel's upstream requests.
+
 ## 2. Invariants
 
 CP-INV-1. `channels.length >= 1`.
@@ -109,6 +113,8 @@ CP-INV-11. Every non-null `affinity_idle_ttl_seconds_override` MUST be between `
 CP-INV-12. Every non-null `affinity_failback_delay_seconds_override` MUST be between `0` and `2147483647`, inclusive.
 
 CP-INV-13. Every non-null `affinity_failback_mode_override` MUST equal `"sticky"` or `"prefer_higher_priority"`.
+
+CP-INV-14. Every non-empty `proxy_url` MUST be an absolute URL with scheme `http` or `https`. Any other value MUST be rejected with HTTP 400 code `invalid_request`. `null`, absent, and empty are equivalent and mean follow-global.
 
 Provider group routing semantics:
 

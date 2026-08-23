@@ -6,6 +6,7 @@ fn test_runtime(database_dsn: String) -> monoize::app::RuntimeConfig {
         metrics_path: "/metrics".to_string(),
         database_dsn,
         request_log_spool_dir: None,
+        node: monoize::node_config::NodeSettings::primary_default(),
     }
 }
 
@@ -68,9 +69,8 @@ async fn explicit_request_log_spool_directories_are_instance_local() {
 
 #[test]
 fn production_runtime_keeps_spool_override_unset() {
-    assert!(
-        monoize::app::RuntimeConfig::from_env()
-            .request_log_spool_dir
-            .is_none()
-    );
+    let runtime = monoize::app::RuntimeConfig::from_env().expect("env config resolves");
+    assert!(runtime.request_log_spool_dir.is_none());
+    // PRP1 default role without explicit env configuration.
+    assert_eq!(runtime.node.role, monoize::node_config::NodeRole::Primary);
 }

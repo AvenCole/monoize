@@ -296,6 +296,10 @@ ISM4.12d. Migration `m20260809_000029_sessions_expires_at_index` MUST create `id
 
 ISM4.12e. Migration `m20260809_000031_request_logs_without_user_fk` requires source columns `id`, `user_id`, `model`, `is_stream`, `status`, and `created_at`. It MUST fail and roll back when any required source column is absent. Every other nullable ISM4.5 column MAY be absent and MUST be added with null values. For `input_tokens`, `output_tokens`, and `cache_read_tokens`, an existing canonical non-null value MUST win; a null or absent canonical value MUST fall back respectively to legacy `prompt_tokens`, `completion_tokens`, or `cached_tokens`; both absent MUST produce null. The output on SQLite and PostgreSQL MUST contain exactly the 42 ISM4.5 columns. Every other column and every ordinary request-log index outside the ISM5.2 set MUST be removed. PostgreSQL MUST preserve indexes owned by table constraints and MUST drop both `request_logs_user_id_fkey` and `fk_request_logs_user_id` with `IF EXISTS`. The migration MUST perform inspection, data changes, and DDL in one transaction, MUST be idempotent, and MUST preserve every row. The migration down operation MUST be a no-op.
 
+ISM4.12f. Migration `m20260823_000033_billing_ledger_delta_dedupe` MUST add nullable TEXT column `idempotency_key` to `billing_ledger` and one partial unique index over that column restricted to non-null values, identically on SQLite and PostgreSQL (`primary-replica-deployment.spec.md` SC1). Existing rows keep NULL. The down migration MUST drop the index then the column.
+
+ISM4.12g. Migration `m20260823_000034_channel_egress_proxy` MUST add nullable TEXT column `proxy_url` to `monoize_channels` on SQLite and PostgreSQL; existing rows MUST read as NULL (follow-global) (`primary-replica-deployment.spec.md` SC3). The down migration MUST drop the column.
+
 ISM4.13. Legacy `providers`, `model_mappings`, and `group_members` tables MUST NOT be created.
 
 ISM4.15. `state_records` columns:

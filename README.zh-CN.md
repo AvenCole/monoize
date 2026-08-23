@@ -203,8 +203,23 @@ curl http://localhost:8080/v1/responses \
 | `MONOIZE_METRICS_PATH` | `/metrics` | Prometheus 指标路径 |
 | `MONOIZE_HTTP_BODY_MAX_BYTES` | `52428800` | 转发请求体上限 |
 | `MONOIZE_TRUSTED_PROXY_CIDRS` | 空 | 受信任的反向代理网段 |
+| `MONOIZE_UPSTREAM_PROXY_URL` | 未设置 | 本节点的上游出站 HTTP(S) 代理；Channel 可通过 `proxy_url` 单独覆盖 |
 
 Monoize 支持 SQLite 和 PostgreSQL。业务表只支持由一个 Monoize 应用进程写入。
+
+### 主从部署
+
+Monoize 支持一个可写主机加若干只读从机、共享同一 PostgreSQL 数据库的部署形态（见 `spec/primary-replica-deployment.spec.md`）。从机仅服务 `/v1/**` 转发流量（不提供控制台），请求日志与计费扣减经内部鉴权接口集中上报主机落库；余额预检会扣除尚未上报的本地欠账以约束超支。故障切换为手动：将从机角色改为主机并重启即可提升。
+
+| 变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `MONOIZE_NODE_ROLE` | `primary` | `primary` 或 `replica` |
+| `MONOIZE_PRIMARY_INTERNAL_URL` | 从机必填 | 主机内部地址，用于计量上报 |
+| `MONOIZE_REPLICA_TOKEN` | 未设置 | 节点共享密钥：从机必填；主机设置后开启接收端点 |
+| `MONOIZE_CONFIG_POLL_INTERVAL_SECONDS` | `5` | 从机配置纪元轮询间隔 |
+| `MONOIZE_METERING_SHIP_INTERVAL_SECONDS` | `10` | 从机计量上报间隔 |
+| `MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES` | `500` | 单批次条目上限（硬上限 2000） |
+| `MONOIZE_REPLICA_METERING_SPOOL_DIR` | `./data/replica-metering-spool` | 计量差额外存目录 |
 
 ## 运维能力
 

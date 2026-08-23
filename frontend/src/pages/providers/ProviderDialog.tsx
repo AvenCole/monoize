@@ -137,7 +137,8 @@ function channelInput(channel: ChannelRow) {
 		affinity_enabled_override: channel.affinity_enabled_override,
 		affinity_idle_ttl_seconds_override: optionalPositiveInteger(channel.affinity_idle_ttl_seconds_override),
 		affinity_failback_mode_override: channel.affinity_failback_mode_override,
-		affinity_failback_delay_seconds_override: optionalPositiveInteger(channel.affinity_failback_delay_seconds_override)
+		affinity_failback_delay_seconds_override: optionalPositiveInteger(channel.affinity_failback_delay_seconds_override),
+		proxy_url: channel.proxy_url.trim() || null
 	}
 }
 
@@ -562,6 +563,9 @@ function ChannelDetail({ form, activeChannel, selectedChannel, setMobileChannelO
 				<AffinityModeOverride label={c('恢复策略', 'Recovery policy')} value={activeChannel.affinity_failback_mode_override} onChange={value => updateChannel(selectedChannel, { affinity_failback_mode_override: value })} c={c} />
 				<NumberOverride label={c('空闲过期（秒）', 'Idle expiry (seconds)')} value={activeChannel.affinity_idle_ttl_seconds_override} placeholder={settings?.monoize_affinity_idle_ttl_seconds} onChange={value => updateChannel(selectedChannel, { affinity_idle_ttl_seconds_override: value })} />
 				<NumberOverride min={0} label={c('回切延迟（秒）', 'Failback delay (seconds)')} value={activeChannel.affinity_failback_delay_seconds_override} placeholder={settings?.monoize_affinity_failback_delay_seconds} onChange={value => updateChannel(selectedChannel, { affinity_failback_delay_seconds_override: value })} />
+				<Field label={c('出口代理', 'Egress proxy')} hint={c('留空跟随节点全局代理；填写 http(s) 代理地址仅对本 Channel 生效', 'Empty follows the node-global proxy; an http(s) URL applies to this channel only')}>
+					<Input value={activeChannel.proxy_url} placeholder='http://proxy:port' onChange={event => updateChannel(selectedChannel, { proxy_url: event.target.value })} />
+				</Field>
 				<p className='text-xs leading-relaxed text-muted-foreground sm:col-span-2'>
 					{c('“保持当前 Channel”会让同一 Agent Thread 持续使用回落后的 Channel；“优先级恢复”在延迟结束后，遇到更高优先级 Provider 恢复时按正常顺序重新选择。', '“Keep current channel” keeps an Agent thread on its fallback channel. “Prefer higher priority” returns to normal ordering after the delay when an earlier provider becomes eligible.')}
 				</p>

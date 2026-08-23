@@ -560,8 +560,9 @@ pub async fn create_embeddings(
             }
 
             let provider = build_channel_provider_config(&attempt);
+            let http = client_http_for_attempt(&state, &attempt)?;
             let result = upstream::call_upstream_with_timeout_and_headers(
-                client_http(&state),
+                &http,
                 &provider,
                 &attempt.api_key,
                 "/v1/embeddings",
@@ -821,6 +822,8 @@ struct MonoizeAttempt {
     affinity_failback_mode: crate::monoize_routing::AffinityFailbackMode,
     affinity_failback_delay_seconds: u64,
     routing_config_revision: u64,
+    /// PX6: per-Channel egress proxy override (None = follow node-global).
+    proxy_url: Option<String>,
 }
 
 fn reasoning_envelope_provider_type(provider_type: ProviderType) -> &'static str {
@@ -1036,6 +1039,10 @@ async fn ensure_balance_before_forward(
     state: &AppState,
     auth: &crate::auth::AuthResult,
 ) -> AppResult<()> {
+    if state.node.is_replica() {
+        // M7: replica preflight subtracts locally unshipped charges.
+        return ensure_replica_can_spend(state, auth).await;
+    }
     if auth.sub_account_enabled {
         let Some(api_key_id) = auth.api_key_id.as_deref() else {
             return Ok(());
@@ -1105,6 +1112,89 @@ async fn ensure_balance_before_forward_for_attempts(
         return Ok(());
     }
     ensure_balance_before_forward(state, auth).await
+}
+
+/// M7: effective-balance preflight for replicas. Mirrors the primary's
+/// `ensure_user_can_spend` / `ensure_sub_account_can_spend` semantics while
+/// subtracting charges that are still queued for shipment to the primary.
+#[allow(clippy::result_large_err)]
+async fn ensure_replica_can_spend(
+    state: &AppState,
+    auth: &crate::auth::AuthResult,
+) -> AppResult<()> {
+    let Some(metering) = state.metering.as_ref() else {
+        return Ok(());
+    };
+    let outstanding_for = |subject: &str| metering.pending().outstanding(subject);
+    if auth.sub_account_enabled {
+        if let Some(api_key_id) = auth.api_key_id.as_deref() {
+            let key = state
+                .user_store
+                .get_api_key_by_id(api_key_id)
+                .await
+                .map_err(|err| {
+                    AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", err)
+                })?
+                .ok_or_else(|| {
+                    AppError::new(
+                        StatusCode::UNAUTHORIZED,
+                        "unauthorized",
+                        "api key not found",
+                    )
+                })?;
+            if key.sub_account_enabled {
+                let stored: i128 = key.sub_account_balance_nano.trim().parse().map_err(|err| {
+                    AppError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        format!("invalid stored sub-account balance: {err}"),
+                    )
+                })?;
+                let effective = stored - outstanding_for(api_key_id);
+                if effective <= 0 {
+                    return Err(AppError::new(
+                        StatusCode::PAYMENT_REQUIRED,
+                        "insufficient_balance",
+                        "insufficient balance",
+                    ));
+                }
+                return Ok(());
+            }
+            // Not sub-account-enabled: charges fall back to the owning user row.
+            return ensure_replica_user_can_spend(state, &key.user_id, outstanding_for).await;
+        }
+        return Ok(());
+    }
+    let Some(user_id) = auth.user_id.as_deref() else {
+        return Ok(());
+    };
+    ensure_replica_user_can_spend(state, user_id, outstanding_for).await
+}
+
+#[allow(clippy::result_large_err)]
+async fn ensure_replica_user_can_spend(
+    state: &AppState,
+    user_id: &str,
+    outstanding_for: impl Fn(&str) -> i128,
+) -> AppResult<()> {
+    let balance = state
+        .user_store
+        .get_user_balance_uncached(user_id)
+        .await
+        .map_err(|err| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", err))?
+        .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, "unauthorized", "user not found"))?;
+    if balance.balance_unlimited {
+        return Ok(());
+    }
+    let effective = balance.balance_nano_usd - outstanding_for(user_id);
+    if effective <= 0 {
+        return Err(AppError::new(
+            StatusCode::PAYMENT_REQUIRED,
+            "insufficient_balance",
+            "insufficient balance",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]

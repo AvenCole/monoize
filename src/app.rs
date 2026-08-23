@@ -11,6 +11,7 @@ use crate::monoize_routing::{
     ChannelAffinityBinding, ChannelHealthState, MonoizeRoutingStore, MonoizeRuntimeConfig,
     probe_channel_completion,
 };
+use crate::node_config::{HttpClients, NodeRole, NodeSettings};
 use crate::rate_limit::RateLimiter;
 use crate::request_capture::RequestCaptureStore;
 use crate::settings::{PricingProfilePattern, SettingsStore, normalize_pricing_model_key};
@@ -18,6 +19,7 @@ use crate::transforms::TransformRegistry;
 use crate::users::{InsertRequestLog, UserRole, UserStore};
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use dashmap::DashMap;
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -173,6 +175,13 @@ pub struct AppState {
     pub runtime: Arc<RuntimeConfig>,
     pub auth: AuthState,
     pub http: reqwest::Client,
+    pub http_clients: HttpClients,
+    pub node: Arc<NodeSettings>,
+    pub db_pool: DbPool,
+    /// Present on replicas; drives the metering shipment pipeline.
+    pub metering: Option<Arc<crate::replica::metering::ReplicaMetering>>,
+    /// SHA-256 digest of MONOIZE_REPLICA_TOKEN on primaries with ingest enabled.
+    pub metering_token_digest: Option<[u8; 32]>,
     pub metrics: PrometheusHandle,
     pub user_store: UserStore,
     pub settings_store: SettingsStore,
@@ -197,6 +206,17 @@ pub struct AppState {
     pub trusted_proxies: TrustedProxyConfig,
 }
 
+impl AppState {
+    pub fn with_node_role(self, role: NodeRole) -> Self {
+        let mut node = (*self.node).clone();
+        node.role = role;
+        Self {
+            node: Arc::new(node),
+            ..self
+        }
+    }
+}
+
 const ACTIVE_PROBE_CONNECTIVITY_KIND: &str = "active_probe_connectivity";
 const ACTIVE_PROBE_SYSTEM_USER: &str = "_monoize_active_probe";
 const DEFAULT_HTTP_BODY_MAX_BYTES: usize = 50 * 1024 * 1024;
@@ -211,10 +231,12 @@ pub struct RuntimeConfig {
     pub metrics_path: String,
     pub database_dsn: String,
     pub request_log_spool_dir: Option<std::path::PathBuf>,
+    pub node: NodeSettings,
 }
 
 impl RuntimeConfig {
-    pub fn from_env() -> Self {
+    /// Errors carry `(error_code, detail)` and stop startup per PRP1/PRP7/PX2.
+    pub fn from_env() -> Result<Self, (&'static str, String)> {
         let listen = std::env::var("MONOIZE_LISTEN")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -224,11 +246,24 @@ impl RuntimeConfig {
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| "/metrics".to_string());
         let database_dsn = resolve_database_dsn();
-        Self {
+        let node = NodeSettings::from_env()?;
+        Ok(Self {
             listen,
             metrics_path,
             database_dsn,
             request_log_spool_dir: None,
+            node,
+        })
+    }
+
+    /// Test/programmatic construction with default (primary) node settings.
+    pub fn with_defaults(listen: &str, metrics_path: &str, database_dsn: String) -> Self {
+        Self {
+            listen: listen.to_string(),
+            metrics_path: metrics_path.to_string(),
+            database_dsn,
+            request_log_spool_dir: None,
+            node: NodeSettings::primary_default(),
         }
     }
 }
@@ -246,12 +281,22 @@ fn http_body_max_bytes_from_raw(raw: Option<&str>) -> usize {
 }
 
 pub async fn load_state() -> AppResult<AppState> {
-    load_state_with_runtime(RuntimeConfig::from_env()).await
+    let runtime = RuntimeConfig::from_env().map_err(|(code, detail)| {
+        AppError::new(axum::http::StatusCode::BAD_REQUEST, code, detail)
+    })?;
+    load_state_with_runtime(runtime).await
 }
 
 #[allow(clippy::field_reassign_with_default)]
 pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppState> {
     let auth = AuthState::new();
+    let is_replica = runtime.node.is_replica();
+    runtime
+        .node
+        .validate_for_dsn(&runtime.database_dsn)
+        .map_err(|(code, detail)| {
+            AppError::new(axum::http::StatusCode::BAD_REQUEST, code, detail)
+        })?;
     let trusted_proxies = TrustedProxyConfig::from_env().map_err(|error| {
         AppError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -260,16 +305,15 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         )
     })?;
 
-    let http = reqwest::Client::builder()
-        .user_agent("monoize/0.1")
-        .build()
-        .map_err(|err| {
+    let http_clients =
+        HttpClients::new(runtime.node.upstream_proxy_url.as_deref()).map_err(|err| {
             AppError::new(
                 axum::http::StatusCode::BAD_REQUEST,
                 "http_client_init_failed",
-                err.to_string(),
+                err,
             )
         })?;
+    let http = http_clients.global_client();
 
     let db = DbPool::connect(&runtime.database_dsn)
         .await
@@ -281,7 +325,7 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
             )
         })?;
 
-    {
+    if !is_replica {
         let _write_guard = db.write().await;
         crate::migration::run_startup_migrations(&*_write_guard)
             .await
@@ -292,16 +336,29 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                     err.to_string(),
                 )
             })?;
+    } else {
+        // PRP10: replicas verify schema currency without writing.
+        crate::migration::verify_schema_current(db.read())
+            .await
+            .map_err(|err| {
+                let code = if err.to_string().contains("replica_schema_pending") {
+                    "replica_schema_pending"
+                } else {
+                    "database_migration_failed"
+                };
+                AppError::new(axum::http::StatusCode::BAD_REQUEST, code, err.to_string())
+            })?;
     }
 
     let (log_broadcast, _) = tokio::sync::broadcast::channel::<Vec<InsertRequestLog>>(64);
 
     let pending_request_logs = Arc::new(DashMap::new());
-    let user_store = UserStore::new_with_pending_request_logs_and_spool_dir(
+    let user_store = UserStore::new_for_role(
         db.clone(),
         log_broadcast.clone(),
         pending_request_logs.clone(),
         runtime.request_log_spool_dir.clone(),
+        is_replica,
     )
     .await
     .map_err(|err| {
@@ -311,14 +368,24 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
             err,
         )
     })?;
-    let settings_store = SettingsStore::new(db.clone()).await.map_err(|err| {
+    let settings_store = if is_replica {
+        SettingsStore::new_read_only(db.clone()).await
+    } else {
+        SettingsStore::new(db.clone()).await
+    }
+    .map_err(|err| {
         AppError::new(
             axum::http::StatusCode::BAD_REQUEST,
             "settings_store_init_failed",
             err,
         )
     })?;
-    let monoize_store = MonoizeRoutingStore::new(db.clone()).await.map_err(|err| {
+    let monoize_store = if is_replica {
+        MonoizeRoutingStore::new_read_only(db.clone()).await
+    } else {
+        MonoizeRoutingStore::new(db.clone()).await
+    }
+    .map_err(|err| {
         AppError::new(
             axum::http::StatusCode::BAD_REQUEST,
             "monoize_store_init_failed",
@@ -332,7 +399,7 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
             err,
         )
     })?;
-    let billing_rate_store = BillingRateStore::new(db).await.map_err(|err| {
+    let billing_rate_store = BillingRateStore::new(db.clone()).await.map_err(|err| {
         AppError::new(
             axum::http::StatusCode::BAD_REQUEST,
             "billing_rate_store_init_failed",
@@ -350,48 +417,7 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         )
     })?;
 
-    let mut monoize_runtime = MonoizeRuntimeConfig::default();
-    monoize_runtime.passive_failure_count_threshold =
-        settings_snapshot.monoize_passive_failure_threshold.max(1);
-    monoize_runtime.passive_cooldown_seconds =
-        settings_snapshot.monoize_passive_cooldown_seconds.max(1);
-    monoize_runtime.passive_window_seconds =
-        settings_snapshot.monoize_passive_window_seconds.max(1);
-    monoize_runtime.passive_rate_limit_cooldown_seconds = settings_snapshot
-        .monoize_passive_rate_limit_cooldown_seconds
-        .max(1);
-    monoize_runtime.active_enabled = settings_snapshot.monoize_active_probe_enabled;
-    monoize_runtime.active_interval_seconds = settings_snapshot
-        .monoize_active_probe_interval_seconds
-        .max(1);
-    monoize_runtime.active_success_threshold = settings_snapshot
-        .monoize_active_probe_success_threshold
-        .max(1);
-    monoize_runtime.active_probe_model = settings_snapshot.monoize_active_probe_model.clone();
-    monoize_runtime.global_transforms = settings_snapshot.global_transforms.clone();
-    monoize_runtime.global_model_redirects = settings_snapshot.global_model_redirects.clone();
-    monoize_runtime.reasoning_suffix_map = settings_snapshot.reasoning_suffix_map.clone();
-    monoize_runtime.pricing_profile_model_patterns =
-        settings_snapshot.pricing_profile_model_patterns.clone();
-    monoize_runtime.codex_model_ids = settings_snapshot.codex_model_ids.clone();
-    monoize_runtime.request_timeout_ms = settings_snapshot.monoize_request_timeout_ms.max(1);
-    monoize_runtime.stream_idle_timeout_ms =
-        settings_snapshot.monoize_stream_idle_timeout_ms.max(1);
-    monoize_runtime.enable_estimated_billing = settings_snapshot.monoize_enable_estimated_billing;
-    monoize_runtime.extra_fields_whitelist =
-        settings_snapshot.monoize_extra_fields_whitelist.clone();
-    monoize_runtime.strip_cross_protocol_nested_extra =
-        settings_snapshot.monoize_strip_cross_protocol_nested_extra;
-    monoize_runtime.request_capture_enabled = settings_snapshot.monoize_request_capture_enabled;
-    monoize_runtime.request_capture_retention_days = settings_snapshot
-        .monoize_request_capture_retention_days
-        .max(1);
-    monoize_runtime.affinity_enabled = settings_snapshot.monoize_affinity_enabled;
-    monoize_runtime.affinity_idle_ttl_seconds =
-        settings_snapshot.monoize_affinity_idle_ttl_seconds.max(1);
-    monoize_runtime.affinity_failback_mode = settings_snapshot.monoize_affinity_failback_mode;
-    monoize_runtime.affinity_failback_delay_seconds =
-        settings_snapshot.monoize_affinity_failback_delay_seconds;
+    let monoize_runtime = runtime_config_from_settings(&settings_snapshot);
     let channel_health = Arc::new(Mutex::new(HashMap::new()));
     let channel_affinity = Arc::new(Mutex::new(HashMap::new()));
     let routing_config_revision = Arc::new(AtomicU64::new(0));
@@ -408,7 +434,11 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         .as_ref()
         .clone()
         .spawn_cleanup_task(ImageTransformCache::default_cleanup_interval());
-    let active_probe_user_id = ensure_active_probe_system_user(&user_store).await?;
+    let active_probe_user_id = if !is_replica {
+        Some(ensure_active_probe_system_user(&user_store).await?)
+    } else {
+        None
+    };
     let request_log_tasks = RequestLogTaskTracker::default();
     let background_shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -429,8 +459,17 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
     }
 
     let probe_store = monoize_store.clone();
-    let probe_http = http.clone();
+    let probe_http_clients = http_clients.clone();
     let monoize_runtime = Arc::new(tokio::sync::RwLock::new(monoize_runtime));
+    if is_replica {
+        // E3: fixed-interval, single-row epoch poll driving snapshot rebuilds.
+        crate::replica::poll::spawn_config_epoch_poller(
+            db.clone(),
+            settings_store.clone(),
+            monoize_runtime.clone(),
+            runtime.node.config_poll_interval,
+        );
+    }
     let request_capture = RequestCaptureStore::new(&runtime.database_dsn);
     request_capture.spawn_cleanup_task(monoize_runtime.clone());
     let probe_runtime = monoize_runtime.clone();
@@ -444,6 +483,10 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
     let probe_task_registration = RequestLogTaskRegistration::new(request_log_tasks.clone());
     tokio::spawn(async move {
         let _probe_task_registration = probe_task_registration;
+        let Some(probe_user_id) = probe_user_id else {
+            // PRP11: replicas never run the active-probe scheduler.
+            return;
+        };
         'scheduler: loop {
             if probe_shutdown.load(Ordering::Acquire) {
                 break;
@@ -544,6 +587,21 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                     if !probe_due {
                         continue;
                     }
+
+                    let probe_http =
+                        match probe_http_clients.for_channel_proxy(channel.proxy_url.as_deref()) {
+                            Ok(client) => client,
+                            Err(error) => {
+                                tracing::warn!(
+                                    channel_id = %channel.id,
+                                    channel_name = %channel.name,
+                                    provider = %provider.name,
+                                    error = %error,
+                                    "active probe skipped because channel proxy could not be built"
+                                );
+                                continue;
+                            }
+                        };
 
                     let configured_model = channel
                         .active_probe_model_override
@@ -772,10 +830,75 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         }
     });
 
+    let node = Arc::new(runtime.node.clone());
+    let metering = if is_replica {
+        let metering = crate::replica::metering::ReplicaMetering::new(
+            runtime.node.metering_spool_dir.clone(),
+            runtime.node.metering_spool_max_bytes,
+            runtime.node.replica_primary_url.as_deref().unwrap_or(""),
+            runtime.node.replica_token.as_deref().unwrap_or(""),
+            runtime.node.metering_ship_batch_max_entries,
+        )
+        .map_err(|err| {
+            AppError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "metering_init_failed",
+                err,
+            )
+        })?;
+        let metering = Arc::new(metering);
+        metering.spawn_ship_loop(
+            user_store.request_log_batcher_clone(),
+            user_store.last_used_batcher_clone(),
+            runtime.node.metering_ship_interval,
+        );
+        Some(metering)
+    } else {
+        // PRP9: a promoted node drains leftover delta spool entries before serving.
+        if runtime.node.metering_spool_dir.exists() {
+            let spool = crate::replica::metering::DeltaSpool::new(
+                runtime.node.metering_spool_dir.clone(),
+                runtime.node.metering_spool_max_bytes,
+            )
+            .map_err(|err| {
+                AppError::new(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "metering_drain_failed",
+                    err,
+                )
+            })?;
+            crate::replica::metering::drain_delta_spool_to_local_db(&db, &spool)
+                .await
+                .map_err(|err| {
+                    AppError::new(
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "metering_drain_failed",
+                        err,
+                    )
+                })?;
+        }
+        None
+    };
+    let metering_token_digest: Option<[u8; 32]> = if !is_replica {
+        runtime
+            .node
+            .replica_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(crate::replica::metering::sha256_hex_lower)
+    } else {
+        None
+    };
+
     Ok(AppState {
         runtime: Arc::new(runtime),
         auth,
         http,
+        http_clients,
+        node,
+        db_pool: db.clone(),
+        metering,
+        metering_token_digest,
         metrics,
         user_store,
         settings_store,
@@ -1620,17 +1743,92 @@ async fn canonical_request_id_middleware(
     next.run(request).await
 }
 
+/// Shared construction logic for the settings-derived runtime snapshot (E3): the
+/// primary publishes it after mutations and the replica rebuilds it on epoch change.
+#[allow(clippy::field_reassign_with_default)]
+pub(crate) fn runtime_config_from_settings(
+    settings_snapshot: &crate::settings::SystemSettings,
+) -> MonoizeRuntimeConfig {
+    let mut runtime = MonoizeRuntimeConfig::default();
+    runtime.passive_failure_count_threshold =
+        settings_snapshot.monoize_passive_failure_threshold.max(1);
+    runtime.passive_cooldown_seconds = settings_snapshot.monoize_passive_cooldown_seconds.max(1);
+    runtime.passive_window_seconds = settings_snapshot.monoize_passive_window_seconds.max(1);
+    runtime.passive_rate_limit_cooldown_seconds = settings_snapshot
+        .monoize_passive_rate_limit_cooldown_seconds
+        .max(1);
+    runtime.active_enabled = settings_snapshot.monoize_active_probe_enabled;
+    runtime.active_interval_seconds = settings_snapshot
+        .monoize_active_probe_interval_seconds
+        .max(1);
+    runtime.active_success_threshold = settings_snapshot
+        .monoize_active_probe_success_threshold
+        .max(1);
+    runtime.active_probe_model = settings_snapshot.monoize_active_probe_model.clone();
+    runtime.global_transforms = settings_snapshot.global_transforms.clone();
+    runtime.global_model_redirects = settings_snapshot.global_model_redirects.clone();
+    runtime.reasoning_suffix_map = settings_snapshot.reasoning_suffix_map.clone();
+    runtime.pricing_profile_model_patterns =
+        settings_snapshot.pricing_profile_model_patterns.clone();
+    runtime.codex_model_ids = settings_snapshot.codex_model_ids.clone();
+    runtime.request_timeout_ms = settings_snapshot.monoize_request_timeout_ms.max(1);
+    runtime.stream_idle_timeout_ms = settings_snapshot.monoize_stream_idle_timeout_ms.max(1);
+    runtime.enable_estimated_billing = settings_snapshot.monoize_enable_estimated_billing;
+    runtime.extra_fields_whitelist = settings_snapshot.monoize_extra_fields_whitelist.clone();
+    runtime.strip_cross_protocol_nested_extra =
+        settings_snapshot.monoize_strip_cross_protocol_nested_extra;
+    runtime.request_capture_enabled = settings_snapshot.monoize_request_capture_enabled;
+    runtime.request_capture_retention_days = settings_snapshot
+        .monoize_request_capture_retention_days
+        .max(1);
+    runtime.affinity_enabled = settings_snapshot.monoize_affinity_enabled;
+    runtime.affinity_idle_ttl_seconds = settings_snapshot.monoize_affinity_idle_ttl_seconds.max(1);
+    runtime.affinity_failback_mode = settings_snapshot.monoize_affinity_failback_mode;
+    runtime.affinity_failback_delay_seconds =
+        settings_snapshot.monoize_affinity_failback_delay_seconds;
+    runtime
+}
+
+/// D1: replica nodes answer every non-API path with this error instead of mounting
+/// the dashboard or the SPA.
+async fn replica_disabled_fallback() -> axum::response::Response {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(json!({
+            "error": {
+                "code": "replica_dashboard_disabled",
+                "message": "dashboard and frontend are served by the primary node"
+            }
+        })),
+    )
+        .into_response()
+}
+
 pub fn build_app(state: AppState) -> Router {
     let metrics_path = state.runtime.metrics_path.clone();
     let trusted_proxies = state.trusted_proxies.clone();
     let http_body_max_bytes = http_body_max_bytes();
+    let is_replica = state.node.is_replica();
     let root_api_router = build_root_api_router(&metrics_path);
     let dashboard_api_router = build_dashboard_api_router();
-    let api_router = root_api_router.clone().merge(dashboard_api_router);
-    Router::<AppState>::new()
-        .merge(root_api_router)
-        .nest("/api", api_router)
-        .fallback(crate::frontend::frontend_fallback)
+
+    let mut app = Router::<AppState>::new().merge(root_api_router.clone());
+    if is_replica {
+        // D1/D2: API-only surface; /v1/** and /metrics stay local.
+        app = app.fallback(replica_disabled_fallback);
+    } else {
+        let api_router = root_api_router.clone().merge(dashboard_api_router);
+        app = app.nest("/api", api_router);
+        if state.metering_token_digest.is_some() {
+            // PRP6/I1: ingest mounted only when a replica token is configured.
+            app = app.route(
+                crate::replica::metering::METERING_INGEST_PATH,
+                post(crate::replica::metering::ingest_metering_handler),
+            );
+        }
+        app = app.fallback(crate::frontend::frontend_fallback);
+    }
+    app
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             trusted_proxies,

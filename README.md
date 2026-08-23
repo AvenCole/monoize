@@ -204,8 +204,23 @@ Runtime bootstrap uses environment variables. Providers, Channels, models, routi
 | `MONOIZE_METRICS_PATH` | `/metrics` | Prometheus metrics path |
 | `MONOIZE_HTTP_BODY_MAX_BYTES` | `52428800` | Forwarding request-body limit |
 | `MONOIZE_TRUSTED_PROXY_CIDRS` | `127.0.0.0/8,::1/128` | Trusted reverse-proxy networks; an explicitly empty value disables trust |
+| `MONOIZE_UPSTREAM_PROXY_URL` | unset | Node-local outbound HTTP(S) proxy for upstream calls; channels may override per channel via `proxy_url` |
 
 Monoize supports SQLite and PostgreSQL. One Monoize application process is the supported writer for its business tables.
+
+### Primary/replica deployment
+
+Monoize can run as one writable primary plus read-only replicas that share one PostgreSQL database (`spec/primary-replica-deployment.spec.md`). Replicas serve `/v1/**` traffic only — no dashboard — and ship request logs and billing deltas to the primary over an authenticated internal API; balance checks subtract locally unshipped charges to keep overspend bounded. Failover is manual: promote a replica by switching its role and restarting.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MONOIZE_NODE_ROLE` | `primary` | `primary` or `replica` |
+| `MONOIZE_PRIMARY_INTERNAL_URL` | required on replicas | Base URL of the primary for metering shipment |
+| `MONOIZE_REPLICA_TOKEN` | unset | Shared secret: required on replicas; on a primary it enables the ingest endpoint |
+| `MONOIZE_CONFIG_POLL_INTERVAL_SECONDS` | `5` | Replica config-epoch poll interval |
+| `MONOIZE_METERING_SHIP_INTERVAL_SECONDS` | `10` | Replica metering shipment interval |
+| `MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES` | `500` | Per-batch entry cap (hard cap 2000) |
+| `MONOIZE_REPLICA_METERING_SPOOL_DIR` | `./data/replica-metering-spool` | Durable delta spool directory |
 
 ## Operations
 

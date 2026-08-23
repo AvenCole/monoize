@@ -162,7 +162,7 @@ C4. Monoize MUST resolve metrics endpoint path from `MONOIZE_METRICS_PATH`, defa
 
 C5. Monoize MUST accept downstream request bodies up to the configured HTTP body limit on forwarding endpoints (`/v1/responses`, `/v1/responses/compact`, `/v1/chat/completions`, `/v1/messages`, `/v1/embeddings`). `MONOIZE_HTTP_BODY_MAX_BYTES` MUST select this limit when its trimmed value is a positive base-10 integer that fits `usize`; an unset, empty, zero, negative, malformed, or overflowing value MUST select the default `52428800` bytes. Any framework-default extractor limit smaller than the selected value MUST be disabled so that the selected value is the effective limit.
 
-C6. Monoize runs as one application process with concurrent worker tasks. The application process is the only supported writer for Monoize business tables. Direct SQL writes and concurrent Monoize writer processes are outside the cache-coherence contract.
+C6. Monoize runs as one application process with concurrent worker tasks. Exactly one process with node role `primary` is the only supported writer for Monoize business tables (`primary-replica-deployment.spec.md`). Processes running as role `replica` share the same database read-only and ship telemetry through the primary's ingest API; direct SQL writes from any source and concurrent Monoize primary writer processes are outside the cache-coherence contract.
 
 C7. `MONOIZE_TRUSTED_PROXY_CIDRS` MUST be an optional comma-separated list of IPv4 or IPv6 CIDR networks. If the variable is absent, the effective list MUST be `127.0.0.0/8,::1/128`. If the variable is present, including with an empty value, the effective list MUST equal the configured entries. An invalid non-empty entry MUST make startup fail.
 

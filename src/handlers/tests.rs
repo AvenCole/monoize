@@ -428,6 +428,8 @@ async fn routing_uses_channel_model_multiplier_and_redirect_per_attempt() {
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
     seed_model_pricing(&state, "channel-owned-model").await;
@@ -459,6 +461,8 @@ async fn routing_uses_channel_model_multiplier_and_redirect_per_attempt() {
         affinity_idle_ttl_seconds_override: None,
         affinity_failback_mode_override: None,
         affinity_failback_delay_seconds_override: None,
+
+        proxy_url: None,
     };
 
     state
@@ -1488,6 +1492,8 @@ async fn resolve_model_suffix_preserves_reasoning_effort_on_attempt_base_request
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -1539,6 +1545,8 @@ async fn resolve_model_suffix_preserves_reasoning_effort_on_attempt_base_request
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
+
+                proxy_url: None,
             }],
         })
         .await
@@ -1607,6 +1615,8 @@ async fn build_monoize_attempts_rejects_unpriced_models_before_forwarding() {
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -1658,6 +1668,8 @@ async fn build_monoize_attempts_rejects_unpriced_models_before_forwarding() {
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
+
+                proxy_url: None,
             }],
         })
         .await
@@ -1681,6 +1693,8 @@ async fn build_monoize_attempts_rejects_admin_unpriced_models_without_pricing() 
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -1732,6 +1746,8 @@ async fn build_monoize_attempts_rejects_admin_unpriced_models_without_pricing() 
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
+
+                proxy_url: None,
             }],
         })
         .await
@@ -1754,6 +1770,8 @@ async fn build_monoize_attempts_rejects_admin_missing_server_tool_meter_rate() {
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -1805,6 +1823,8 @@ async fn build_monoize_attempts_rejects_admin_missing_server_tool_meter_rate() {
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
+
+                proxy_url: None,
             }],
         })
         .await
@@ -1830,6 +1850,8 @@ async fn build_monoize_attempts_accepts_redirected_model_when_logical_fallback_i
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -1881,6 +1903,8 @@ async fn build_monoize_attempts_accepts_redirected_model_when_logical_fallback_i
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
+
+                proxy_url: None,
             }],
         })
         .await
@@ -1954,6 +1978,8 @@ async fn build_monoize_attempts_uses_metadata_pricing_profile_fallback() {
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -2005,6 +2031,8 @@ async fn build_monoize_attempts_uses_metadata_pricing_profile_fallback() {
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
+
+                proxy_url: None,
             }],
         })
         .await
@@ -2047,6 +2075,8 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -2082,6 +2112,8 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
             affinity_idle_ttl_seconds_override: None,
             affinity_failback_mode_override: None,
             affinity_failback_delay_seconds_override: None,
+
+            proxy_url: None,
         }],
     )
     .await;
@@ -2117,6 +2149,8 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
             affinity_idle_ttl_seconds_override: None,
             affinity_failback_mode_override: None,
             affinity_failback_delay_seconds_override: None,
+
+            proxy_url: None,
         }],
     )
     .await;
@@ -2152,6 +2186,8 @@ async fn build_monoize_attempts_filters_providers_by_effective_groups_before_hea
             affinity_idle_ttl_seconds_override: None,
             affinity_failback_mode_override: None,
             affinity_failback_delay_seconds_override: None,
+
+            proxy_url: None,
         }],
     )
     .await;
@@ -2190,6 +2226,8 @@ async fn execute_nonstream_typed_keeps_bad_gateway_when_groups_filter_every_chan
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
 
@@ -2225,6 +2263,8 @@ async fn execute_nonstream_typed_keeps_bad_gateway_when_groups_filter_every_chan
             affinity_idle_ttl_seconds_override: None,
             affinity_failback_mode_override: None,
             affinity_failback_delay_seconds_override: None,
+
+            proxy_url: None,
         }],
     )
     .await;
@@ -2370,6 +2410,7 @@ fn affinity_test_attempt(
         affinity_failback_mode: failback_mode,
         affinity_failback_delay_seconds: failback_delay_seconds,
         routing_config_revision: 0,
+        proxy_url: None,
     }
 }
 
@@ -2447,6 +2488,8 @@ async fn disabled_breaker_success_and_failure_do_not_insert_health_state() {
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
     let mut attempt = affinity_test_attempt(
@@ -2478,6 +2521,8 @@ async fn passive_failure_queue_stops_at_threshold_and_success_adds_no_sample() {
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
     let mut attempt = affinity_test_attempt(
@@ -2572,6 +2617,8 @@ async fn affinity_lookup_removes_only_the_requested_expired_binding() {
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
     let request = build_test_routing_request("gpt-affinity");
@@ -2619,6 +2666,8 @@ async fn affinity_failback_mode_controls_recovered_provider_order() {
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
     let request = build_test_routing_request("gpt-affinity");
@@ -2696,6 +2745,8 @@ async fn affinity_disabled_override_removes_existing_binding() {
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
     let request = build_test_routing_request("gpt-affinity");
@@ -2735,6 +2786,8 @@ async fn response_id_affinity_inherits_source_binding_age_on_hit() {
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
         request_log_spool_dir: None,
+
+        node: crate::node_config::NodeSettings::primary_default(),
     };
     let state = load_state_with_runtime(runtime).await.expect("state loads");
     let request = build_test_routing_request("gpt-affinity");

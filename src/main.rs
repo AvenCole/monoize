@@ -20,7 +20,8 @@ async fn main() {
 
 async fn run() -> Result<(), AppError> {
     let state = monoize::app::load_state().await?;
-    state.user_store.spawn_background_tasks();
+    let is_replica = state.node.is_replica();
+    state.user_store.spawn_background_tasks_for_role(is_replica);
 
     // Periodic rate limiter cleanup to bound memory growth
     {
@@ -33,16 +34,19 @@ async fn run() -> Result<(), AppError> {
         });
     }
 
-    match state.user_store.cleanup_pending_request_logs().await {
-        Ok(n) if n > 0 => tracing::info!(count = n, "cleaned up stale pending request logs"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!("failed to cleanup pending request logs: {e}"),
-    }
+    if !is_replica {
+        // PRP11: retention/pending-log deletion is a primary responsibility.
+        match state.user_store.cleanup_pending_request_logs().await {
+            Ok(n) if n > 0 => tracing::info!(count = n, "cleaned up stale pending request logs"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("failed to cleanup pending request logs: {e}"),
+        }
 
-    match state.user_store.cleanup_expired_request_logs().await {
-        Ok(n) if n > 0 => tracing::info!(count = n, "cleaned up expired request logs"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!("failed to cleanup expired request logs: {e}"),
+        match state.user_store.cleanup_expired_request_logs().await {
+            Ok(n) if n > 0 => tracing::info!(count = n, "cleaned up expired request logs"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("failed to cleanup expired request logs: {e}"),
+        }
     }
 
     let app = monoize::app::build_app(state.clone());
@@ -86,12 +90,28 @@ async fn run() -> Result<(), AppError> {
         tracing::info!(terminal_tasks, "waiting for terminal request-log tasks");
     }
     state.request_log_tasks.wait_for_idle().await;
-    state.user_store.flush_all_batchers().await;
+    if is_replica {
+        // M6: one best-effort shipment attempt; durable spool covers the rest.
+        if let Some(metering) = state.metering.as_ref() {
+            metering
+                .final_ship(
+                    &state.user_store.request_log_batcher_clone(),
+                    &state.user_store.last_used_batcher_clone(),
+                )
+                .await;
+        }
+    } else {
+        state.user_store.flush_all_batchers().await;
+    }
 
-    match state.user_store.cleanup_pending_request_logs().await {
-        Ok(n) if n > 0 => tracing::info!(count = n, "finalized pending request logs on shutdown"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!("failed to cleanup pending request logs on shutdown: {e}"),
+    if !is_replica {
+        match state.user_store.cleanup_pending_request_logs().await {
+            Ok(n) if n > 0 => {
+                tracing::info!(count = n, "finalized pending request logs on shutdown")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("failed to cleanup pending request logs on shutdown: {e}"),
+        }
     }
 
     Ok(())

@@ -117,7 +117,28 @@ impl LastUsedBatcher {
         })
     }
 
-    fn record_retry(&self, api_key_id: String, timestamp: DateTime<Utc>) {
+    /// Replica shipment path (PRP12): atomically drain all buffered entries without
+    /// touching the database. Callers re-insert via `record_retry` on delivery failure.
+    pub fn drain(&self) -> Vec<(String, DateTime<Utc>)> {
+        self.drain_limit(usize::MAX)
+    }
+
+    pub fn drain_limit(&self, max: usize) -> Vec<(String, DateTime<Utc>)> {
+        let mut drained = Vec::new();
+        if max == 0 {
+            return drained;
+        }
+        self.buffer.retain(|k, v| {
+            if drained.len() >= max {
+                return true;
+            }
+            drained.push((k.clone(), *v));
+            false
+        });
+        drained
+    }
+
+    pub(crate) fn record_retry(&self, api_key_id: String, timestamp: DateTime<Utc>) {
         let _guard = self
             .record_lock
             .lock()
@@ -141,7 +162,9 @@ impl LastUsedBatcher {
     }
 }
 
-fn last_used_bulk_update(entries: &[(String, DateTime<Utc>)]) -> (String, Vec<sea_orm::Value>) {
+pub(crate) fn last_used_bulk_update(
+    entries: &[(String, DateTime<Utc>)],
+) -> (String, Vec<sea_orm::Value>) {
     let mut sql = String::from("UPDATE api_keys SET last_used_at = CASE");
     let mut values = Vec::with_capacity(entries.len().saturating_mul(2));
     let mut id_placeholders = Vec::with_capacity(entries.len());
@@ -164,7 +187,7 @@ fn last_used_bulk_update(entries: &[(String, DateTime<Utc>)]) -> (String, Vec<se
 // ---------------------------------------------------------------------------
 
 const REQUEST_LOG_INSERT_COLUMNS: usize = 42;
-const REQUEST_LOG_INSERT_CHUNK_ENTRIES: usize = 20;
+pub(crate) const REQUEST_LOG_INSERT_CHUNK_ENTRIES: usize = 20;
 const REQUEST_LOG_MIN_ENTRY_BYTES: u64 = 4_096;
 const REQUEST_LOG_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const REQUEST_LOG_RETRY_MAX_DELAY: Duration = Duration::from_millis(1_000);
@@ -194,50 +217,58 @@ struct SpoolFileRef {
     bytes: u64,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct SpoolRequestLog {
-    id: String,
-    request_id: Option<String>,
-    user_id: String,
-    api_key_id: Option<String>,
-    model: String,
-    provider_id: Option<String>,
-    upstream_model: Option<String>,
-    channel_id: Option<String>,
-    is_stream: bool,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    cache_read_tokens: Option<u64>,
-    cache_creation_tokens: Option<u64>,
-    tool_prompt_tokens: Option<u64>,
-    reasoning_tokens: Option<u64>,
-    accepted_prediction_tokens: Option<u64>,
-    rejected_prediction_tokens: Option<u64>,
-    provider_multiplier: Option<String>,
-    charge_nano_usd: Option<String>,
-    status: String,
-    usage_breakdown_json: Option<serde_json::Value>,
-    billing_breakdown_json: Option<serde_json::Value>,
-    error_code: Option<String>,
-    error_message: Option<String>,
-    error_http_status: Option<u16>,
-    duration_ms: Option<u64>,
-    ttfb_ms: Option<u64>,
-    first_visible_output_ms: Option<u64>,
-    last_visible_output_ms: Option<u64>,
-    visible_generation_ms: Option<u64>,
-    visible_output_tokens: Option<u64>,
-    tps_mode: Option<String>,
-    request_ip: Option<String>,
-    reasoning_effort: Option<String>,
-    tried_providers_json: Option<serde_json::Value>,
-    request_kind: Option<String>,
-    effective_provider_type: Option<String>,
-    affinity_hit: Option<bool>,
-    affinity_key_hash: Option<String>,
-    affinity_target: Option<String>,
-    created_at: String,
-    created_at_unix_ms: i64,
+/// Delivery target for replica request-log shipment (PRP12 / M4–M5).
+#[async_trait::async_trait]
+pub(crate) trait MeteringSink: Send + Sync {
+    /// Deliver one batch durably on the receiving side. Returning `Err` MUST mean
+    /// nothing was persisted so the caller can retry the identical entries later.
+    async fn deliver(&self, entries: &[SpoolRequestLog]) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpoolRequestLog {
+    pub id: String,
+    pub request_id: Option<String>,
+    pub user_id: String,
+    pub api_key_id: Option<String>,
+    pub model: String,
+    pub provider_id: Option<String>,
+    pub upstream_model: Option<String>,
+    pub channel_id: Option<String>,
+    pub is_stream: bool,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub tool_prompt_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub accepted_prediction_tokens: Option<u64>,
+    pub rejected_prediction_tokens: Option<u64>,
+    pub provider_multiplier: Option<String>,
+    pub charge_nano_usd: Option<String>,
+    pub status: String,
+    pub usage_breakdown_json: Option<serde_json::Value>,
+    pub billing_breakdown_json: Option<serde_json::Value>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub error_http_status: Option<u16>,
+    pub duration_ms: Option<u64>,
+    pub ttfb_ms: Option<u64>,
+    pub first_visible_output_ms: Option<u64>,
+    pub last_visible_output_ms: Option<u64>,
+    pub visible_generation_ms: Option<u64>,
+    pub visible_output_tokens: Option<u64>,
+    pub tps_mode: Option<String>,
+    pub request_ip: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub tried_providers_json: Option<serde_json::Value>,
+    pub request_kind: Option<String>,
+    pub effective_provider_type: Option<String>,
+    pub affinity_hit: Option<bool>,
+    pub affinity_key_hash: Option<String>,
+    pub affinity_target: Option<String>,
+    pub created_at: String,
+    pub created_at_unix_ms: i64,
 }
 
 impl SpoolRequestLog {
@@ -406,7 +437,7 @@ fn request_log_insert_values(log: &SpoolRequestLog) -> Vec<sea_orm::Value> {
     ]
 }
 
-fn request_log_insert_chunk<'a>(
+pub(crate) fn request_log_insert_chunk<'a>(
     logs: impl ExactSizeIterator<Item = &'a SpoolRequestLog>,
 ) -> (String, Vec<sea_orm::Value>) {
     use std::fmt::Write as _;
@@ -1247,6 +1278,91 @@ impl RequestLogBatcher {
         if !deletion_failed.is_empty() {
             self.requeue_front(deletion_failed).await;
         }
+    }
+
+    /// Replica shipment path (PRP12 / M4–M5): select the oldest durable entries, hand
+    /// them to `sink`, and only release spool files and quota accounting after the sink
+    /// reports success. On failure every entry is requeued in its original order.
+    /// Serialized by `flush_lock`, so it cannot interleave with a DB flush on this node.
+    pub(crate) async fn ship_via(&self, max_entries: usize, sink: &dyn MeteringSink) -> usize {
+        let _flush_guard = self.flush_lock.lock().await;
+        let selected: Vec<SpoolFileRef> = {
+            let mut buf = self.buffer.lock().await;
+            let take = max_entries.min(buf.len());
+            if take == 0 {
+                return 0;
+            }
+            buf.drain(..take).collect()
+        };
+        let selected_backup: Vec<SpoolFileRef> = selected
+            .iter()
+            .map(|entry| SpoolFileRef {
+                path: entry.path.clone(),
+                bytes: entry.bytes,
+            })
+            .collect();
+        let entries = match load_spool_batch(
+            &self.spool_dir,
+            selected,
+            self.memory_capacity,
+            self.spool_entry_max_bytes,
+        )
+        .await
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                // At least one file became unreadable: put the refs back unchanged.
+                tracing::warn!("request_log_batcher ship read error: {error}");
+                self.requeue_front(selected_backup).await;
+                return 0;
+            }
+        };
+        if entries.is_empty() {
+            return 0;
+        }
+        let entry_refs = entries
+            .iter()
+            .map(|(entry, _)| entry.clone())
+            .collect::<Vec<_>>();
+        let payloads = entries
+            .iter()
+            .map(|(_, log)| log.clone())
+            .collect::<Vec<_>>();
+        match sink.deliver(&payloads).await {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::warn!(
+                    entries = payloads.len(),
+                    "metering sink rejected request-log batch: {error}"
+                );
+                self.requeue_front(entry_refs).await;
+                return 0;
+            }
+        }
+        let mut delivered = 0usize;
+        let mut deletion_failed = Vec::new();
+        for (entry, _) in entries {
+            match tokio::fs::remove_file(&entry.path).await {
+                Ok(()) => {
+                    atomic_saturating_sub(&self.spool_bytes, entry.bytes);
+                    atomic_saturating_sub(&self.admitted_bytes, entry.bytes);
+                    delivered += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    atomic_saturating_sub(&self.spool_bytes, entry.bytes);
+                    atomic_saturating_sub(&self.admitted_bytes, entry.bytes);
+                    delivered += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(path = %entry.path.display(), "remove shipped request log spool file failed: {error}");
+                    deletion_failed.push(entry);
+                }
+            }
+        }
+        if !deletion_failed.is_empty() {
+            self.requeue_front(deletion_failed).await;
+        }
+        delivered
     }
 
     /// Spawn background task that flushes every `interval`.

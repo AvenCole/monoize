@@ -5087,7 +5087,8 @@ async fn create_test_provider(
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
-            }],
+            
+                proxy_url: None,}],
             max_retries: -1,
             channel_max_retries: 0,
             channel_retry_interval_ms: 0,
@@ -5278,7 +5279,8 @@ async fn setup_with_unknown_fields() -> TestContext {
         metrics_path: "/metrics".to_string(),
         database_dsn: format!("sqlite://{}", db_path.display()),
         request_log_spool_dir: Some(temp_dir.path().join("request-log-spool")),
-    })
+    
+            node: monoize::node_config::NodeSettings::primary_default(),})
     .await
     .expect("load state");
     configure_test_extra_fields_whitelist(&state).await;

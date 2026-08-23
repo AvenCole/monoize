@@ -369,8 +369,9 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     .await
                     .stream_idle_timeout_ms
                     .max(1);
+                let http = client_http_for_attempt(state, &attempt)?;
                 let call = upstream::call_upstream_raw_with_timeout_and_headers(
-                    client_http(state),
+                    &http,
                     &provider,
                     &attempt.api_key,
                     &path,
@@ -462,8 +463,9 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                         .await);
                     }
                 };
+                let http = client_http_for_attempt(state, &attempt)?;
                 match upstream::call_upstream_multipart_with_timeout_and_headers(
-                    client_http(state),
+                    &http,
                     &provider,
                     &attempt.api_key,
                     &path,
@@ -495,8 +497,9 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                     Err(err) => Err(err),
                 }
             } else {
+                let http = client_http_for_attempt(state, &attempt)?;
                 upstream::call_upstream_with_timeout_and_headers(
-                    client_http(state),
+                    &http,
                     &provider,
                     &attempt.api_key,
                     &path,

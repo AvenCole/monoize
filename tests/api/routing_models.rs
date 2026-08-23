@@ -226,6 +226,8 @@ async fn channel_passive_override_threshold_takes_precedence_over_global_default
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
+
+                proxy_url: None,
             }],
             max_retries: -1,
             channel_max_retries: 0,
@@ -317,6 +319,8 @@ async fn provider_request_transform_matches_normalized_model_before_redirect() {
             affinity_idle_ttl_seconds_override: None,
             affinity_failback_mode_override: None,
             affinity_failback_delay_seconds_override: None,
+
+            proxy_url: None,
         }],
         max_retries: -1,
         channel_max_retries: 0,
@@ -424,6 +428,8 @@ async fn provider_api_type_override_matches_logical_model_before_provider_redire
             affinity_idle_ttl_seconds_override: None,
             affinity_failback_mode_override: None,
             affinity_failback_delay_seconds_override: None,
+
+            proxy_url: None,
         }],
         max_retries: -1,
         channel_max_retries: 0,

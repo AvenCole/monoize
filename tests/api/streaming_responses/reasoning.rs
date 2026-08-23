@@ -113,7 +113,8 @@ async fn responses_streaming_omits_multiple_reasoning_items_emptied_by_response_
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
-            }],
+            
+                proxy_url: None,}],
             max_retries: -1,
             channel_max_retries: 0,
             channel_retry_interval_ms: 0,
@@ -326,7 +327,8 @@ async fn responses_streaming_applies_response_transform_from_provider() {
             affinity_idle_ttl_seconds_override: None,
             affinity_failback_mode_override: None,
             affinity_failback_delay_seconds_override: None,
-        }],
+        
+                proxy_url: None,}],
         max_retries: -1,
         channel_max_retries: 0,
         channel_retry_interval_ms: 0,
@@ -420,7 +422,8 @@ async fn responses_streaming_split_sse_frames_breaks_large_delta_frames() {
             affinity_idle_ttl_seconds_override: None,
             affinity_failback_mode_override: None,
             affinity_failback_delay_seconds_override: None,
-        }],
+        
+                proxy_url: None,}],
         max_retries: -1,
         channel_max_retries: 0,
         channel_retry_interval_ms: 0,

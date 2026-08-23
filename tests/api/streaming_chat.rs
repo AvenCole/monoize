@@ -1240,6 +1240,8 @@ async fn chat_streaming_plaintext_reasoning_to_summary_rewrites_reasoning_events
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
+
+                proxy_url: None,
             }],
             max_retries: -1,
             channel_max_retries: 0,
@@ -1341,6 +1343,8 @@ async fn chat_streaming_plaintext_reasoning_to_summary_preserves_encrypted_reaso
                 affinity_idle_ttl_seconds_override: None,
                 affinity_failback_mode_override: None,
                 affinity_failback_delay_seconds_override: None,
+
+                proxy_url: None,
             }],
             max_retries: -1,
             channel_max_retries: 0,

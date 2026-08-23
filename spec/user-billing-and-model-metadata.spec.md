@@ -252,7 +252,7 @@ LC4. The write pool's single connection is the required serialization mechanism 
 
 LC4.1. PostgreSQL balance mutations MUST lock every user and API-key balance row that participates in the mutation with `SELECT ... FOR UPDATE` in deterministic user-then-API-key order. Each mutation MUST compute balances, write balances, and append all ledger rows in one transaction.
 
-LC5. The billing charge path (`charge_user_balance_nano`) MUST execute a single attempt and MUST NOT include an explicit retry loop. Error behavior for non-transient failures remains unchanged.
+LC5. The billing charge path (`charge_user_balance_nano`) MUST execute a single attempt and MUST NOT include an explicit retry loop. Error behavior for non-transient failures remains unchanged. This clause scopes the primary-role synchronous path; a replica node enqueues balance deltas instead per `primary-replica-deployment.spec.md` M3.
 
 ## 7. Model metadata store
 

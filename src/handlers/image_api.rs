@@ -701,8 +701,9 @@ async fn execute_stream_collected_image_typed(
             };
             let provider = build_channel_provider_config(&attempt);
             let path = upstream_path_for_model(attempt.provider_type, &req_attempt.model, true);
+            let http = client_http_for_attempt(state, &attempt)?;
             let call = upstream::call_upstream_raw_with_timeout_and_headers(
-                client_http(state),
+                &http,
                 &provider,
                 &attempt.api_key,
                 &path,

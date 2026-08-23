@@ -300,6 +300,25 @@ impl UserStore {
         pending_request_logs: Arc<dashmap::DashMap<String, super::InsertRequestLog>>,
         request_log_spool_dir: Option<std::path::PathBuf>,
     ) -> Result<Self, String> {
+        Self::new_for_role(
+            db,
+            log_broadcast,
+            pending_request_logs,
+            request_log_spool_dir,
+            false,
+        )
+        .await
+    }
+
+    /// `is_replica` skips the startup write passes (PRP11): transform-id canonicalization,
+    /// key-hash backfill, and expired-session deletion are primary responsibilities.
+    pub async fn new_for_role(
+        db: crate::db::DbPool,
+        log_broadcast: tokio::sync::broadcast::Sender<Vec<super::InsertRequestLog>>,
+        pending_request_logs: Arc<dashmap::DashMap<String, super::InsertRequestLog>>,
+        request_log_spool_dir: Option<std::path::PathBuf>,
+        is_replica: bool,
+    ) -> Result<Self, String> {
         use std::time::Duration;
         let store = Self {
             db,
@@ -315,9 +334,11 @@ impl UserStore {
             registration_lock: Arc::new(tokio::sync::Mutex::new(())),
             api_key_creation_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
-        store.migrate_transform_rule_ids().await?;
-        store.migrate_api_key_lookup_hashes().await?;
-        store.cleanup_expired_sessions().await?;
+        if !is_replica {
+            store.migrate_transform_rule_ids().await?;
+            store.migrate_api_key_lookup_hashes().await?;
+            store.cleanup_expired_sessions().await?;
+        }
         Ok(store)
     }
 
@@ -520,18 +541,29 @@ impl UserStore {
     }
 
     pub fn spawn_background_tasks(&self) {
-        self.last_used_batcher
-            .clone()
-            .spawn_flush_task(self.db.clone(), std::time::Duration::from_secs(30));
-        self.request_log_batcher
-            .clone()
-            .spawn_flush_task(self.db.clone(), std::time::Duration::from_secs(2));
+        self.spawn_background_tasks_for_role(false);
+    }
+
+    /// On a replica the DB flush loops, session cleanup, and log retention loops are
+    /// replaced by the shipment pipeline (`primary-replica-deployment.spec.md` PRP12).
+    pub fn spawn_background_tasks_for_role(&self, is_replica: bool) {
+        if !is_replica {
+            self.last_used_batcher
+                .clone()
+                .spawn_flush_task(self.db.clone(), std::time::Duration::from_secs(30));
+            self.request_log_batcher
+                .clone()
+                .spawn_flush_task(self.db.clone(), std::time::Duration::from_secs(2));
+        }
         self.api_key_cache
             .clone()
             .spawn_eviction_task(std::time::Duration::from_secs(30));
         self.balance_cache
             .clone()
             .spawn_eviction_task(std::time::Duration::from_secs(30));
+        if is_replica {
+            return;
+        }
         let store = self.clone();
         tokio::spawn(async move {
             loop {
@@ -554,6 +586,16 @@ impl UserStore {
             }
         });
         self.spawn_plan_grant_scheduler();
+    }
+
+    /// Replica shipment pipeline access (PRP12/M4).
+    pub fn last_used_batcher_clone(&self) -> crate::db_cache::LastUsedBatcher {
+        self.last_used_batcher.clone()
+    }
+
+    /// Replica shipment pipeline access (PRP12/M4).
+    pub fn request_log_batcher_clone(&self) -> crate::db_cache::RequestLogBatcher {
+        self.request_log_batcher.clone()
     }
 
     pub async fn flush_all_batchers(&self) {
@@ -2536,38 +2578,44 @@ impl UserStore {
         self.delete_api_keys_transactional(ids).await
     }
 
+    fn user_balance_from_row(row: &QueryResult) -> Result<UserBalance, String> {
+        let balance_raw: String = row
+            .try_get("", "balance_nano_usd")
+            .map_err(|e| e.to_string())?;
+        Ok(UserBalance {
+            user_id: row.try_get("", "id").map_err(|e| e.to_string())?,
+            balance_nano_usd: parse_nano_usd(&balance_raw)?,
+            balance_unlimited: row
+                .try_get::<i32>("", "balance_unlimited")
+                .map_err(|e| e.to_string())?
+                == 1,
+        })
+    }
+
+    async fn load_user_balance(&self, user_id: &str) -> Result<Option<UserBalance>, String> {
+        let row = self
+            .db
+            .read()
+            .query_one(self.db.stmt(
+                "SELECT id, balance_nano_usd, balance_unlimited FROM users WHERE id = $1",
+                vec![user_id.into()],
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        row.map(|row| Self::user_balance_from_row(&row)).transpose()
+    }
+
     pub async fn get_user_balance(&self, user_id: &str) -> Result<Option<UserBalance>, String> {
         loop {
             if let Some(cached) = self.balance_cache.get(user_id) {
                 return Ok(Some(cached));
             }
             let generation = self.balance_cache.current_generation();
-            let row = self
-                .db
-                .read()
-                .query_one(self.db.stmt(
-                    "SELECT id, balance_nano_usd, balance_unlimited FROM users WHERE id = $1",
-                    vec![user_id.into()],
-                ))
-                .await
-                .map_err(|e| e.to_string())?;
-            let Some(row) = row else {
+            let Some(balance) = self.load_user_balance(user_id).await? else {
                 if self.balance_cache.current_generation() != generation {
                     continue;
                 }
                 return Ok(None);
-            };
-            let balance_raw: String = row
-                .try_get("", "balance_nano_usd")
-                .map_err(|e| e.to_string())?;
-            let balance_nano_usd = parse_nano_usd(&balance_raw)?;
-            let balance = UserBalance {
-                user_id: row.try_get("", "id").map_err(|e| e.to_string())?,
-                balance_nano_usd,
-                balance_unlimited: row
-                    .try_get::<i32>("", "balance_unlimited")
-                    .map_err(|e| e.to_string())?
-                    == 1,
             };
             if !self.balance_cache.insert_if_current(
                 user_id.to_string(),
@@ -2578,6 +2626,14 @@ impl UserStore {
             }
             return Ok(Some(balance));
         }
+    }
+
+    /// Replica preflight (M7): persisted balance without the 30s dashboard cache.
+    pub async fn get_user_balance_uncached(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserBalance>, String> {
+        self.load_user_balance(user_id).await
     }
 
     pub async fn ensure_user_can_spend(&self, user_id: &str) -> Result<(), BillingError> {
