@@ -2322,6 +2322,8 @@ fn exhausted_upstream_error_preserves_final_machine_code() {
         attempt_number: 1,
         provider_id: "provider-a".to_string(),
         channel_id: "channel-a".to_string(),
+        provider_name: "Provider A".to_string(),
+        channel_name: "Channel A".to_string(),
         error: "encrypted content could not be verified".to_string(),
         upstream_status: Some(StatusCode::BAD_REQUEST.as_u16()),
         upstream_code: Some("thinking_signature_invalid".to_string()),
@@ -2338,6 +2340,149 @@ fn exhausted_upstream_error_preserves_final_machine_code() {
         err.upstream_code.as_deref(),
         Some("thinking_signature_invalid")
     );
+}
+
+#[test]
+fn channel_origin_key_groups_same_host_independent_of_path_and_case() {
+    assert_eq!(
+        routing::channel_origin_key("https://input.codes"),
+        routing::channel_origin_key("https://INPUT.CODES/v1/")
+    );
+    assert_eq!(
+        routing::channel_origin_key("https://input.codes").as_deref(),
+        Some("https://input.codes:443")
+    );
+    assert_ne!(
+        routing::channel_origin_key("https://input.codes"),
+        routing::channel_origin_key("https://codex.ciii.club")
+    );
+    assert!(routing::channel_origin_key("not a url").is_none());
+}
+
+#[test]
+fn shared_origin_status_covers_502_503_524_only() {
+    assert!(routing::is_shared_origin_status(Some(502)));
+    assert!(routing::is_shared_origin_status(Some(503)));
+    assert!(routing::is_shared_origin_status(Some(524)));
+    assert!(!routing::is_shared_origin_status(Some(429)));
+    assert!(!routing::is_shared_origin_status(Some(500)));
+    assert!(!routing::is_shared_origin_status(None));
+}
+
+#[tokio::test]
+async fn shared_origin_blast_marks_peer_channels_and_skips_without_clearing_affinity() {
+    let runtime = RuntimeConfig {
+        listen: "127.0.0.1:0".to_string(),
+        metrics_path: "/metrics".to_string(),
+        database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
+        node: crate::node_config::NodeSettings::primary_default(),
+    };
+    let state = load_state_with_runtime(runtime).await.expect("state loads");
+    let mut attempt = affinity_test_attempt(
+        "og86dfgj",
+        "input-1",
+        crate::monoize_routing::AffinityFailbackMode::Sticky,
+        30,
+    );
+    attempt.channel_id = "input-1".to_string();
+    attempt.base_url = "https://input.codes".to_string();
+    attempt.origin_key = routing::channel_origin_key(&attempt.base_url);
+    attempt.origin_peer_channel_ids = vec!["input-1".to_string(), "input-2".to_string()];
+    attempt.passive_failure_count_threshold = 1;
+    attempt.affinity_key = Some("v1|api_key:k|model:gpt-affinity|prefix:x".to_string());
+    attempt.routing_config_revision = state
+        .routing_config_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    state.channel_affinity.lock().await.insert(
+        attempt.affinity_key.clone().expect("key"),
+        crate::monoize_routing::ChannelAffinityBinding {
+            provider_id: attempt.provider_id.clone(),
+            channel_id: attempt.channel_id.clone(),
+            bound_at: now_ts(),
+            last_used_at: now_ts(),
+            expires_at: now_ts() + 1800,
+        },
+    );
+
+    let err = AppError::new(
+        StatusCode::BAD_GATEWAY,
+        "upstream_error",
+        "upstream status 502 Bad Gateway: error code: 502",
+    )
+    .with_upstream_error(Some(StatusCode::BAD_GATEWAY), None, None, None);
+    let mut tried = Vec::new();
+    let mut execution_state = AttemptExecutionState::default();
+    routing::record_upstream_attempt_failure(
+        &state,
+        &attempt,
+        1,
+        &err,
+        Some(routing::RetryableFailureClass::Transient),
+        &mut tried,
+        &mut execution_state,
+    )
+    .await;
+
+    assert!(execution_state.should_skip(&attempt));
+    let health = state.channel_health.lock().await;
+    assert!(!health.get("input-1").expect("input-1 health").healthy);
+    assert!(!health.get("input-2").expect("input-2 health").healthy);
+    drop(health);
+    assert!(
+        state
+            .channel_affinity
+            .lock()
+            .await
+            .contains_key(attempt.affinity_key.as_ref().expect("key"))
+    );
+}
+
+#[tokio::test]
+async fn affinity_keeps_unexpired_binding_when_target_is_absent() {
+    let runtime = RuntimeConfig {
+        listen: "127.0.0.1:0".to_string(),
+        metrics_path: "/metrics".to_string(),
+        database_dsn: "sqlite::memory:".to_string(),
+        request_log_spool_dir: None,
+        node: crate::node_config::NodeSettings::primary_default(),
+    };
+    let state = load_state_with_runtime(runtime).await.expect("state loads");
+    let request = build_test_routing_request("gpt-affinity");
+    let auth = affinity_test_auth();
+    let (key, _) = affinity_key_for_request(&request, &auth).expect("affinity key");
+    let now = now_ts();
+    state.channel_affinity.lock().await.insert(
+        key.clone(),
+        crate::monoize_routing::ChannelAffinityBinding {
+            provider_id: "provider-b".to_string(),
+            channel_id: "channel-b1".to_string(),
+            bound_at: now,
+            last_used_at: now,
+            expires_at: now + 1800,
+        },
+    );
+
+    let attempts = apply_channel_affinity(
+        &state,
+        &request,
+        &auth,
+        vec![affinity_test_attempt(
+            "provider-a",
+            "channel-a1",
+            crate::monoize_routing::AffinityFailbackMode::Sticky,
+            30,
+        )],
+    )
+    .await
+    .expect("affinity applies");
+
+    assert_eq!(attempts[0].affinity_hit, Some(false));
+    assert_eq!(
+        attempts[0].affinity_target.as_deref(),
+        Some("provider-b/channel-b1")
+    );
+    assert!(state.channel_affinity.lock().await.contains_key(&key));
 }
 
 #[test]
@@ -2439,6 +2584,8 @@ fn affinity_test_attempt(
         client_session_id: None,
         derived_session_affinity: None,
         session_affinity_value: None,
+        origin_key: None,
+        origin_peer_channel_ids: Vec::new(),
     }
 }
 

@@ -607,13 +607,13 @@ pub async fn create_embeddings(
     let mut execution_state = AttemptExecutionState::default();
 
     for attempt in attempts {
-        if !execution_state.provider_budget_remaining(&attempt) {
+        if execution_state.should_skip(&attempt) {
             continue;
         }
 
         let max_channel_attempts = (attempt.channel_max_retries + 1).max(1) as usize;
         for channel_attempt in 0..max_channel_attempts {
-            if !execution_state.provider_budget_remaining(&attempt) {
+            if execution_state.should_skip(&attempt) {
                 break;
             }
 
@@ -704,12 +704,13 @@ pub async fn create_embeddings(
                                 &err,
                                 passive_failure_class,
                                 &mut tried_providers,
+                                &mut execution_state,
                             )
                             .await;
                             last_failed_attempt = Some(attempt.clone());
                             if same_channel_retryable
                                 && is_attempt_channel_healthy(&state, &attempt).await
-                                && execution_state.provider_budget_remaining(&attempt)
+                                && !execution_state.should_skip(&attempt)
                                 && channel_attempt + 1 < max_channel_attempts
                             {
                                 maybe_sleep_before_channel_retry(&attempt).await;
@@ -758,12 +759,13 @@ pub async fn create_embeddings(
                         &app_err,
                         passive_failure_class,
                         &mut tried_providers,
+                        &mut execution_state,
                     )
                     .await;
                     last_failed_attempt = Some(attempt.clone());
                     if same_channel_retryable
                         && is_attempt_channel_healthy(&state, &attempt).await
-                        && execution_state.provider_budget_remaining(&attempt)
+                        && !execution_state.should_skip(&attempt)
                         && channel_attempt + 1 < max_channel_attempts
                     {
                         maybe_sleep_before_channel_retry(&attempt).await;
@@ -905,6 +907,10 @@ struct MonoizeAttempt {
     /// CM-AFF-4: the effective `x-session-affinity` value sent upstream, for
     /// request-log persistence.
     session_affinity_value: Option<String>,
+    /// RTA-6c: `scheme://host:port` from Channel `base_url`, when parseable.
+    origin_key: Option<String>,
+    /// Enabled positive-weight Channels of this Provider that share `origin_key`.
+    origin_peer_channel_ids: Vec<String>,
 }
 
 fn reasoning_envelope_provider_type(provider_type: ProviderType) -> &'static str {
@@ -934,6 +940,8 @@ struct TriedProvider {
     attempt_number: u32,
     provider_id: String,
     channel_id: String,
+    provider_name: String,
+    channel_name: String,
     error: String,
     upstream_status: Option<u16>,
     upstream_code: Option<String>,
@@ -947,6 +955,8 @@ impl TriedProvider {
             attempt_number,
             provider_id: attempt.provider_id.clone(),
             channel_id: attempt.channel_id.clone(),
+            provider_name: attempt.provider_name.clone(),
+            channel_name: attempt.channel_name.clone(),
             error: app_err.message.clone(),
             upstream_status: Some(app_err.upstream_status.unwrap_or(app_err.status.as_u16())),
             upstream_code: Some(
@@ -961,10 +971,15 @@ impl TriedProvider {
     }
 }
 
+fn shared_origin_skip_token(provider_id: &str, origin_key: &str) -> String {
+    format!("{provider_id}\0{origin_key}")
+}
+
 #[derive(Default)]
 struct AttemptExecutionState {
     provider_attempts_used: HashMap<String, usize>,
     next_attempt_number: u32,
+    shared_origin_skips: HashSet<String>,
 }
 
 impl AttemptExecutionState {
@@ -979,6 +994,26 @@ impl AttemptExecutionState {
                     < limit
             })
             .unwrap_or(true)
+    }
+
+    fn skip_shared_origin(&self, attempt: &MonoizeAttempt) -> bool {
+        let Some(origin_key) = attempt.origin_key.as_ref() else {
+            return false;
+        };
+        self.shared_origin_skips
+            .contains(&shared_origin_skip_token(&attempt.provider_id, origin_key))
+    }
+
+    fn mark_shared_origin_skip(&mut self, attempt: &MonoizeAttempt) {
+        let Some(origin_key) = attempt.origin_key.as_ref() else {
+            return;
+        };
+        self.shared_origin_skips
+            .insert(shared_origin_skip_token(&attempt.provider_id, origin_key));
+    }
+
+    fn should_skip(&self, attempt: &MonoizeAttempt) -> bool {
+        !self.provider_budget_remaining(attempt) || self.skip_shared_origin(attempt)
     }
 
     fn record_upstream_attempt(&mut self, attempt: &MonoizeAttempt) -> u32 {

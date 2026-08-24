@@ -800,6 +800,8 @@
 		"errorCode": "エラーコード",
 		"errorMessage": "エラーメッセージ",
 		"triedProviders": "試行プロバイダー",
+		"retryChain": "リトライ経路",
+		"retryHopServed": "最終成功",
 		"reasoningEffort": "推論強度",
 		"upstreamModel": "上流モデル",
 		"modelProvider": "プロバイダー",

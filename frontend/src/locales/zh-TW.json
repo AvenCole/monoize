@@ -801,6 +801,8 @@
 		"errorCode": "錯誤碼",
 		"errorMessage": "錯誤訊息",
 		"triedProviders": "已嘗試供應商",
+		"retryChain": "重試鏈路",
+		"retryHopServed": "最終成功",
 		"reasoningEffort": "推理強度",
 		"upstreamModel": "上游模型",
 		"modelProvider": "供應商",

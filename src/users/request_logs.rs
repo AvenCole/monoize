@@ -8,6 +8,7 @@ use chrono::{Duration, Utc};
 use sea_orm::Value as SeaValue;
 use sea_orm::{AccessMode, ConnectionTrait, IsolationLevel, TransactionTrait};
 use serde_json::Value;
+use std::collections::HashMap;
 
 const REQUEST_LOG_RETENTION_DAYS: i64 = 90;
 pub(super) const REQUEST_LOG_RETENTION_INTERVAL_SECS: u64 = 3600;
@@ -69,6 +70,53 @@ fn parse_optional_json_text(value: Option<String>, column: &str) -> Result<Optio
                 .map_err(|error| format!("request_logs.{column}: {error}"))
         })
         .transpose()
+}
+
+fn json_nonempty_str(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty())
+}
+
+fn tried_providers_need_name_enrichment(tried: Option<&Value>) -> bool {
+    let Some(Value::Array(items)) = tried else {
+        return false;
+    };
+    items.iter().any(|item| {
+        let Some(obj) = item.as_object() else {
+            return false;
+        };
+        !json_nonempty_str(obj.get("provider_name")) || !json_nonempty_str(obj.get("channel_name"))
+    })
+}
+
+pub(super) fn enrich_tried_providers_names(
+    tried: &mut Option<Value>,
+    provider_names: &HashMap<String, String>,
+    channel_names: &HashMap<String, String>,
+) {
+    let Some(Value::Array(items)) = tried.as_mut() else {
+        return;
+    };
+    for item in items {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        if !json_nonempty_str(obj.get("provider_name")) {
+            if let Some(id) = obj.get("provider_id").and_then(Value::as_str) {
+                if let Some(name) = provider_names.get(id) {
+                    obj.insert("provider_name".into(), Value::String(name.clone()));
+                }
+            }
+        }
+        if !json_nonempty_str(obj.get("channel_name")) {
+            if let Some(id) = obj.get("channel_id").and_then(Value::as_str) {
+                if let Some(name) = channel_names.get(id) {
+                    obj.insert("channel_name".into(), Value::String(name.clone()));
+                }
+            }
+        }
+    }
 }
 
 fn escape_like_literal(value: &str) -> String {
@@ -248,16 +296,71 @@ mod tests {
     use super::{
         analytics_bucket_expr, analytics_model_bucket_sql, append_request_log_filters,
         ascii_folded_like_pattern, charge_aggregate_select, decode_charge_aggregate,
-        escape_like_literal, request_log_model_filter_max_terms_from_raw,
+        enrich_tried_providers_names, escape_like_literal,
+        request_log_model_filter_max_terms_from_raw, tried_providers_need_name_enrichment,
         validate_request_log_model_filter_with_limit,
     };
     use crate::db::DbPool;
     use sea_orm::{ConnectionTrait, TransactionTrait, Value as SeaValue};
+    use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn like_literals_escape_wildcards_and_escape_character() {
         assert_eq!(escape_like_literal(r"A%_\\B"), r"A\%\_\\\\B");
         assert_eq!(ascii_folded_like_pattern("CAFÉ"), "%cafÉ%");
+    }
+
+    #[test]
+    fn tried_providers_name_enrichment_fills_missing_names_and_preserves_present_names() {
+        let mut tried = Some(json!([
+            {
+                "attempt_number": 1,
+                "provider_id": "prov-1",
+                "channel_id": "ch-1",
+                "error": "upstream status 429"
+            },
+            {
+                "attempt_number": 2,
+                "provider_id": "prov-2",
+                "channel_id": "ch-2",
+                "provider_name": "Kept Provider",
+                "channel_name": "Kept Channel",
+                "error": "upstream status 502"
+            }
+        ]));
+        assert!(tried_providers_need_name_enrichment(tried.as_ref()));
+        let provider_names = HashMap::from([
+            ("prov-1".to_string(), "Ciii".to_string()),
+            ("prov-2".to_string(), "Should Not Replace".to_string()),
+        ]);
+        let channel_names = HashMap::from([
+            ("ch-1".to_string(), "ciii_1".to_string()),
+            ("ch-2".to_string(), "Should Not Replace".to_string()),
+        ]);
+        enrich_tried_providers_names(&mut tried, &provider_names, &channel_names);
+        assert_eq!(
+            tried,
+            Some(json!([
+                {
+                    "attempt_number": 1,
+                    "provider_id": "prov-1",
+                    "channel_id": "ch-1",
+                    "provider_name": "Ciii",
+                    "channel_name": "ciii_1",
+                    "error": "upstream status 429"
+                },
+                {
+                    "attempt_number": 2,
+                    "provider_id": "prov-2",
+                    "channel_id": "ch-2",
+                    "provider_name": "Kept Provider",
+                    "channel_name": "Kept Channel",
+                    "error": "upstream status 502"
+                }
+            ]))
+        );
+        assert!(!tried_providers_need_name_enrichment(tried.as_ref()));
     }
 
     #[test]
@@ -1210,6 +1313,63 @@ impl UserStore {
         Ok(())
     }
 
+    async fn load_routing_name_maps(
+        &self,
+    ) -> Result<(HashMap<String, String>, HashMap<String, String>), String> {
+        let provider_rows = self
+            .db
+            .read()
+            .query_all(
+                self.db
+                    .stmt("SELECT id, name FROM monoize_providers", vec![]),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut provider_names = HashMap::new();
+        for row in provider_rows {
+            let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+            let name: String = row.try_get("", "name").map_err(|e| e.to_string())?;
+            if !name.trim().is_empty() {
+                provider_names.insert(id, name);
+            }
+        }
+        let channel_rows = self
+            .db
+            .read()
+            .query_all(
+                self.db
+                    .stmt("SELECT id, name FROM monoize_channels", vec![]),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut channel_names = HashMap::new();
+        for row in channel_rows {
+            let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
+            let name: String = row.try_get("", "name").map_err(|e| e.to_string())?;
+            if !name.trim().is_empty() {
+                channel_names.insert(id, name);
+            }
+        }
+        Ok((provider_names, channel_names))
+    }
+
+    async fn enrich_request_log_tried_provider_names(
+        &self,
+        logs: &mut [RequestLogRow],
+    ) -> Result<(), String> {
+        let needs_enrichment = logs
+            .iter()
+            .any(|log| tried_providers_need_name_enrichment(log.tried_providers.as_ref()));
+        if !needs_enrichment {
+            return Ok(());
+        }
+        let (provider_names, channel_names) = self.load_routing_name_maps().await?;
+        for log in logs {
+            enrich_tried_providers_names(&mut log.tried_providers, &provider_names, &channel_names);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn list_request_logs_by_user(
         &self,
@@ -1353,10 +1513,12 @@ impl UserStore {
             .map_err(|e| e.to_string())?;
 
         txn.commit().await.map_err(|e| e.to_string())?;
-        let logs = rows
+        let mut logs = rows
             .into_iter()
             .map(|row| row_to_request_log(&row))
             .collect::<Result<Vec<_>, _>>()?;
+        self.enrich_request_log_tried_provider_names(&mut logs)
+            .await?;
 
         Ok((logs, total, total_charge_nano_usd))
     }
@@ -1506,10 +1668,12 @@ impl UserStore {
             .map_err(|e| e.to_string())?;
 
         txn.commit().await.map_err(|e| e.to_string())?;
-        let logs = rows
+        let mut logs = rows
             .into_iter()
             .map(|row| row_to_request_log(&row))
             .collect::<Result<Vec<_>, _>>()?;
+        self.enrich_request_log_tried_provider_names(&mut logs)
+            .await?;
 
         Ok((logs, total, total_charge_nano_usd))
     }

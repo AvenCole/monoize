@@ -248,13 +248,13 @@ pub(super) async fn execute_nonstream_typed_with_validator(
     let mut tried_providers: Vec<TriedProvider> = Vec::new();
     let mut execution_state = AttemptExecutionState::default();
     for mut attempt in attempts {
-        if !execution_state.provider_budget_remaining(&attempt) {
+        if execution_state.should_skip(&attempt) {
             continue;
         }
 
         let max_channel_attempts = (attempt.channel_max_retries + 1).max(1) as usize;
         'channel_attempts: for channel_attempt in 0..max_channel_attempts {
-            if !execution_state.provider_budget_remaining(&attempt) {
+            if execution_state.should_skip(&attempt) {
                 break;
             }
 
@@ -471,12 +471,13 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                                 &err,
                                 passive_failure_class,
                                 &mut tried_providers,
+                                &mut execution_state,
                             )
                             .await;
                             last_failed_attempt = Some(attempt.clone());
                             if same_channel_retryable
                                 && is_attempt_channel_healthy(state, &attempt).await
-                                && execution_state.provider_budget_remaining(&attempt)
+                                && !execution_state.should_skip(&attempt)
                                 && channel_attempt + 1 < max_channel_attempts
                             {
                                 maybe_sleep_before_channel_retry(&attempt).await;
@@ -619,12 +620,13 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                                         &err,
                                         passive_failure_class,
                                         &mut tried_providers,
+                                        &mut execution_state,
                                     )
                                     .await;
                                     last_failed_attempt = Some(attempt.clone());
                                     if same_channel_retryable
                                         && is_attempt_channel_healthy(state, &attempt).await
-                                        && execution_state.provider_budget_remaining(&attempt)
+                                        && !execution_state.should_skip(&attempt)
                                         && channel_attempt + 1 < max_channel_attempts
                                     {
                                         maybe_sleep_before_channel_retry(&attempt).await;
@@ -674,12 +676,13 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                             &err,
                             passive_failure_class,
                             &mut tried_providers,
+                            &mut execution_state,
                         )
                         .await;
                         last_failed_attempt = Some(attempt.clone());
                         if same_channel_retryable
                             && is_attempt_channel_healthy(state, &attempt).await
-                            && execution_state.provider_budget_remaining(&attempt)
+                            && !execution_state.should_skip(&attempt)
                             && channel_attempt + 1 < max_channel_attempts
                         {
                             maybe_sleep_before_channel_retry(&attempt).await;
@@ -903,12 +906,13 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                         &app_err,
                         passive_failure_class,
                         &mut tried_providers,
+                        &mut execution_state,
                     )
                     .await;
                     last_failed_attempt = Some(attempt.clone());
                     if same_channel_retryable
                         && is_attempt_channel_healthy(state, &attempt).await
-                        && execution_state.provider_budget_remaining(&attempt)
+                        && !execution_state.should_skip(&attempt)
                         && channel_attempt + 1 < max_channel_attempts
                     {
                         maybe_sleep_before_channel_retry(&attempt).await;

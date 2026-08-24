@@ -58,7 +58,7 @@ function RequestLogsTableHeader({ isAdmin, t }: Pick<RequestLogsTableProps, 'isA
 				</th>
 			)}
 			{isAdmin && (
-				<th className='w-[5.5rem] text-left font-medium text-muted-foreground px-2 py-1.5 whitespace-nowrap'>
+				<th className='min-w-[8rem] text-left font-medium text-muted-foreground px-2 py-1.5 whitespace-nowrap'>
 					{t('requestLogs.channel')}
 				</th>
 			)}

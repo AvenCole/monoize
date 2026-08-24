@@ -509,6 +509,19 @@ export interface RequestLogAffinity {
   target?: string;
 }
 
+export interface RequestLogTriedProvider {
+  attempt_number?: number;
+  provider_id: string;
+  channel_id: string;
+  provider_name?: string | null;
+  channel_name?: string | null;
+  error: string;
+  upstream_status?: number | null;
+  upstream_code?: string | null;
+  upstream_type?: string | null;
+  upstream_param?: string | null;
+}
+
 export interface RequestLog {
   id: string;
   request_id?: string;
@@ -521,7 +534,7 @@ export interface RequestLog {
   request_kind?: string;
   reasoning_effort?: string;
   request_ip?: string;
-  tried_providers?: Array<{ provider_id: string; channel_id: string; error: string }>;
+  tried_providers?: RequestLogTriedProvider[];
   session_affinity_value?: string | null;
   provider: RequestLogProvider;
   channel: RequestLogChannel;

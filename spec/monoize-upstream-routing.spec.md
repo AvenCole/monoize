@@ -184,6 +184,7 @@ RTA-4. Execute provider with intra-provider retry:
 - per-channel attempt limit: `channel_max_retries + 1` (default `0 + 1 = 1`, i.e. one attempt per channel with no intra-channel retry)
 - execution is nested: for each channel in weighted order, try up to per-channel limit, then move to next channel, all bounded by total attempt budget
 - if the channel becomes unhealthy (breaker trips) during intra-channel retries, remaining retries on that channel MUST be aborted and execution MUST move to the next channel
+- after a shared-origin blast defined by RTA-6c, remaining not-yet-attempted Channels of that Provider whose origin key equals the failed Channel's origin key MUST be skipped for this request without consuming the Provider attempt budget
 - between intra-channel retry attempts on the same channel, the router MUST sleep for `channel_retry_interval_ms` milliseconds. If `channel_retry_interval_ms == 0` (default), no sleep is inserted.
 
 RTA-5. Error policy per attempt:
@@ -198,6 +199,15 @@ RTA-6. On an HTTP `408`, HTTP `429`, HTTP `5xx`, timeout, or connection failure,
 RTA-6b. Other upstream failures MUST NOT update Channel passive health state.
 
 RTA-6a. If `provider.circuit_breaker_enabled == false`, retryable attempt failures MUST NOT trip passive health state and MUST NOT mark the channel unhealthy.
+
+RTA-6c. Shared-origin blast. When a retryable failure's upstream HTTP status is `502`, `503`, or `524`, Monoize MUST treat the failure as a shared-origin blast for that attempt's Provider:
+
+1. The origin key is `lowercase(scheme) + "://" + lowercase(host) + ":" + port`, where `scheme`, `host`, and `port` come from parsing the Channel `base_url`. `port` is the URL's explicit port when present, otherwise the default port for that scheme (`80` for `http`, `443` for `https`). Only `http` and `https` origins are valid. If `base_url` cannot be parsed into such an origin, that Channel has no origin key and MUST NOT share health with any other Channel.
+2. Every other Channel of the same Provider that is enabled, has `weight > 0`, and has an equal origin key MUST receive the same Transient passive-failure sample as the failed Channel, using the failed attempt's resolved passive parameters and the same timestamp. Peer updates MUST use the same health keying as the failed attempt (HSK-1 / HSK-2). A peer insert that would exceed HSK-6 MUST be skipped.
+3. Remaining same-Channel retries and remaining not-yet-attempted same-origin Channels of that Provider MUST be skipped for the rest of this request.
+4. HTTP `408` and HTTP `429` MUST NOT trigger a shared-origin blast. They remain per-Channel.
+
+RTA-6d. A shared-origin blast MUST classify cooldown as Transient (`passive_cooldown_seconds`), not as the rate-limit cooldown.
 
 RTA-7. If all attempts in Provider fail before the first downstream byte, router MUST continue with the next Provider. The status code of an upstream failure MUST NOT stop cross-Provider fail-forward.
 
@@ -265,9 +275,11 @@ AFF-7c. If AFF-7b uses normal waterfall order, request logging MUST set `affinit
 
 AFF-7d. A successful request that used the bound target through AFF-7 or AFF-7a MUST update `last_used_at` and MUST preserve `bound_at`.
 
-AFF-8. If the bound Provider+Channel is stale, affinity-disabled, disabled, zero weight, unhealthy, group-ineligible, multiplier-ineligible, or does not support the logical model, the binding MUST be cleared and normal waterfall routing MUST begin from the first provider.
+AFF-8. If the bound Provider+Channel is stale, affinity-disabled, disabled, zero weight, group-ineligible, multiplier-ineligible, or does not support the logical model, the binding MUST be cleared and normal waterfall routing MUST begin from the first provider.
 
-AFF-9. HTTP `408`, HTTP `429`, HTTP `5xx`, timeout, and connection failures MUST clear affinity. Other upstream errors MUST NOT clear affinity by themselves. A later successful fallback attempt MAY replace the binding.
+AFF-8a. If the bound Provider+Channel is merely unhealthy or otherwise absent from this request's eligible attempt list, the binding MUST remain stored. Routing MUST NOT jump to that target for this request. Waterfall MUST continue from the first eligible attempt. When the bound target is eligible again, AFF-7 MUST apply to the retained binding.
+
+AFF-9. HTTP `408`, HTTP `429`, HTTP `5xx` other than a shared-origin blast, timeout, and connection failures MUST clear affinity. A shared-origin blast as defined by RTA-6c MUST NOT clear affinity. Other upstream errors MUST NOT clear affinity by themselves. A later successful fallback attempt MAY replace the binding.
 
 AFF-10. A successful non-stream request MUST write or refresh affinity after success only when the successful Channel's effective `affinity_enabled` is true.
 

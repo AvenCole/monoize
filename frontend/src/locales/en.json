@@ -804,6 +804,8 @@
 		"errorCode": "Error Code",
 		"errorMessage": "Error Message",
 		"triedProviders": "Tried Providers",
+		"retryChain": "Retry chain",
+		"retryHopServed": "Served",
 		"reasoningEffort": "Reasoning Effort",
 		"upstreamModel": "Upstream Model",
 		"modelProvider": "Provider",

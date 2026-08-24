@@ -804,6 +804,8 @@
 		"errorCode": "错误码",
 		"errorMessage": "错误信息",
 		"triedProviders": "已尝试供应商",
+		"retryChain": "重试链路",
+		"retryHopServed": "最终成功",
 		"reasoningEffort": "推理强度",
 		"upstreamModel": "上游模型",
 		"modelProvider": "供应商",

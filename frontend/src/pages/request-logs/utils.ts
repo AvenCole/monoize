@@ -1,4 +1,4 @@
-import type { RequestLog } from '@/lib/api'
+import type { RequestLog, RequestLogTriedProvider } from '@/lib/api'
 import { formatNanoUsd, isSignedIntegerString } from '@/lib/exact-decimal'
 
 type TimingValue = number | string | null | undefined
@@ -216,4 +216,109 @@ export function formatTime(dateString: string): string {
 	const mi = String(date.getMinutes()).padStart(2, '0')
 	const s = String(date.getSeconds()).padStart(2, '0')
 	return `${y}-${mo}-${d} ${h}:${mi}:${s}`
+}
+
+const RETRY_CHAIN_SEPARATOR = ' → '
+
+function nonempty(value: string | null | undefined): string | null {
+	const trimmed = value?.trim()
+	return trimmed ? trimmed : null
+}
+
+export type RetryHopIdentity = {
+	provider_id?: string | null
+	channel_id?: string | null
+	provider_name?: string | null
+	channel_name?: string | null
+}
+
+export function hopDisplayLabel(hop: RetryHopIdentity): string {
+	return (
+		nonempty(hop.channel_name) ||
+		nonempty(hop.provider_name) ||
+		nonempty(hop.channel_id) ||
+		nonempty(hop.provider_id) ||
+		''
+	)
+}
+
+function hopIdentityKey(providerId: string | null | undefined, channelId: string | null | undefined): string {
+	return `${providerId ?? ''}\0${channelId ?? ''}`
+}
+
+export function compactRetryChainLabels(log: RequestLog): string[] | null {
+	const hops: string[] = []
+	const seen = new Set<string>()
+	const push = (key: string, label: string) => {
+		if (!label || seen.has(key)) return
+		seen.add(key)
+		hops.push(label)
+	}
+	for (const tried of log.tried_providers ?? []) {
+		push(hopIdentityKey(tried.provider_id, tried.channel_id), hopDisplayLabel(tried))
+	}
+	if (log.provider.id || log.channel.id) {
+		push(
+			hopIdentityKey(log.provider.id, log.channel.id),
+			hopDisplayLabel({
+				provider_id: log.provider.id,
+				channel_id: log.channel.id,
+				provider_name: log.provider.name,
+				channel_name: log.channel.name
+			})
+		)
+	}
+	return hops.length >= 2 ? hops : null
+}
+
+export function formatRetryChain(labels: string[]): string {
+	return labels.join(RETRY_CHAIN_SEPARATOR)
+}
+
+export type RetryAttemptRow = {
+	label: string
+	error: string | null
+	upstreamStatus: number | null
+	outcome: 'failed' | 'served'
+}
+
+export function retryAttemptRows(log: RequestLog): RetryAttemptRow[] {
+	const tried = log.tried_providers ?? []
+	const rows: RetryAttemptRow[] = tried.map((entry: RequestLogTriedProvider) => ({
+		label:
+			hopDisplayLabel(entry) || `${entry.provider_id}/${entry.channel_id}`,
+		error: entry.error || null,
+		upstreamStatus: entry.upstream_status ?? null,
+		outcome: 'failed'
+	}))
+	const terminalLabel = hopDisplayLabel({
+		provider_id: log.provider.id,
+		channel_id: log.channel.id,
+		provider_name: log.provider.name,
+		channel_name: log.channel.name
+	})
+	if (!terminalLabel || (!log.provider.id && !log.channel.id)) {
+		return rows
+	}
+	const terminalKey = hopIdentityKey(log.provider.id, log.channel.id)
+	const lastTried = tried.at(-1)
+	const lastTriedKey = lastTried
+		? hopIdentityKey(lastTried.provider_id, lastTried.channel_id)
+		: null
+	if (log.status === 'error' && lastTriedKey === terminalKey) {
+		return rows
+	}
+	if (
+		log.status === 'success' ||
+		log.status === 'client_gone' ||
+		lastTriedKey !== terminalKey
+	) {
+		rows.push({
+			label: terminalLabel,
+			error: log.status === 'error' ? log.error.message ?? null : null,
+			upstreamStatus: log.status === 'error' ? log.error.http_status ?? null : null,
+			outcome: log.status === 'error' ? 'failed' : 'served'
+		})
+	}
+	return rows
 }

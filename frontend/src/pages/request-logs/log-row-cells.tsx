@@ -17,15 +17,19 @@ import {
 import {
 	asObject,
 	billingValueTranslationKey,
+	compactRetryChainLabels,
 	computeTps,
 	formatCost,
 	formatDuration,
+	formatRetryChain,
 	formatTime,
 	getDurationMs,
 	getTtfbMs,
 	readNanoString,
 	readNumber,
-	readTokenCount
+	readTokenCount,
+	retryAttemptRows,
+	type RetryAttemptRow
 } from './utils'
 
 interface LogRowCellsProps {
@@ -96,6 +100,11 @@ export function LogRowCells({
 	const computedTps = computeTps(log)
 	const channelDisplay = log.channel.name?.trim() || log.channel.id || null
 	const providerDisplay = log.provider.name?.trim() || log.provider.id || null
+	const retryChainLabels = compactRetryChainLabels(log)
+	const retryChainText = retryChainLabels ? formatRetryChain(retryChainLabels) : null
+	const channelPrimaryText = retryChainText || providerDisplay
+	const hasTriedProviders = (log.tried_providers?.length ?? 0) > 0
+	const attemptRows = hasTriedProviders ? retryAttemptRows(log) : []
 	const costDisplay = formatCost(log.billing.charge_nano_usd)
 	const usageSnapshot = asObject(log.usage)
 	const usageInput = asObject(usageSnapshot?.input)
@@ -485,19 +494,9 @@ export function LogRowCells({
 											)}
 										</>
 									)}
-									{log.tried_providers && log.tried_providers.length > 0 && (
+									{attemptRows.length > 0 && (
 										<div className='border-t border-border/50 pt-1 mt-1'>
-											<div className='font-medium mb-0.5'>
-												{t('requestLogs.triedProviders')}:
-											</div>
-											{log.tried_providers.map((tp, i) => (
-												<div
-													key={i}
-													className='text-muted-foreground break-words'
-												>
-													{tp.provider_id}/{tp.channel_id}: {tp.error}
-												</div>
-											))}
+											<RetryAttemptList rows={attemptRows} t={t} />
 										</div>
 									)}
 								</div>
@@ -593,16 +592,19 @@ export function LogRowCells({
 
 			{isAdmin && (
 				<td className='px-2 py-1 whitespace-nowrap align-middle text-[11px] leading-4 text-muted-foreground'>
-					{providerDisplay ? (
+					{channelPrimaryText ? (
 						<TooltipProvider delayDuration={200}>
 							<Tooltip onOpenChange={channelTooltipOpenChange}>
 								<TooltipTrigger asChild>
-									<span className='inline-flex h-4 items-center cursor-default max-w-[80px] truncate'>
-										{providerDisplay}
+									<span className='inline-flex h-4 items-center cursor-default max-w-[16rem] truncate'>
+										{channelPrimaryText}
 									</span>
 								</TooltipTrigger>
 								<TooltipContent>
-									<div className='text-xs space-y-0.5'>
+									<div className='text-xs space-y-1 max-w-[480px]'>
+										{attemptRows.length > 0 && (
+											<RetryAttemptList rows={attemptRows} t={t} />
+										)}
 										{channelDisplay && (
 											<div>
 												{t('requestLogs.channel')}: {channelDisplay}
@@ -909,5 +911,37 @@ export function LogRowCells({
 				</span>
 			</td>
 		</>
+	)
+}
+
+function RetryAttemptList({
+	rows,
+	t
+}: {
+	rows: RetryAttemptRow[]
+	t: (key: string) => string
+}) {
+	return (
+		<div className='space-y-1'>
+			<div className='font-medium'>{t('requestLogs.retryChain')}</div>
+			{rows.map((row, index) => (
+				<div key={`${row.label}-${index}`} className='break-words'>
+					<span className='font-mono'>{row.label}</span>
+					{row.outcome === 'served' ?
+						<span className='text-success'> {t('requestLogs.retryHopServed')}</span>
+					:	<>
+							{row.upstreamStatus != null && (
+								<span className='text-muted-foreground'> {row.upstreamStatus}</span>
+							)}
+							{row.error && (
+								<div className='text-muted-foreground whitespace-pre-wrap'>
+									{row.error}
+								</div>
+							)}
+						</>
+					}
+				</div>
+			))}
+		</div>
 	)
 }

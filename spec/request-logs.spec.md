@@ -45,7 +45,18 @@ A request log row has:
 - `tps_mode: string?` (`"exact"`, `"estimated"`, or `"approx"`; null for rows without new TPS basis)
 - `request_ip: string?` (the server-generated canonical client IP for the request)
 - `reasoning_effort: string?` (the selected reasoning-effort label when present)
-- `tried_providers_json: object[]?` (array of `{ provider_id, channel_id, error }` objects recording providers/channels that were attempted and failed before the final result; persisted as JSON text in DB; null when no fallback occurred)
+- `tried_providers_json: object[]?` (array of failed upstream attempts in chronological order; persisted as JSON text in DB; null when no upstream attempt failed). Each object has:
+  - `attempt_number: integer` (>= 1)
+  - `provider_id: string`
+  - `channel_id: string`
+  - `provider_name: string` (Provider display name at attempt time)
+  - `channel_name: string` (Channel display name at attempt time)
+  - `error: string`
+  - `upstream_status: integer?`
+  - `upstream_code: string?`
+  - `upstream_type: string?`
+  - `upstream_param: string?`
+  Historical rows MAY omit `provider_name`, `channel_name`, `attempt_number`, and the `upstream_*` fields.
 - `request_kind: string?` (classification of log source; null for normal client requests. `"active_probe_connectivity"` for active health-probe connectivity tests)
 - `effective_provider_type: string?` (effective upstream type used for the selected attempt; null when no attempt was selected)
 - `affinity_hit: boolean?` (true when request routing used an eligible affinity binding; false when affinity was evaluated but no binding was used; null when affinity did not run)
@@ -63,6 +74,9 @@ When returning request log rows via the dashboard API, the following fields are 
 - `api_key_name: string?` (from `api_keys.name` via `api_key_id`)
 - `channel_name: string?` (from `monoize_channels.name` via `channel_id`)
 - `provider_name: string?` (from `monoize_providers.name` via `provider_id`)
+- For each `tried_providers` hop whose `provider_name` is missing or empty, dashboard list responses MUST set `provider_name` from the current `monoize_providers.name` for that `provider_id` when the row exists.
+- For each `tried_providers` hop whose `channel_name` is missing or empty, dashboard list responses MUST set `channel_name` from the current `monoize_channels.name` for that `channel_id` when the row exists.
+- A deleted Provider or Channel MUST leave that hop name absent.
 
 ## 2. Recording rules
 
@@ -223,7 +237,9 @@ RL16b. Each token line item MUST include `usage_class`, `unit`, `unit_price_nano
 
 RL16c. Each meter line item MUST include `usage_class`, `unit`, `unit_price_nano`, `quantity`, `charge_nano`, and whether the quantity was authoritative when that can be represented.
 
-RL17. When a request triggers waterfall fail-forward, `tried_providers_json` MUST record each failed upstream attempt. This rule applies to every upstream error class. Each entry MUST contain `{ provider_id, channel_id, error }`. The array MUST be ordered chronologically. When no upstream attempt failed, the field MUST be null.
+RL17. When a request triggers waterfall fail-forward, `tried_providers_json` MUST record each failed upstream attempt. This rule applies to every upstream error class. Each persisted entry MUST contain `attempt_number`, `provider_id`, `channel_id`, `provider_name`, `channel_name`, and `error`. It MUST also persist `upstream_status`, `upstream_code`, `upstream_type`, and `upstream_param` when those values exist on the failed attempt. `provider_name` and `channel_name` MUST equal the Provider and Channel display names at attempt time. The array MUST be ordered chronologically. When no upstream attempt failed, the field MUST be null.
+
+RL17a. `GET /api/dashboard/request-logs` MUST return `tried_providers` as that JSON array, or null. For each hop, if `provider_name` is missing or empty, the handler MUST set it from the current `monoize_providers` row for `provider_id` when that row exists. If `channel_name` is missing or empty, the handler MUST set it from the current `monoize_channels` row for `channel_id` when that row exists. In-memory SSE snapshots already contain write-time names and MUST NOT require this fill.
 
 RL18. Successful active probe connectivity tests that can incur upstream token cost MUST be persisted as request logs with `request_kind = "active_probe_connectivity"`. Failed active probe connectivity tests MUST NOT be persisted as request logs.
 
@@ -426,10 +442,26 @@ FL8. Column order (left to right): `created_at`, `request_id` (with adjacent sta
 
 FL9. For the admin channel column display value:
 
-- If `provider_name` is non-empty, UI MUST render `provider_name` as the primary text.
+- If compact retry-chain hops defined by FL9a contain two or more hops, the cell MUST render those hop labels joined by the three-character separator ` → ` (space, U+2192, space) as the primary text.
+- Else if `provider_name` is non-empty, UI MUST render `provider_name` as the primary text.
 - Else if `provider_id` is non-empty, UI MUST render `provider_id`.
 - Else UI MUST render `-`.
-- On hover, the tooltip MUST show `channel_name` (or `channel_id` as fallback) when available, and upstream model when it differs from the requested model.
+- The cell MUST truncate overflowing primary text.
+- On hover, focus, or activate, the tooltip MUST show the content defined by FL9b. Activation MUST work on touch devices; activating outside the tooltip or pressing Escape MUST close it.
+
+FL9a. Compact retry-chain hops:
+
+1. Walk `tried_providers` in stored order. For each entry, hop identity is `(provider_id, channel_id)`. Skip the entry if that identity is already in the hop list.
+2. If the row has a terminal Provider or Channel id, form terminal identity `(provider.id ?? "", channel.id ?? "")`. If that identity is not already in the hop list, append one hop for the terminal Provider/Channel.
+3. A hop label MUST be the first non-empty value among hop `channel_name`, hop `provider_name`, hop `channel_id`, hop `provider_id`. For the terminal hop those fields are `channel.name`, `provider.name`, `channel.id`, `provider.id`.
+4. Empty-label hops MUST be omitted.
+5. A hop list of length less than 2 is not a retry chain; FL9 MUST then use the non-chain primary text.
+
+FL9b. Channel tooltip:
+
+- If `tried_providers` is non-empty, the tooltip MUST first render a localized retry-chain heading, then one row per stored `tried_providers` entry in chronological order. Each row MUST show the hop label from FL9a.3, `upstream_status` when present, and `error`.
+- After those failed-attempt rows, if a terminal hop identity exists and either (a) it differs from the last `tried_providers` identity, or (b) row `status` is `success` or `client_gone` and the last `tried_providers` identity equals the terminal identity, the tooltip MUST append one terminal row with the terminal hop label and a localized served marker. When `status` is `error` and the last `tried_providers` identity already equals the terminal identity, the tooltip MUST NOT append a duplicate terminal row.
+- The tooltip MUST then show `channel_name` (or `channel_id` as fallback) when available, `session_affinity_value` when present, and upstream model when it differs from the requested model.
 
 FL10. The request logs table body MUST use virtualized rendering via `react-virtuoso` (`TableVirtuoso`) instead of rendering all loaded rows as plain DOM rows.
 
@@ -465,7 +497,7 @@ FL21. The `api_key_name` (Token) column MUST use a narrow width and truncated te
 
 FL22. The merged `duration/ttfb/stream` column MUST remain narrowly sized with minimal horizontal cell padding and a compact inline badge row, and MUST NOT reserve excess blank width when values are short.
 
-FL23. The admin `channel` column MUST use a narrow width with aggressive truncation for long channel names, to minimize horizontal space usage.
+FL23. The admin `channel` column MUST use a compact width with truncation for long values. When FL9 renders a retry chain, the column MAY use a minimum width of 8 rem; overflow MUST still truncate.
 
 FL24. On desktop dashboard layouts, the logs table SHOULD fit within the page content width without horizontal scrolling; the `request_ip` column MUST use narrow width with truncated text display.
 
@@ -497,7 +529,7 @@ FL27d. When a row carries cached-input data (`usage_breakdown_json.input.cached_
 
 FL28. For rows with `status = "error"` or `status = "client_gone"`, hovering the request-id/status indicator MUST show error details from `error_code`, `error_message`, and `error_http_status` when present.
 
-FL29. When `tried_providers_json` is non-empty, the request-id tooltip MUST additionally display the list of tried providers/channels with their error messages, separated from the main error details by a visual divider.
+FL29. When `tried_providers` is non-empty, the request-id tooltip MUST additionally display the localized retry-chain heading and the same chronological attempt rows as FL9b (hop label, optional `upstream_status`, `error`), separated from the main error details by a visual divider. The hop label MUST follow FL9a.3. The tooltip MUST NOT use raw `provider_id/channel_id` as the label when a name exists.
 
 FL30. For rows where `request_kind = "active_probe_connectivity"` and `api_key_name` is null, the Token column MUST display a localized i18n label meaning "Connectivity Test".
 

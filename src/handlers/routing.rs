@@ -32,6 +32,33 @@ pub(crate) fn health_key(channel_id: &str, model: Option<&str>) -> String {
     }
 }
 
+pub(super) fn channel_origin_key(base_url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(base_url.trim()).ok()?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed.port_or_known_default()?;
+    Some(format!("{scheme}://{host}:{port}"))
+}
+
+pub(super) fn is_shared_origin_status(status: Option<u16>) -> bool {
+    matches!(status, Some(502 | 503 | 524))
+}
+
+fn origin_peer_channel_ids(
+    channels: &[crate::monoize_routing::MonoizeChannel],
+    origin_key: &str,
+) -> Vec<String> {
+    channels
+        .iter()
+        .filter(|channel| channel.enabled && channel.weight > 0)
+        .filter(|channel| channel_origin_key(&channel.base_url).as_deref() == Some(origin_key))
+        .map(|channel| channel.id.clone())
+        .collect()
+}
+
 pub(super) fn upstream_path(provider_type: ProviderType) -> &'static str {
     match provider_type {
         ProviderType::Responses => "/v1/responses",
@@ -384,7 +411,7 @@ pub(super) async fn apply_channel_affinity(
                 bound_target = Some(target);
             }
         } else {
-            state.channel_affinity.lock().await.remove(&key);
+            bound_target = Some(target);
         }
     }
 
@@ -583,6 +610,11 @@ pub(super) async fn collect_provider_attempts(
         .min(ordered.len());
     let runtime = state.monoize_runtime.read().await;
     for channel in ordered.into_iter().take(max_attempts) {
+        let origin_key = channel_origin_key(&channel.base_url);
+        let origin_peer_channel_ids = origin_key
+            .as_deref()
+            .map(|origin| origin_peer_channel_ids(&provider.channels, origin))
+            .unwrap_or_default();
         let model_entry = channel
             .models
             .get(&urp.model)
@@ -677,6 +709,8 @@ pub(super) async fn collect_provider_attempts(
             client_session_id: None,
             derived_session_affinity: None,
             session_affinity_value: None,
+            origin_key,
+            origin_peer_channel_ids,
         });
     }
 }
@@ -1200,6 +1234,7 @@ pub(super) async fn record_upstream_attempt_failure(
     app_err: &AppError,
     passive_failure_class: Option<RetryableFailureClass>,
     tried_providers: &mut Vec<TriedProvider>,
+    execution_state: &mut AttemptExecutionState,
 ) {
     tried_providers.push(TriedProvider::from_app_error(
         attempt_number,
@@ -1209,8 +1244,16 @@ pub(super) async fn record_upstream_attempt_failure(
     let Some(failure_class) = passive_failure_class else {
         return;
     };
-    clear_channel_affinity(state, attempt).await;
+    let shared_origin_blast = failure_class == RetryableFailureClass::Transient
+        && is_shared_origin_status(app_err.upstream_status);
+    if !shared_origin_blast {
+        clear_channel_affinity(state, attempt).await;
+    }
     mark_channel_retryable_failure(state, attempt, failure_class).await;
+    if shared_origin_blast {
+        execution_state.mark_shared_origin_skip(attempt);
+        mark_shared_origin_peer_failures(state, attempt, failure_class).await;
+    }
 }
 
 pub(super) fn prune_passive_failure_timestamps(
@@ -1268,6 +1311,40 @@ pub(super) async fn mark_channel_retryable_failure(
     attempt: &MonoizeAttempt,
     failure_class: RetryableFailureClass,
 ) {
+    apply_retryable_failure_to_channel(state, attempt, &attempt.channel_id, failure_class, true)
+        .await;
+}
+
+async fn mark_shared_origin_peer_failures(
+    state: &AppState,
+    attempt: &MonoizeAttempt,
+    failure_class: RetryableFailureClass,
+) {
+    let mut peer_count = 0usize;
+    for peer_id in &attempt.origin_peer_channel_ids {
+        if peer_id == &attempt.channel_id {
+            continue;
+        }
+        apply_retryable_failure_to_channel(state, attempt, peer_id, failure_class, false).await;
+        peer_count += 1;
+    }
+    if peer_count > 0 {
+        tracing::info!(
+            channel_id = %attempt.channel_id,
+            origin_key = attempt.origin_key.as_deref().unwrap_or(""),
+            peer_count,
+            "shared-origin blast applied to same-base-url channels"
+        );
+    }
+}
+
+async fn apply_retryable_failure_to_channel(
+    state: &AppState,
+    attempt: &MonoizeAttempt,
+    channel_id: &str,
+    failure_class: RetryableFailureClass,
+    log_threshold: bool,
+) {
     if !attempt.circuit_breaker_enabled {
         return;
     }
@@ -1276,7 +1353,7 @@ pub(super) async fn mark_channel_retryable_failure(
     if state.routing_config_revision.load(Ordering::Acquire) != attempt.routing_config_revision {
         return;
     }
-    let key = health_key(&attempt.channel_id, attempt_health_model(attempt));
+    let key = health_key(channel_id, attempt_health_model(attempt));
     if !crate::monoize_routing::prepare_channel_health_insert(&mut health, &key) {
         return;
     }
@@ -1306,13 +1383,15 @@ pub(super) async fn mark_channel_retryable_failure(
         entry.cooldown_until = Some(now + cooldown_seconds as i64);
         entry.probe_success_count = 0;
         entry.last_probe_at = None;
-        tracing::info!(
-            channel_id = %attempt.channel_id,
-            failure_class = ?failure_class,
-            failed_samples = failure_samples,
-            cooldown_seconds,
-            "channel marked unhealthy after passive breaker threshold"
-        );
+        if log_threshold {
+            tracing::info!(
+                channel_id = %channel_id,
+                failure_class = ?failure_class,
+                failed_samples = failure_samples,
+                cooldown_seconds,
+                "channel marked unhealthy after passive breaker threshold"
+            );
+        }
     }
 }
 pub(super) fn upstream_error_to_app(err: UpstreamCallError) -> AppError {

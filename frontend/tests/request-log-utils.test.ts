@@ -6,8 +6,12 @@ import zh from '../src/locales/zh.json'
 import zhTw from '../src/locales/zh-TW.json'
 import {
 	billingValueTranslationKey,
+	compactRetryChainLabels,
 	computeTps,
 	formatCost,
+	formatRetryChain,
+	hopDisplayLabel,
+	retryAttemptRows,
 	type BillingValueDimension
 } from '../src/pages/request-logs/utils'
 
@@ -175,5 +179,137 @@ describe('billing breakdown translations', () => {
 
 	test('preserves unknown custom profile values by returning no translation key', () => {
 		expect(billingValueTranslationKey('usageClass', 'custom_gpu_second')).toBeNull()
+	})
+})
+
+describe('retry chain', () => {
+	test('prefers channel name, then provider name, then ids', () => {
+		expect(
+			hopDisplayLabel({
+				provider_id: 'p1',
+				channel_id: 'c1',
+				provider_name: 'Ciii',
+				channel_name: 'ciii_1'
+			})
+		).toBe('ciii_1')
+		expect(
+			hopDisplayLabel({
+				provider_id: 'p1',
+				channel_id: 'c1',
+				provider_name: 'Ciii'
+			})
+		).toBe('Ciii')
+		expect(hopDisplayLabel({ provider_id: 'p1', channel_id: 'c1' })).toBe('c1')
+	})
+
+	test('builds a compact unique hop chain including the terminal channel', () => {
+		const labels = compactRetryChainLabels(
+			requestLog({
+				status: 'success',
+				provider: { id: 'input', name: 'Input' },
+				channel: { id: 'input-1', name: 'Input1' },
+				tried_providers: [
+					{
+						provider_id: 'ciii',
+						channel_id: 'ciii-2',
+						provider_name: 'Ciii',
+						channel_name: 'ciii_2',
+						error: '429'
+					},
+					{
+						provider_id: 'ciii',
+						channel_id: 'ciii-2',
+						provider_name: 'Ciii',
+						channel_name: 'ciii_2',
+						error: '429 again'
+					}
+				]
+			})
+		)
+		expect(labels).toEqual(['ciii_2', 'Input1'])
+		expect(formatRetryChain(labels ?? [])).toBe('ciii_2 → Input1')
+	})
+
+	test('does not render a chain for a single hop', () => {
+		expect(
+			compactRetryChainLabels(
+				requestLog({
+					status: 'success',
+					provider: { id: 'cf', name: 'CloudFlare' },
+					channel: { id: 'cf-1', name: 'CloudFlare' },
+					tried_providers: []
+				})
+			)
+		).toBeNull()
+	})
+
+	test('appends a served terminal hop after failed attempts on success', () => {
+		const rows = retryAttemptRows(
+			requestLog({
+				status: 'success',
+				provider: { id: 'input', name: 'Input' },
+				channel: { id: 'input-1', name: 'Input1' },
+				tried_providers: [
+					{
+						provider_id: 'ciii',
+						channel_id: 'ciii-1',
+						provider_name: 'Ciii',
+						channel_name: 'ciii_1',
+						error: 'upstream status 429',
+						upstream_status: 429
+					}
+				]
+			})
+		)
+		expect(rows).toEqual([
+			{
+				label: 'ciii_1',
+				error: 'upstream status 429',
+				upstreamStatus: 429,
+				outcome: 'failed'
+			},
+			{
+				label: 'Input1',
+				error: null,
+				upstreamStatus: null,
+				outcome: 'served'
+			}
+		])
+	})
+
+	test('does not duplicate the terminal hop on a failed last attempt', () => {
+		const rows = retryAttemptRows(
+			requestLog({
+				status: 'error',
+				provider: { id: 'input', name: 'Input' },
+				channel: { id: 'input-1', name: 'Input1' },
+				error: { message: 'upstream status 502', http_status: 502 },
+				tried_providers: [
+					{
+						provider_id: 'input',
+						channel_id: 'input-1',
+						provider_name: 'Input',
+						channel_name: 'Input1',
+						error: 'upstream status 502',
+						upstream_status: 502
+					}
+				]
+			})
+		)
+		expect(rows).toEqual([
+			{
+				label: 'Input1',
+				error: 'upstream status 502',
+				upstreamStatus: 502,
+				outcome: 'failed'
+			}
+		])
+	})
+
+	test('ships retry-chain labels in every locale', () => {
+		for (const locale of [en, zh, zhTw, ja]) {
+			expect(locale.requestLogs.retryChain).toBeTruthy()
+			expect(locale.requestLogs.retryHopServed).toBeTruthy()
+		}
 	})
 })
