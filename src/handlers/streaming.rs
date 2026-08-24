@@ -90,6 +90,8 @@ fn spawn_stream_attempt_error(
         stream_terminal_error_from_app(error),
         reasoning_effort,
         tried_providers,
+        None,
+        None,
     );
 }
 
@@ -652,6 +654,8 @@ pub(super) async fn forward_stream_typed(
                                                 },
                                                 reasoning_effort_for_log,
                                                 tried_providers_for_log,
+                                                resp.usage.clone(),
+                                                None,
                                             );
                                         }
                                     }
@@ -1075,6 +1079,8 @@ pub(super) async fn forward_stream_typed(
                                 terminal_error,
                                 reasoning_effort_for_log,
                                 tried_providers_for_log,
+                                actual_upstream_usage.clone(),
+                                visible_tps_basis.clone(),
                             );
                             if let Some(session) = capture_session.as_ref() {
                                 let frames = if let Some(frames) = capture_frames_for_task.as_ref()
@@ -1264,6 +1270,8 @@ pub(super) async fn forward_stream_typed(
                                     terminal_error,
                                     reasoning_effort_for_log,
                                     tried_providers_for_log,
+                                    usage.clone(),
+                                    visible_tps_basis.clone(),
                                 );
                                 if let Some(session) = capture_session.as_ref() {
                                     session.persist_with_result(usage.as_ref(), true).await;
@@ -1413,6 +1421,8 @@ pub(super) async fn forward_stream_typed(
             terminal_error,
             req.reasoning.as_ref().and_then(|r| r.effort.clone()),
             tried_providers,
+            None,
+            None,
         );
     } else {
         spawn_request_log_error_no_attempt(

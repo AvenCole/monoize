@@ -114,15 +114,19 @@ M2. A balance delta record is `{delta_id, kind, user_id, api_key_id?, amount_nan
 
 M3. Before the charge path reports success on a replica, the delta MUST be durably published as one JSON file in `MONOIZE_REPLICA_METERING_SPOOL_DIR` using temporary-file write followed by same-directory atomic rename. If publication fails or the combined spool size would exceed `MONOIZE_REPLICA_METERING_SPOOL_MAX_BYTES`, enqueue MUST fail and terminal billing finalization MUST treat the request as a billing failure consistent with MB-C6. A successful enqueue MUST also atomically add `amount_nano_usd` to the in-memory pending-deduction counter keyed by `user_id` (kind `request_charge`) or `api_key_id` (kind `api_key_charge`).
 
+M3a. Replica startup MUST create `MONOIZE_REPLICA_METERING_SPOOL_DIR` if it is absent and MUST write then delete one probe file in that directory. A create, write, or permission failure MUST stop startup with error `metering_spool_unwritable`. A bind-mounted spool directory MUST be writable by the process user; a root-owned mount that the non-root process cannot write MUST fail this probe rather than accept traffic.
+
 ### 6.2 Ship loop
 
-M4. Every `MONOIZE_METERING_SHIP_INTERVAL_SECONDS`, the replica MUST send at most one batch POSTed as JSON to `POST {MONOIZE_PRIMARY_INTERNAL_URL}/internal/replica/metering` with header `Authorization: Bearer {MONOIZE_REPLICA_TOKEN}`. The batch is composed as:
+M4. The replica MUST run one ship loop that POSTs at most one JSON batch per iteration to `POST {MONOIZE_PRIMARY_INTERNAL_URL}/internal/replica/metering` with header `Authorization: Bearer {MONOIZE_REPLICA_TOKEN}`. The loop MUST iterate at least every `MONOIZE_METERING_SHIP_INTERVAL_SECONDS`. It MUST also iterate as soon as a request-log spool file is published or a balance delta is durably enqueued (M4b), coalescing wakes that arrive while a POST is in flight into the next iteration. The batch is composed as:
 
-1. the oldest queued request-log spool files, at most `MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES`;
+1. the oldest durable request-log spool files, at most `MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES`, discovered from on-disk `.json` files even when the in-memory buffer is empty (same discovery as `db-performance-tuning.spec.md` DPT-RL4 `load_spool_batch`);
 2. pending deltas, at most `MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES`;
 3. currently buffered last-used pairs, filling remaining capacity.
 
 Total entries across the three arrays MUST be at most 2000 (I3). Entries that do not fit MUST remain buffered or spooled for the next tick. Every tick, including a tick whose three arrays are empty, MUST include a `replica` heartbeat object (M4a) and MUST POST.
+
+M4b. Publishing a terminal request-log spool file or durably enqueuing a balance delta MUST wake the ship loop without waiting for the next interval tick. The ship loop remains the only POST issuer.
 
 M4a. The `replica` heartbeat object is not counted toward the 2000-entry cap. Its schema is:
 
@@ -178,6 +182,8 @@ I4. The entire batch MUST apply inside one database transaction:
 
 Commit MUST precede the HTTP 200 response. The response body MUST be `{"applied_request_logs": N, "applied_last_used": N, "applied_balance_deltas": N}` counting actually-inserted rows and accepted pairs. Any transaction error MUST roll back every statement of the batch and return HTTP 500 code `metering_apply_failed`; the replica retains and retries the batch unchanged.
 
+I4a. After a successful ingest commit whose batch contained one or more request logs, the primary MUST broadcast those request-log entries on the process-local request-log SSE stream used by `request-logs.spec.md` RL1c-0. Dashboard clients MUST observe replica-originated terminal rows through that stream without waiting for a later list fetch. Name snapshots on that broadcast MAY be empty; the next `GET` list query still JOINs names per `request-logs.spec.md` section 1.2.
+
 I5. Balance update per newly-inserted delta:
 
 - kind `request_charge`: decrement `users.balance_nano_usd` by `amount_nano_usd`, allowing a negative result; an unlimited owner MUST receive no balance update while the delta still counts as applied;
@@ -221,11 +227,15 @@ XR4. `user-billing-and-model-metadata.spec.md` LC5 single-attempt semantics appl
 
 T1. Config validation: each error code in PRP1/PRP3–PRP7/PX2 has one unit test asserting the exact code.
 
+T1a. Delta spool construction: a writable directory accepts `DeltaSpool::new`; a directory the process cannot write MUST return an error whose text begins with `metering_spool_unwritable`.
+
 T2. Ingest idempotency (SQLite in-memory): replaying one batch twice yields exactly one ledger row per delta, one net balance effect, identical response counts; duplicate `request_logs` ids are no-ops; last-used keeps the later timestamp.
 
 T3. Ingest semantics: unlimited owner skips balance update but counts applied; sub-account delta updates `sub_account_balance_nano`; negative result allowed; batch >2000 returns 413 without partial state.
 
 T4. Shipper against a mock primary: HTTP 200 deletes shipped spool files and clears buffers/counters; HTTP 500 retains everything; transport error retains everything; consecutive-failure warn appears at the third failure.
+
+T4a. Request-log shipment discovers on-disk `.json` spool files even when the in-memory buffer is empty and deletes them only after the sink reports success.
 
 T5. Epoch: primary mutation increments epoch within its transaction; replica poll observes change and swaps snapshot; failed poll keeps prior snapshot.
 

@@ -95,6 +95,47 @@ fn apply_client_gone_if_needed(log: &mut InsertRequestLog, client_gone: bool) {
     log.error_http_status = Some(499);
 }
 
+fn apply_usage_fields(
+    log: &mut InsertRequestLog,
+    usage: Option<&urp::Usage>,
+    visible_tps_basis: Option<&VisibleOutputTpsBasis>,
+) {
+    if let Some(usage) = usage {
+        log.input_tokens = Some(usage.input_tokens);
+        log.output_tokens = Some(usage.output_tokens);
+        log.cache_read_tokens = usage.cached_tokens();
+        log.cache_creation_tokens = usage
+            .input_details
+            .as_ref()
+            .map(|details| details.cache_creation_tokens)
+            .filter(|&value| value > 0);
+        log.tool_prompt_tokens = usage
+            .input_details
+            .as_ref()
+            .map(|details| details.tool_prompt_tokens)
+            .filter(|&value| value > 0);
+        log.reasoning_tokens = usage.reasoning_tokens();
+        log.accepted_prediction_tokens = usage
+            .output_details
+            .as_ref()
+            .map(|details| details.accepted_prediction_tokens)
+            .filter(|&value| value > 0);
+        log.rejected_prediction_tokens = usage
+            .output_details
+            .as_ref()
+            .map(|details| details.rejected_prediction_tokens)
+            .filter(|&value| value > 0);
+        log.usage_breakdown_json = Some(build_usage_breakdown(usage));
+    }
+    if let Some(basis) = visible_tps_basis {
+        log.first_visible_output_ms = Some(basis.first_visible_output_ms);
+        log.last_visible_output_ms = Some(basis.last_visible_output_ms);
+        log.visible_generation_ms = Some(basis.visible_generation_ms);
+        log.visible_output_tokens = Some(basis.visible_output_tokens);
+        log.tps_mode = Some(basis.tps_mode.to_string());
+    }
+}
+
 struct ClaimedRequestLogTerminal {
     request_id: String,
     lifecycle: std::sync::Arc<crate::app::RequestLogLifecycle>,
@@ -716,6 +757,8 @@ pub(super) fn spawn_request_log_stream_terminal_error(
     terminal_error: StreamTerminalError,
     reasoning_effort: Option<String>,
     tried_providers: Vec<TriedProvider>,
+    usage: Option<urp::Usage>,
+    visible_tps_basis: Option<VisibleOutputTpsBasis>,
 ) {
     let Some(user_id) = auth.user_id.clone() else {
         return;
@@ -750,7 +793,7 @@ pub(super) fn spawn_request_log_stream_terminal_error(
         serde_json::to_value(&tried_providers).ok()
     };
 
-    let log = InsertRequestLog {
+    let mut log = InsertRequestLog {
         request_id,
         user_id,
         api_key_id,
@@ -794,6 +837,7 @@ pub(super) fn spawn_request_log_stream_terminal_error(
         session_affinity_value,
         created_at,
     };
+    apply_usage_fields(&mut log, usage.as_ref(), visible_tps_basis.as_ref());
     spawn_claimed_terminal_log(
         state.user_store.clone(),
         state.request_log_admissions.clone(),
@@ -1016,6 +1060,34 @@ mod admission_tests {
             Some("request_finalization_aborted")
         );
         assert_eq!(terminal.error_http_status, Some(500));
+    }
+
+    #[test]
+    fn billing_settlement_error_keeps_usage_and_timing() {
+        let mut log = pending_log("canonical");
+        log.status = REQUEST_LOG_STATUS_ERROR.to_string();
+        log.error_code = Some("billing_settlement_failed".to_string());
+        let usage = urp::Usage {
+            input_tokens: 12,
+            output_tokens: 3,
+            input_details: None,
+            output_details: None,
+            extra_body: Default::default(),
+        };
+        let basis = VisibleOutputTpsBasis {
+            first_visible_output_ms: 100,
+            last_visible_output_ms: 400,
+            visible_generation_ms: 300,
+            visible_output_tokens: 3,
+            tps_mode: "estimated",
+        };
+        apply_usage_fields(&mut log, Some(&usage), Some(&basis));
+        assert_eq!(log.input_tokens, Some(12));
+        assert_eq!(log.output_tokens, Some(3));
+        assert!(log.usage_breakdown_json.is_some());
+        assert_eq!(log.first_visible_output_ms, Some(100));
+        assert_eq!(log.visible_output_tokens, Some(3));
+        assert_eq!(log.error_code.as_deref(), Some("billing_settlement_failed"));
     }
 
     #[tokio::test]

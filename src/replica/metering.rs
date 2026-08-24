@@ -168,7 +168,21 @@ pub struct DeltaSpool {
 impl DeltaSpool {
     pub fn new(dir: PathBuf, max_bytes: u64) -> Result<Self, String> {
         std::fs::create_dir_all(&dir)
-            .map_err(|error| format!("create delta spool dir: {error}"))?;
+            .map_err(|error| format!("metering_spool_unwritable: create dir: {error}"))?;
+        let probe = dir.join(format!(".write-probe-{}", uuid::Uuid::new_v4().simple()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(file) => {
+                drop(file);
+                let _ = std::fs::remove_file(&probe);
+            }
+            Err(error) => {
+                return Err(format!("metering_spool_unwritable: {error}"));
+            }
+        }
         let mut total = 0u64;
         let entries =
             std::fs::read_dir(&dir).map_err(|error| format!("open delta spool dir: {error}"))?;
@@ -465,6 +479,7 @@ pub struct ReplicaMetering {
     token: String,
     ship_batch_max: usize,
     heartbeat_source: Option<ReplicaHeartbeatSource>,
+    ship_notify: Arc<tokio::sync::Notify>,
 }
 
 impl ReplicaMetering {
@@ -501,6 +516,7 @@ impl ReplicaMetering {
             token: token.to_string(),
             ship_batch_max: ship_batch_max.clamp(1, METERING_BATCH_HARD_CAP),
             heartbeat_source: None,
+            ship_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -585,6 +601,7 @@ impl ReplicaMetering {
         if let Some(subject) = delta_subject(&delta) {
             self.pending.add(&subject, amount_nano_usd);
         }
+        self.ship_notify.notify_one();
         Ok(())
     }
 
@@ -728,8 +745,14 @@ impl ReplicaMetering {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut consecutive_failures = 0usize;
+            let log_notify = log_batcher.ship_notify();
+            let delta_notify = metering.ship_notify.clone();
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = log_notify.notified() => {}
+                    _ = delta_notify.notified() => {}
+                }
                 let tick = metering.ship_once(&log_batcher, &last_used).await;
                 consecutive_failures = next_consecutive_failures(consecutive_failures, tick);
                 if consecutive_failures >= 3 {
@@ -883,7 +906,17 @@ pub(crate) async fn ingest_metering_handler(
     }
 
     match apply_metering_batch(&state.db_pool, &batch).await {
-        Ok(ack) => axum::Json(ack).into_response(),
+        Ok(ack) => {
+            if !batch.request_logs.is_empty() {
+                let rows = batch
+                    .request_logs
+                    .iter()
+                    .map(SpoolRequestLog::to_insert_log)
+                    .collect::<Vec<_>>();
+                let _ = state.log_broadcast.send(rows);
+            }
+            axum::Json(ack).into_response()
+        }
         Err(error) => {
             tracing::warn!(error = %error, "metering batch apply failed; replica will retry");
             metering_error(
@@ -1219,5 +1252,30 @@ mod tests {
         assert_eq!(next_consecutive_failures(2, ShipTick::Failure), 3);
         assert_eq!(next_consecutive_failures(3, ShipTick::Idle), 0);
         assert_eq!(next_consecutive_failures(2, ShipTick::Success), 0);
+    }
+
+    #[test]
+    fn delta_spool_accepts_writable_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        DeltaSpool::new(temp.path().to_path_buf(), 1024).unwrap();
+    }
+
+    #[test]
+    fn delta_spool_rejects_unwritable_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let result = DeltaSpool::new(dir.clone(), 1024);
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            if let Err(error) = result {
+                assert!(
+                    error.starts_with("metering_spool_unwritable"),
+                    "{error}"
+                );
+            }
+        }
     }
 }

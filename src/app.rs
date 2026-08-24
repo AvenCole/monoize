@@ -861,11 +861,12 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
             })
         })
         .map_err(|err| {
-            AppError::new(
-                axum::http::StatusCode::BAD_REQUEST,
-                "metering_init_failed",
-                err,
-            )
+            let code = if err.starts_with("metering_spool_unwritable") {
+                "metering_spool_unwritable"
+            } else {
+                "metering_init_failed"
+            };
+            AppError::new(axum::http::StatusCode::BAD_REQUEST, code, err)
         })?;
         let metering = Arc::new(metering);
         metering.spawn_ship_loop(

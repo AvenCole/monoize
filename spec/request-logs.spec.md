@@ -86,6 +86,8 @@ RL1b. The lifecycle row MUST transition from `"pending"` to exactly one terminal
 
 RL1b-1. The only exception to RL1b for an already-delivered normal streaming response is a post-response billing settlement failure. That lifecycle row MUST use `status = "error"` with `error_code = "billing_settlement_failed"`. No additional terminal status value is introduced.
 
+RL1b-1a. A `billing_settlement_failed` terminal row MUST still include the usage snapshot, scalar token fields, and timing fields that were available when settlement was attempted (`input_tokens`, `output_tokens`, related detail counters, `usage_breakdown_json`, `duration_ms`, `ttfb_ms`, and visible-TPS fields when known). It MUST NOT store those fields as null solely because charging failed. `charge_nano_usd` and `billing_breakdown_json` MAY be null on that row.
+
 RL1c. Terminal logging MUST enqueue exactly one new row with all fields populated (including terminal status, usage, billing, and provider metadata) into the request-log write batcher. There is no preceding pending row to update. Enqueue succeeds only after a durable bounded spool file exists. An abrupt process termination after successful enqueue MUST NOT lose the spooled entry.
 
 RL1c-2. The write batcher MUST assign a stable database row ID when an entry is enqueued. If transaction begin, any insert, or commit reports failure, the complete drained batch MUST be returned to the front of the buffer for retry. Retrying the same stable row ID MUST be idempotent so an ambiguous commit outcome cannot create duplicate rows.

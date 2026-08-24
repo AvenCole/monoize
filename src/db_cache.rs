@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::db::DbPool;
 use crate::users::{InsertRequestLog, REQUEST_LOG_STATUS_PENDING, UserBalance};
@@ -319,6 +319,65 @@ impl SpoolRequestLog {
             session_affinity_value: log.session_affinity_value.clone(),
             created_at: log.created_at.to_rfc3339(),
             created_at_unix_ms: log.created_at.timestamp_millis(),
+        }
+    }
+
+    pub fn to_insert_log(&self) -> InsertRequestLog {
+        let created_at = chrono::DateTime::parse_from_rfc3339(&self.created_at)
+            .map(|value| value.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| {
+                chrono::DateTime::from_timestamp_millis(self.created_at_unix_ms)
+                    .unwrap_or_else(chrono::Utc::now)
+            });
+        InsertRequestLog {
+            request_id: self.request_id.clone(),
+            user_id: self.user_id.clone(),
+            api_key_id: self.api_key_id.clone(),
+            model: self.model.clone(),
+            provider_id: self.provider_id.clone(),
+            upstream_model: self.upstream_model.clone(),
+            channel_id: self.channel_id.clone(),
+            names: crate::users::RequestLogNameSnapshots::default(),
+            is_stream: self.is_stream,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            tool_prompt_tokens: self.tool_prompt_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            accepted_prediction_tokens: self.accepted_prediction_tokens,
+            rejected_prediction_tokens: self.rejected_prediction_tokens,
+            provider_multiplier: self
+                .provider_multiplier
+                .as_deref()
+                .and_then(|value| value.parse().ok()),
+            charge_nano_usd: self
+                .charge_nano_usd
+                .as_deref()
+                .and_then(|value| value.parse().ok()),
+            status: self.status.clone(),
+            usage_breakdown_json: self.usage_breakdown_json.clone(),
+            billing_breakdown_json: self.billing_breakdown_json.clone(),
+            error_code: self.error_code.clone(),
+            error_message: self.error_message.clone(),
+            error_http_status: self.error_http_status,
+            duration_ms: self.duration_ms,
+            ttfb_ms: self.ttfb_ms,
+            first_visible_output_ms: self.first_visible_output_ms,
+            last_visible_output_ms: self.last_visible_output_ms,
+            visible_generation_ms: self.visible_generation_ms,
+            visible_output_tokens: self.visible_output_tokens,
+            tps_mode: self.tps_mode.clone(),
+            request_ip: self.request_ip.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            tried_providers_json: self.tried_providers_json.clone(),
+            request_kind: self.request_kind.clone(),
+            effective_provider_type: self.effective_provider_type.clone(),
+            affinity_hit: self.affinity_hit,
+            affinity_key_hash: self.affinity_key_hash.clone(),
+            affinity_target: self.affinity_target.clone(),
+            session_affinity_value: self.session_affinity_value.clone(),
+            created_at,
         }
     }
 }
@@ -757,7 +816,7 @@ fn request_log_u64_value(
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RequestLogBatcher {
     buffer: Arc<Mutex<Vec<SpoolFileRef>>>,
     flush_lock: Arc<Mutex<()>>,
@@ -771,6 +830,7 @@ pub struct RequestLogBatcher {
     spool_error: Arc<std::sync::Mutex<Option<String>>>,
     broadcast: tokio::sync::broadcast::Sender<Vec<InsertRequestLog>>,
     pending_snapshots: Arc<DashMap<String, InsertRequestLog>>,
+    ship_notify: Arc<Notify>,
 }
 
 impl RequestLogBatcher {
@@ -836,7 +896,12 @@ impl RequestLogBatcher {
             spool_error: Arc::new(std::sync::Mutex::new(spool_error)),
             broadcast,
             pending_snapshots,
+            ship_notify: Arc::new(Notify::new()),
         }
+    }
+
+    pub(crate) fn ship_notify(&self) -> Arc<Notify> {
+        self.ship_notify.clone()
     }
 
     pub fn can_accept_terminal_log(&self) -> bool {
@@ -1124,6 +1189,7 @@ impl RequestLogBatcher {
             self.pending_snapshots.remove(request_id);
         }
         let _ = self.broadcast.send(vec![log.clone()]);
+        self.ship_notify.notify_one();
         let mut buf = self.buffer.lock().await;
         if buf.len() < self.memory_capacity {
             buf.push(SpoolFileRef {
@@ -1293,9 +1359,6 @@ impl RequestLogBatcher {
         let selected: Vec<SpoolFileRef> = {
             let mut buf = self.buffer.lock().await;
             let take = max_entries.min(buf.len());
-            if take == 0 {
-                return 0;
-            }
             buf.drain(..take).collect()
         };
         let selected_backup: Vec<SpoolFileRef> = selected
@@ -1308,7 +1371,7 @@ impl RequestLogBatcher {
         let entries = match load_spool_batch(
             &self.spool_dir,
             selected,
-            self.memory_capacity,
+            max_entries,
             self.spool_entry_max_bytes,
         )
         .await
@@ -2792,5 +2855,52 @@ mod tests {
 
         assert!(first.same_reservation(&clone));
         assert!(!first.same_reservation(&second));
+    }
+
+    #[test]
+    fn spool_request_log_round_trips_usage_into_insert_log() {
+        let spool = spool_request_log("round-trip");
+        let insert = spool.to_insert_log();
+        assert_eq!(insert.request_id.as_deref(), Some("request-round-trip"));
+        assert_eq!(insert.input_tokens, Some(1));
+        assert_eq!(insert.output_tokens, Some(2));
+        assert_eq!(insert.duration_ms, Some(10));
+        assert_eq!(insert.ttfb_ms, Some(11));
+        assert_eq!(insert.charge_nano_usd, Some(9));
+        assert_eq!(insert.status, "success");
+    }
+
+    struct RecordingSink(std::sync::Mutex<Vec<SpoolRequestLog>>);
+
+    #[async_trait::async_trait]
+    impl MeteringSink for RecordingSink {
+        async fn deliver(&self, entries: &[SpoolRequestLog]) -> Result<(), String> {
+            self.0.lock().unwrap().extend(entries.iter().cloned());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn ship_via_discovers_on_disk_files_when_memory_buffer_is_empty() {
+        let temp = TempDir::new().unwrap();
+        let log = spool_request_log("disk-only");
+        let path = temp.path().join("00000000000000000001-disk-only.json");
+        std::fs::write(&path, serde_json::to_vec(&log).unwrap()).unwrap();
+        let (broadcast, _) = tokio::sync::broadcast::channel(1);
+        let batcher = RequestLogBatcher::new_with_limits(
+            2,
+            temp.path().to_path_buf(),
+            REQUEST_LOG_MIN_ENTRY_BYTES * 4,
+            REQUEST_LOG_MIN_ENTRY_BYTES,
+            broadcast,
+            Arc::new(DashMap::new()),
+        );
+        let sink = RecordingSink(std::sync::Mutex::new(Vec::new()));
+        let delivered = batcher.ship_via(10, &sink).await;
+        assert_eq!(delivered, 1);
+        let shipped = sink.0.lock().unwrap();
+        assert_eq!(shipped.len(), 1);
+        assert_eq!(shipped[0].id, "disk-only");
+        assert!(!path.exists());
     }
 }
