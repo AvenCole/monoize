@@ -160,19 +160,22 @@ export function computeTps(log: RequestLog): ComputedTps {
 
 	const outputTotal = totalOutputTokens(log)
 	const visibleTokens = visibleOutputTokens(log)
+	const visibleWindowEligible =
+		visibleGenerationMs != null && visibleGenerationMs >= 100
 
 	let average: TpsBasis | null = null
 	if (outputTotal != null) {
 		average = tpsFromBasis(outputTotal, averageWindowMs)
-	} else {
+	} else if (visibleWindowEligible) {
 		// FL4a-1: when no output-token total exists, fall back to the visible
 		// token count paired with the visible generation window.
 		average = tpsFromBasis(visibleTokens, visibleGenerationMs)
 	}
 
-	// FL4a-5: the visible-window row is only shown when a visible basis exists.
 	const visible =
-		outputTotal != null ? tpsFromBasis(visibleTokens, visibleGenerationMs) : null
+		outputTotal != null && visibleWindowEligible ?
+			tpsFromBasis(visibleTokens, visibleGenerationMs)
+		:	null
 
 	if (!average && !visible) {
 		return { state: 'unavailable' }

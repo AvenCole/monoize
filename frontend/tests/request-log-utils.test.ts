@@ -108,6 +108,26 @@ describe('computeTps', () => {
 			)
 		).toEqual({ state: 'unavailable' })
 	})
+
+	test('omits visible-window TPS when the visible span is under 100 ms', () => {
+		const result = computeTps(
+			requestLog({
+				tokens: { output: 1037 },
+				timing: {
+					duration_ms: 33360,
+					ttfb_ms: 15560,
+					visible_output_tokens: 31,
+					visible_generation_ms: 5
+				}
+			})
+		)
+
+		expect(result.state).toBe('display')
+		if (result.state === 'display') {
+			expect(result.average?.denominatorMs).toBe(17800)
+			expect(result.visible).toBeNull()
+		}
+	})
 })
 
 describe('formatCost', () => {
@@ -349,6 +369,7 @@ describe('retry chain', () => {
 			expect(locale.requestLogs.retryChain).toBeTruthy()
 			expect(locale.requestLogs.retryHopServed).toBeTruthy()
 			expect(locale.requestLogs.retryHopCount).toBeTruthy()
+			expect(locale.requestLogs.stickySession).toBeTruthy()
 		}
 	})
 })

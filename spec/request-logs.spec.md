@@ -420,11 +420,11 @@ FL4a-1. The Average TPS numerator MUST be the total output token count: `usage_b
 
 FL4a-2. The Average TPS generation window MUST be `duration_ms - ttfb_ms` when both values are present and `duration_ms > ttfb_ms`; otherwise a positive `duration_ms` value. This window represents wall-clock generation time and therefore pairs with the total output token count of FL4a-1.
 
-FL4a-3. The UI MUST compute `TPS = numerator / (generation_window_ms / 1000)`. Every displayed value MUST use two decimal places, the unit `t/s`, and the `~` prefix because either the numerator, the generation window, or both may be approximate. The UI MUST NOT impose a minimum token count or minimum generation-window duration.
+FL4a-3. The UI MUST compute `TPS = numerator / (generation_window_ms / 1000)`. Every displayed value MUST use two decimal places, the unit `t/s`, and the `~` prefix because either the numerator, the generation window, or both may be approximate. Average TPS MUST NOT impose a minimum token count or minimum generation-window duration.
 
 FL4a-4. When the numerator or generation window is absent or not greater than zero, the tooltip MUST omit the Average TPS row. It MUST NOT render an insufficient-sample state. The tooltip MUST NOT expose `tps_mode` or legacy/exact/estimated basis labels. Because the Average TPS window is the wall-clock span bounded by the duration and TTFB rows, the tooltip MUST NOT render an additional generation-window row for Average TPS.
 
-FL4a-5. When `visible_generation_ms > 0` and `visible_output_tokens > 0`, the tooltip MUST additionally render a localized "Visible window TPS" row computed as `visible_output_tokens / (visible_generation_ms / 1000)` with the same two-decimal `~`-prefixed `t/s` format, followed by exactly one localized generation-window row showing `visible_generation_ms` formatted per the shared duration format. When the visible basis is absent, both rows MUST be omitted. The visible basis MUST NOT be combined with the total output numerator of FL4a-1.
+FL4a-5. When `visible_generation_ms >= 100` and `visible_output_tokens > 0`, the tooltip MUST additionally render a localized "Visible window TPS" row computed as `visible_output_tokens / (visible_generation_ms / 1000)` with the same two-decimal `~`-prefixed `t/s` format, followed by exactly one localized generation-window row showing `visible_generation_ms` formatted per the shared duration format. When `visible_generation_ms` is absent, zero, or less than 100, both visible-window rows MUST be omitted. The stored timing fields MUST remain unchanged. The visible basis MUST NOT be combined with the total output numerator of FL4a-1.
 
 FL4d. When `tried_providers` is non-empty, the timing tooltip MUST list those hops in stored order after the duration/TTFB/TPS rows. Each hop row MUST show the FL9a.3 label, `duration_ms` when present (same duration format as the duration badge), `upstream_status` when present, and `error`. The list MUST use the same served-terminal rule as FL9b.
 
@@ -451,6 +451,7 @@ FL9. For the admin channel column display value:
 - Else if `provider_id` is non-empty, the first line MUST render `provider_id`.
 - Else the first line MUST render `-`.
 - If compact retry-chain hops defined by FL9a contain two or more hops, the cell MUST render a second line with those hop labels joined by the three-character separator ` → ` (space, U+2192, space). The second line MUST be visible without opening a tooltip. Each line MAY truncate independently.
+- When `affinity_hit` is true, the first line MUST include a localized sticky-session badge immediately after the provider name. The badge MUST NOT appear when `affinity_hit` is false or null.
 - On hover, focus, or activate, the tooltip MUST show the content defined by FL9b. Activation MUST work on touch devices; activating outside the tooltip or pressing Escape MUST close it.
 
 FL9a. Compact retry-chain hops:
@@ -465,7 +466,7 @@ FL9b. Channel tooltip:
 
 - If `tried_providers` is non-empty, the tooltip MUST first render a localized retry-chain heading, then one row per stored `tried_providers` entry in chronological order. Each row MUST show the hop label from FL9a.3, `duration_ms` when present, `upstream_status` when present, and `error`.
 - After those failed-attempt rows, if a terminal hop identity exists and either (a) it differs from the last `tried_providers` identity, or (b) row `status` is `success` or `client_gone` and the last `tried_providers` identity equals the terminal identity, the tooltip MUST append one terminal row with the terminal hop label and a localized served marker. When `status` is `error` and the last `tried_providers` identity already equals the terminal identity, the tooltip MUST NOT append a duplicate terminal row.
-- The tooltip MUST then show `channel_name` (or `channel_id` as fallback) when available, `session_affinity_value` when present, and upstream model when it differs from the requested model.
+- The tooltip MUST then show `channel_name` (or `channel_id` as fallback) when available, a localized affinity hit/miss label when `affinity_hit` is non-null, `affinity_target` when present, `session_affinity_value` when present, and upstream model when it differs from the requested model.
 
 FL10. The request logs table body MUST use virtualized rendering via `react-virtuoso` (`TableVirtuoso`) instead of rendering all loaded rows as plain DOM rows.
 

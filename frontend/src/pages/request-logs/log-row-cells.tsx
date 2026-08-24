@@ -104,6 +104,7 @@ export function LogRowCells({
 	const retryChainLabels = compactRetryChainLabels(log)
 	const retryChainText = retryChainLabels ? formatRetryChain(retryChainLabels) : null
 	const channelPrimaryText = providerDisplay
+	const affinityHit = log.affinity?.hit === true
 	const triedProviders = triedProvidersOf(log)
 	const hasTriedProviders = triedProviders.length > 0
 	const attemptRows = hasTriedProviders ? retryAttemptRows(log) : []
@@ -613,7 +614,17 @@ export function LogRowCells({
 							<Tooltip onOpenChange={channelTooltipOpenChange}>
 								<TooltipTrigger asChild>
 									<span className='inline-flex max-w-[16rem] cursor-default flex-col items-start leading-tight'>
-										<span className='truncate'>{channelPrimaryText}</span>
+										<span className='inline-flex max-w-full items-center gap-1'>
+											<span className='truncate'>{channelPrimaryText}</span>
+											{affinityHit ?
+												<Badge
+													variant='secondary'
+													className='h-4 shrink-0 px-1 text-[10px] font-normal rounded-full border-info-border bg-info-soft text-info-foreground'
+												>
+													{t('requestLogs.stickySession')}
+												</Badge>
+											:	null}
+										</span>
 										{retryChainText ?
 											<span className='max-w-full truncate text-[10px] text-warning'>
 												{retryChainText}
@@ -629,6 +640,17 @@ export function LogRowCells({
 										{channelDisplay && (
 											<div>
 												{t('requestLogs.channel')}: {channelDisplay}
+											</div>
+										)}
+										{log.affinity?.hit === true && (
+											<div>{t('requestLogs.affinityHit')}</div>
+										)}
+										{log.affinity?.hit === false && (
+											<div>{t('requestLogs.affinityMiss')}</div>
+										)}
+										{log.affinity?.target && (
+											<div>
+												{t('requestLogs.affinityTarget')}: {log.affinity.target}
 											</div>
 										)}
 										{log.session_affinity_value && (
