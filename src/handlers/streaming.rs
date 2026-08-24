@@ -194,7 +194,7 @@ pub(super) async fn forward_stream_typed(
     let logical_model = req.model.clone();
     let routing_stub = build_routing_stub(&req, max_multiplier);
     let mut attempts = build_monoize_attempts(&state, &routing_stub, &auth).await?;
-    attach_client_session_id(&mut attempts, client_session_id);
+    attach_client_session_id(&mut attempts, client_session_id, Some(&req));
     ensure_balance_before_forward_for_attempts(&state, &auth, &attempts).await?;
     let pending_request_log_guard = insert_pending_request_log(
         &state,

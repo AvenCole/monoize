@@ -85,11 +85,17 @@ pub(super) fn extract_request_id(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// CM-AFF-1a: read the client-supplied session-affinity value. `session_id`
-/// (codex-style) wins over `x-session-affinity`. Values are sanitized per the
-/// shared affinity sanitizer; an empty result means "absent".
+/// CM-AFF-1a: read the client-supplied session-affinity value. Underscore and
+/// hyphenated aliases are both accepted because some reverse proxies drop
+/// header names that contain `_`. Values are sanitized per the shared affinity
+/// sanitizer; an empty result means "absent".
 pub(super) fn extract_client_session_id(headers: &HeaderMap) -> Option<String> {
-    for name in ["session_id", "x-session-affinity"] {
+    for name in [
+        "session_id",
+        "session-id",
+        "x-session-id",
+        "x-session-affinity",
+    ] {
         if let Some(raw) = headers.get(name).and_then(|value| value.to_str().ok()) {
             let sanitized = crate::handlers::routing::sanitize_session_affinity(raw);
             if !sanitized.is_empty() {
@@ -368,6 +374,48 @@ fn affinity_value_from_json(value: &Value) -> Option<String> {
                 .map(|v| v.to_string())
                 .or_else(|| value.as_u64().map(|v| v.to_string()))
         })
+}
+
+/// CM-AFF-1b: raw conversation identifier from the decoded request body.
+/// Returns the identifier string itself so a header uuid and a body uuid match.
+pub(super) fn stable_session_affinity_raw(req: &urp::UrpRequest) -> Option<String> {
+    const SESSION_KEYS: &[&str] = &[
+        "session_id",
+        "session",
+        "conversation_id",
+        "conversation",
+        "thread_id",
+        "thread",
+    ];
+    for key in SESSION_KEYS {
+        if let Some(value) = req.extra_body.get(*key).and_then(affinity_value_from_json) {
+            return Some(value);
+        }
+    }
+    if let Some(metadata) = req.extra_body.get("metadata").and_then(Value::as_object) {
+        for key in SESSION_KEYS {
+            if let Some(value) = metadata.get(*key).and_then(affinity_value_from_json) {
+                return Some(value);
+            }
+        }
+    }
+    if let Some(value) = req
+        .extra_body
+        .get("user_id")
+        .and_then(affinity_value_from_json)
+    {
+        return Some(value);
+    }
+    if let Some(metadata) = req.extra_body.get("metadata").and_then(Value::as_object)
+        && let Some(value) = metadata.get("user_id").and_then(affinity_value_from_json)
+    {
+        return Some(value);
+    }
+    req.user
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn stable_affinity_field(req: &urp::UrpRequest) -> Option<String> {

@@ -672,19 +672,29 @@ pub(super) async fn collect_provider_attempts(
             extra_headers: channel.extra_headers.clone(),
             session_affinity_auto: channel.session_affinity_auto.unwrap_or(false),
             client_session_id: None,
+            derived_session_affinity: None,
             session_affinity_value: None,
         });
     }
 }
 
-/// CM-AFF-1a: stamp every freshly built attempt with the client-supplied
-/// session id extracted from the incoming request headers.
+/// CM-AFF-1a/1b/2: stamp every freshly built attempt with the client header,
+/// decoded-body conversation identifier, and `mono-*` fallback digest.
 pub(super) fn attach_client_session_id(
     attempts: &mut [MonoizeAttempt],
     client_session_id: Option<String>,
+    req: Option<&urp::UrpRequest>,
 ) {
+    let body_id = req.and_then(super::helpers::stable_session_affinity_raw);
+    let derived = req.map(derive_session_affinity_from_urp);
     for attempt in attempts {
-        attempt.client_session_id = client_session_id.clone();
+        attempt.client_session_id = client_session_id.clone().or_else(|| {
+            body_id
+                .as_deref()
+                .map(sanitize_session_affinity)
+                .filter(|value| !value.is_empty())
+        });
+        attempt.derived_session_affinity = derived.clone();
     }
 }
 
@@ -868,9 +878,11 @@ pub(super) fn attempt_extra_headers(
     out
 }
 
-/// CM-AFF-1/1a/2 + CM-AFF-4: the single effective `x-session-affinity` value
-/// for one attempt. Priority: explicit static `extra_headers` entry, then the
-/// client-supplied session id, then body derivation.
+/// CM-AFF-1/1a/1b/2 + CM-AFF-4: the single effective `x-session-affinity`
+/// value for one attempt. Priority: explicit static `extra_headers` entry,
+/// then the client header or body conversation identifier, then
+/// `prompt_cache_key`, then the decoded-request digest, then encoded-body
+/// digest without tools.
 pub(super) fn resolve_session_affinity_value(
     attempt: &MonoizeAttempt,
     body: &serde_json::Value,
@@ -889,6 +901,12 @@ pub(super) fn resolve_session_affinity_value(
     if let Some(client) = attempt.client_session_id.as_deref() {
         return Some(client.to_string());
     }
+    if let Some(key) = encoded_prompt_cache_key(body) {
+        return Some(key);
+    }
+    if let Some(derived) = attempt.derived_session_affinity.as_deref() {
+        return Some(derived.to_string());
+    }
     derive_session_affinity(body)
 }
 
@@ -904,19 +922,117 @@ pub(super) fn sanitize_session_affinity(raw: &str) -> String {
         .collect()
 }
 
-/// CM-AFF-2: pure function of the request body. `prompt_cache_key` wins when
-/// present; otherwise a digest over the stable conversation head (instructions,
-/// system, tools, and the first two history entries) so that appending further
-/// messages within one session keeps the same affinity while distinct sessions
-/// spread across instances.
-pub(super) fn derive_session_affinity(body: &serde_json::Value) -> Option<String> {
+fn encoded_prompt_cache_key(body: &serde_json::Value) -> Option<String> {
+    let key = body.get("prompt_cache_key").and_then(Value::as_str)?;
+    let sanitized = sanitize_session_affinity(key);
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn session_affinity_digest(payload: &Value) -> Option<String> {
     use sha2::Digest;
 
-    if let Some(key) = body.get("prompt_cache_key").and_then(Value::as_str) {
-        let sanitized = sanitize_session_affinity(key);
-        if !sanitized.is_empty() {
-            return Some(sanitized);
-        }
+    let digest = sha2::Sha256::digest(serde_json::to_string(payload).ok()?);
+    let prefix = u64::from_be_bytes([
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ]);
+    Some(format!("mono-{prefix:016x}"))
+}
+
+fn canonical_session_head_node(node: &urp::Node) -> Value {
+    match node {
+        urp::Node::Text { role, content, .. } => json!({
+            "t": "text",
+            "role": role,
+            "content": content,
+        }),
+        urp::Node::Image { role, source, .. } => json!({
+            "t": "image",
+            "role": role,
+            "source": source,
+        }),
+        urp::Node::Audio { role, source, .. } => json!({
+            "t": "audio",
+            "role": role,
+            "source": source,
+        }),
+        urp::Node::File { role, source, .. } => json!({
+            "t": "file",
+            "role": role,
+            "source": source,
+        }),
+        urp::Node::Refusal { content, .. } => json!({
+            "t": "refusal",
+            "content": content,
+        }),
+        urp::Node::Reasoning { content, .. } => json!({
+            "t": "reasoning",
+            "content": content,
+        }),
+        urp::Node::ToolCall {
+            name, arguments, ..
+        } => json!({
+            "t": "tool_call",
+            "name": name,
+            "arguments": arguments,
+        }),
+        urp::Node::ToolResult {
+            call_id,
+            is_error,
+            content,
+            ..
+        } => json!({
+            "t": "tool_result",
+            "call_id": call_id,
+            "is_error": is_error,
+            "content": content,
+        }),
+        urp::Node::ProviderItem {
+            role,
+            item_type,
+            body,
+            ..
+        } => json!({
+            "t": "provider",
+            "role": role,
+            "item_type": item_type,
+            "body": body,
+        }),
+        urp::Node::NextDownstreamEnvelopeExtra { .. } => json!({ "t": "envelope" }),
+    }
+}
+
+fn session_affinity_instructions(req: &urp::UrpRequest) -> Value {
+    req.extra_body
+        .get("instructions")
+        .cloned()
+        .or_else(|| {
+            req.extra_body
+                .get(urp::RESPONSES_INSTRUCTIONS_EXTRA_KEY)
+                .cloned()
+        })
+        .unwrap_or(Value::Null)
+}
+
+/// CM-AFF-2 rule 2 over the decoded request: instructions plus the first two
+/// input nodes, with ids/extra_body/tools omitted.
+pub(super) fn derive_session_affinity_from_urp(req: &urp::UrpRequest) -> String {
+    let head: Vec<Value> = req
+        .input
+        .iter()
+        .take(2)
+        .map(canonical_session_head_node)
+        .collect();
+    let payload = json!({
+        "head": Value::Array(head),
+        "instructions": session_affinity_instructions(req),
+    });
+    session_affinity_digest(&payload).expect("session affinity payload is serializable")
+}
+
+/// CM-AFF-2 encoded-body fallback: conversation head without `tools`.
+pub(super) fn derive_session_affinity(body: &serde_json::Value) -> Option<String> {
+    if let Some(key) = encoded_prompt_cache_key(body) {
+        return Some(key);
     }
 
     let head: Option<Value> = ["messages", "input"].iter().find_map(|field| {
@@ -929,24 +1045,10 @@ pub(super) fn derive_session_affinity(body: &serde_json::Value) -> Option<String
 
     let payload = serde_json::json!({
         "head": head.unwrap_or(Value::Null),
-        "instructions": body
-            .get("instructions")
-            .filter(|value| value.is_string())
-            .cloned()
-            .unwrap_or(Value::Null),
+        "instructions": body.get("instructions").cloned().unwrap_or(Value::Null),
         "system": body.get("system").cloned().unwrap_or(Value::Null),
-        "tools": body
-            .get("tools")
-            .and_then(Value::as_array)
-            .filter(|tools| !tools.is_empty())
-            .map(|tools| Value::Array(tools.clone()))
-            .unwrap_or(Value::Null),
     });
-    let digest = sha2::Sha256::digest(serde_json::to_string(&payload).ok()?);
-    let prefix = u64::from_be_bytes([
-        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
-    ]);
-    Some(format!("mono-{prefix:016x}"))
+    session_affinity_digest(&payload)
 }
 
 fn messages_body_uses_files_api(value: &serde_json::Value) -> bool {

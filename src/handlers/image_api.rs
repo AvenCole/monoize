@@ -489,7 +489,7 @@ async fn execute_image_subrequest_typed(
 ) -> AppResult<(urp::UrpResponse, String)> {
     let routing_stub = build_routing_stub(&req, max_multiplier);
     let mut attempts = build_monoize_attempts(state, &routing_stub, auth).await?;
-    attach_client_session_id(&mut attempts, client_session_id.clone());
+    attach_client_session_id(&mut attempts, client_session_id.clone(), Some(&req));
     let all_responses = !attempts.is_empty()
         && attempts
             .iter()
@@ -574,7 +574,7 @@ async fn execute_stream_collected_image_typed(
     let logical_model = req.model.clone();
     let routing_stub = build_routing_stub(&req, max_multiplier);
     let mut attempts = build_monoize_attempts(state, &routing_stub, auth).await?;
-    attach_client_session_id(&mut attempts, client_session_id);
+    attach_client_session_id(&mut attempts, client_session_id, Some(&req));
     ensure_balance_before_forward_for_attempts(state, auth, &attempts).await?;
     let pending_request_log_guard = insert_pending_request_log(
         state,

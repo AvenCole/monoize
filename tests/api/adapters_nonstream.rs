@@ -470,4 +470,79 @@ async fn auto_session_affinity_is_stable_per_conversation_and_distinct_across_se
             .unwrap()
     };
     assert_ne!(third, affinities[0]);
+
+    ctx.captured_headers
+        .lock()
+        .expect("captured headers lock")
+        .clear();
+    let mut with_calc = turn_one.clone();
+    with_calc["tools"] = json!([{
+        "type": "function",
+        "function": { "name": "calc", "parameters": { "type": "object" } }
+    }]);
+    let mut with_search = with_calc.clone();
+    with_search["tools"] = json!([
+        {
+            "type": "function",
+            "function": { "name": "calc", "parameters": { "type": "object" } }
+        },
+        {
+            "type": "function",
+            "function": { "name": "search", "parameters": { "type": "object" } }
+        }
+    ]);
+    with_search["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "role": "assistant", "content": "working" }));
+    for body in [&with_calc, &with_search] {
+        let (status, resp) = json_post(&ctx, "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+    }
+    let tool_affinities: Vec<String> = {
+        let headers = ctx.captured_headers.lock().expect("captured headers lock");
+        headers
+            .iter()
+            .filter(|(name, _)| name == "x-session-affinity")
+            .map(|(_, value)| value.clone())
+            .collect()
+    };
+    assert_eq!(tool_affinities.len(), 2, "{tool_affinities:?}");
+    assert_eq!(tool_affinities[0], tool_affinities[1]);
+    assert_eq!(tool_affinities[0], affinities[0]);
+
+    ctx.captured_headers
+        .lock()
+        .expect("captured headers lock")
+        .clear();
+    let mut body_session = turn_one.clone();
+    body_session["session_id"] = json!("019ffeb5-e6ed-7180-89b6-df6e938625a6");
+    let mut body_session_later = body_session.clone();
+    body_session_later["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "role": "assistant", "content": "working" }));
+    body_session_later["tools"] = json!([{
+        "type": "function",
+        "function": { "name": "other_tool", "parameters": { "type": "object" } }
+    }]);
+    for body in [&body_session, &body_session_later] {
+        let (status, resp) = json_post(&ctx, "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+    }
+    let body_ids: Vec<String> = {
+        let headers = ctx.captured_headers.lock().expect("captured headers lock");
+        headers
+            .iter()
+            .filter(|(name, _)| name == "x-session-affinity")
+            .map(|(_, value)| value.clone())
+            .collect()
+    };
+    assert_eq!(
+        body_ids,
+        vec![
+            "019ffeb5-e6ed-7180-89b6-df6e938625a6".to_string(),
+            "019ffeb5-e6ed-7180-89b6-df6e938625a6".to_string()
+        ]
+    );
 }

@@ -2437,6 +2437,7 @@ fn affinity_test_attempt(
         extra_headers: None,
         session_affinity_auto: false,
         client_session_id: None,
+        derived_session_affinity: None,
         session_affinity_value: None,
     }
 }
@@ -2506,6 +2507,21 @@ fn client_session_id_header_extraction_prefers_codex_session_id() {
     assert_eq!(
         extract_client_session_id(&headers).as_deref(),
         Some("codex-b")
+    );
+
+    let mut hyphenated = HeaderMap::new();
+    hyphenated.insert("session-id", "codex-hyphen".parse().unwrap());
+    hyphenated.insert("x-session-affinity", "ses-a".parse().unwrap());
+    assert_eq!(
+        extract_client_session_id(&hyphenated).as_deref(),
+        Some("codex-hyphen")
+    );
+
+    let mut x_session_id = HeaderMap::new();
+    x_session_id.insert("x-session-id", "sid-1".parse().unwrap());
+    assert_eq!(
+        extract_client_session_id(&x_session_id).as_deref(),
+        Some("sid-1")
     );
 
     let mut only_affinity = HeaderMap::new();
@@ -3001,6 +3017,17 @@ fn session_affinity_is_stable_within_conversation_and_differs_across_sessions() 
         "appending messages must keep affinity stable"
     );
 
+    let mut tools_changed = base.clone();
+    tools_changed["tools"] = serde_json::json!([
+        { "type": "function", "function": { "name": "calc" } },
+        { "type": "function", "function": { "name": "search" } }
+    ]);
+    assert_eq!(
+        routing::derive_session_affinity(&tools_changed).unwrap(),
+        first,
+        "tool-definition changes must not split session affinity"
+    );
+
     let other_session = serde_json::json!({
         "model": "cf-model",
         "messages": [
@@ -3012,6 +3039,93 @@ fn session_affinity_is_stable_within_conversation_and_differs_across_sessions() 
     assert_ne!(
         first, other,
         "distinct sessions must derive distinct affinities"
+    );
+}
+
+#[test]
+fn session_affinity_body_session_id_wins_over_derived_digest() {
+    let req = urp::decode::openai_chat::decode_request(&serde_json::json!({
+        "model": "cf-model",
+        "messages": [
+            { "role": "system", "content": "shared system prompt" },
+            { "role": "user", "content": "turn one" }
+        ],
+        "tools": [{ "type": "function", "function": { "name": "calc" } }],
+        "session_id": "019ffeb5-e6ed-7180-89b6-df6e938625a6"
+    }))
+    .expect("decode request");
+    let mut attempt = affinity_test_attempt(
+        "p",
+        "c",
+        crate::monoize_routing::AffinityFailbackMode::Sticky,
+        0,
+    );
+    attempt.session_affinity_auto = true;
+    attach_client_session_id(std::slice::from_mut(&mut attempt), None, Some(&req));
+    assert_eq!(
+        attempt.client_session_id.as_deref(),
+        Some("019ffeb5-e6ed-7180-89b6-df6e938625a6")
+    );
+
+    let mut later = req.clone();
+    later.input.push(urp::Node::Text {
+        id: None,
+        role: urp::OrdinaryRole::User,
+        content: "turn two".to_string(),
+        phase: None,
+        extra_body: HashMap::new(),
+    });
+    later.tools = Some(Vec::new());
+    let mut later_attempt = attempt.clone();
+    attach_client_session_id(std::slice::from_mut(&mut later_attempt), None, Some(&later));
+    assert_eq!(later_attempt.client_session_id, attempt.client_session_id);
+    assert_eq!(
+        resolve_session_affinity_value(&attempt, &serde_json::json!({})).as_deref(),
+        Some("019ffeb5-e6ed-7180-89b6-df6e938625a6")
+    );
+}
+
+#[test]
+fn session_affinity_urp_digest_ignores_tools_and_appended_nodes() {
+    let first = urp::decode::openai_chat::decode_request(&serde_json::json!({
+        "model": "cf-model",
+        "messages": [
+            { "role": "system", "content": "shared system prompt" },
+            { "role": "user", "content": "session A question" }
+        ],
+        "tools": [{ "type": "function", "function": { "name": "calc" } }]
+    }))
+    .expect("decode first");
+    let second = urp::decode::openai_chat::decode_request(&serde_json::json!({
+        "model": "cf-model",
+        "messages": [
+            { "role": "system", "content": "shared system prompt" },
+            { "role": "user", "content": "session A question" },
+            { "role": "assistant", "content": "working" },
+            { "role": "user", "content": "continue" }
+        ],
+        "tools": [
+            { "type": "function", "function": { "name": "calc" } },
+            { "type": "function", "function": { "name": "search" } }
+        ]
+    }))
+    .expect("decode second");
+    assert_eq!(
+        routing::derive_session_affinity_from_urp(&first),
+        routing::derive_session_affinity_from_urp(&second)
+    );
+
+    let other = urp::decode::openai_chat::decode_request(&serde_json::json!({
+        "model": "cf-model",
+        "messages": [
+            { "role": "system", "content": "shared system prompt" },
+            { "role": "user", "content": "session B question" }
+        ]
+    }))
+    .expect("decode other");
+    assert_ne!(
+        routing::derive_session_affinity_from_urp(&first),
+        routing::derive_session_affinity_from_urp(&other)
     );
 }
 

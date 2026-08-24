@@ -90,7 +90,7 @@ Channel static upstream header map MAY be present:
 
 Channel automatic session affinity flag MAY be present:
 
-- `session_affinity_auto: boolean | null`. `null`, absent, and `false` are equivalent and mean disabled. When `true`, every proxied upstream request issued for this Channel MUST carry a derived `x-session-affinity` header per CM-AFF-2 unless an explicit value exists per CM-AFF-1.
+- `session_affinity_auto: boolean | null`. `null`, absent, and `false` are equivalent and mean disabled. When `true`, every proxied upstream request issued for this Channel MUST carry an `x-session-affinity` header per CM-AFF-1 through CM-AFF-2.
 
 ## 2. Invariants
 
@@ -135,25 +135,33 @@ CP-INV-15a. On persist, the server MUST trim keys and serialize the map as JSON 
 
 CM-HDR-1. Every upstream request issued for a Channel (proxy traffic and the liveness probe of §3.8) MUST send the Channel's persisted `extra_headers` entries in addition to the authentication and protocol-specific headers. When an entry name collides with an authentication or protocol-specific header, the request MUST be rejected at configuration time by CP-INV-15 rather than silently overridden at runtime.
 
-CM-AFF-1. If the Channel `extra_headers` contains an explicit `x-session-affinity` entry, that value MUST be sent verbatim and client passthrough (CM-AFF-1a) and automatic derivation (CM-AFF-2) MUST NOT run.
+CM-AFF-1. If the Channel `extra_headers` contains an explicit `x-session-affinity` entry, that value MUST be sent verbatim and client passthrough (CM-AFF-1a), request-body identifiers (CM-AFF-1b), and automatic derivation (CM-AFF-2) MUST NOT run.
 
 CM-AFF-1a. When `session_affinity_auto` is enabled and CM-AFF-1 does not apply, and the incoming client request carries a session-affinity-style header, the gateway MUST pass that client value through as the upstream `x-session-affinity` header. The client headers are read in this order and the first present, non-empty one wins:
 1. `session_id` (codex-style header; matched case-insensitively);
-2. `x-session-affinity` (the header itself, sent by clients that already compute affinity).
+2. `session-id` (hyphenated alias; nginx default configs drop underscore header names);
+3. `x-session-id`;
+4. `x-session-affinity` (the header itself, sent by clients that already compute affinity).
 The value MUST be trimmed, restricted to printable ASCII characters (`0x20..=0x7E`), and truncated to 128 characters. If nothing remains after restriction, the header is treated as absent and the rules below continue.
 
-CM-AFF-2. When `session_affinity_auto` is enabled and neither CM-AFF-1 nor CM-AFF-1a produced a value, the gateway MUST derive the header value for each proxied request as follows:
+CM-AFF-1b. When `session_affinity_auto` is enabled and neither CM-AFF-1 nor CM-AFF-1a produced a value, the gateway MUST use a stable conversation identifier from the decoded request. Scan the following sources in order and take the first present, non-empty value after the same printable-ASCII restriction and 128-character truncation as CM-AFF-1a:
+1. `extra_body` keys `session_id`, `session`, `conversation_id`, `conversation`, `thread_id`, `thread`;
+2. `extra_body.metadata` with the same keys as (1);
+3. `extra_body.user_id`, then `extra_body.metadata.user_id`;
+4. `req.user`.
+A source value MAY be a JSON string or integer; other JSON types are skipped. The raw identifier string is used (not a `key:value` encoding) so a header `session_id` and a body `session_id` with the same uuid produce the same upstream header. `previous_response_id` MUST NOT be used: that field changes every Responses turn and would split one conversation across instances.
+
+CM-AFF-2. When `session_affinity_auto` is enabled and none of CM-AFF-1, CM-AFF-1a, or CM-AFF-1b produced a value, the gateway MUST derive the header value for each proxied request as follows:
 1. If the upstream body contains a non-empty string `prompt_cache_key`, the value MUST be that string trimmed, restricted to printable ASCII characters (`0x20..=0x7E`), and truncated to 128 characters. If nothing remains after restriction, fall through to rule 2.
 2. Otherwise the value MUST be `"mono-"` followed by the first 16 lowercase hex characters of the SHA-256 digest of the canonical JSON serialization (`serde_json`, key-sorted) of the object:
-   - `instructions`: the body `instructions` string when present, else null;
-   - `system`: the body `system` value when present, else null;
-   - `tools`: the body `tools` array when present and non-empty, else null;
-   - `head`: the first at most 2 entries of the body `messages` array when present, else the body `input` when it is a non-empty array, else null.
-The derivation MUST be a pure function of the request body: identical bodies yield identical values, and appending further messages after position 2 MUST NOT change the value.
+   - `instructions`: the decoded request `extra_body.instructions` value when present, else null;
+   - `head`: an array of at most the first 2 decoded input nodes, each replaced by a canonical identity object that includes the node's kind, role when the node has a role, and content identity (text content; image/audio/file source; tool-call name and arguments; tool-result content). The canonical object MUST omit `id`, `extra_body`, `cache_control`, and any tool-definition array.
+The derivation MUST NOT include `tools` or `functions`. It MUST be a pure function of `instructions` plus the first two input nodes: identical heads yield identical values; appending further input nodes MUST NOT change the value; adding, removing, or reordering tool definitions MUST NOT change the value.
+When a decoded request is not available, the gateway MUST apply the same hash to the encoded upstream body using `instructions` (string or absent), `system` (when present), and the first at most 2 entries of `messages` else `input`, and MUST still omit `tools` and `functions`.
 
 CM-AFF-3. Automatic session affinity applies only to proxied traffic. Liveness probes (§3.8) MUST NOT send derived values or client passthrough values; explicit static `extra_headers` entries continue to apply there under CM-HDR-1.
 
-CM-AFF-4. When `session_affinity_auto` is enabled and any of CM-AFF-1, CM-AFF-1a, or CM-AFF-2 produced a value for a proxied request, the gateway MUST record that exact value in `request_logs.session_affinity_value` on the request's terminal log row (`request-logs.spec.md` §1.1). Requests whose automatic session affinity is disabled, liveness probes, and requests that produced no value MUST store null.
+CM-AFF-4. When `session_affinity_auto` is enabled and any of CM-AFF-1, CM-AFF-1a, CM-AFF-1b, or CM-AFF-2 produced a value for a proxied request, the gateway MUST record that exact value in `request_logs.session_affinity_value` on the request's terminal log row (`request-logs.spec.md` §1.1). Requests whose automatic session affinity is disabled, liveness probes, and requests that produced no value MUST store null.
 
 Provider group routing semantics:
 

@@ -58,7 +58,11 @@ pub async fn compact_response(
             format!("model '{logical_model}' has no Responses provider"),
         ));
     }
-    attach_client_session_id(&mut attempts, extract_client_session_id(&headers));
+    attach_client_session_id(
+        &mut attempts,
+        extract_client_session_id(&headers),
+        Some(&routing_request),
+    );
     ensure_balance_before_forward_for_attempts(&state, &auth, &attempts).await?;
 
     let request_id = extract_request_id(&headers);
