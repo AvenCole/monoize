@@ -225,6 +225,22 @@ function nonempty(value: string | null | undefined): string | null {
 	return trimmed ? trimmed : null
 }
 
+export function triedProvidersOf(log: RequestLog): RequestLogTriedProvider[] {
+	const raw = log.tried_providers as unknown
+	if (Array.isArray(raw)) {
+		return raw
+	}
+	if (typeof raw === 'string' && raw.trim()) {
+		try {
+			const parsed = JSON.parse(raw) as unknown
+			return Array.isArray(parsed) ? (parsed as RequestLogTriedProvider[]) : []
+		} catch {
+			return []
+		}
+	}
+	return []
+}
+
 export type RetryHopIdentity = {
 	provider_id?: string | null
 	channel_id?: string | null
@@ -254,7 +270,7 @@ export function compactRetryChainLabels(log: RequestLog): string[] | null {
 		seen.add(key)
 		hops.push(label)
 	}
-	for (const tried of log.tried_providers ?? []) {
+	for (const tried of triedProvidersOf(log)) {
 		push(hopIdentityKey(tried.provider_id, tried.channel_id), hopDisplayLabel(tried))
 	}
 	if (log.provider.id || log.channel.id) {
@@ -279,16 +295,18 @@ export type RetryAttemptRow = {
 	label: string
 	error: string | null
 	upstreamStatus: number | null
+	durationMs: number | null
 	outcome: 'failed' | 'served'
 }
 
 export function retryAttemptRows(log: RequestLog): RetryAttemptRow[] {
-	const tried = log.tried_providers ?? []
+	const tried = triedProvidersOf(log)
 	const rows: RetryAttemptRow[] = tried.map((entry: RequestLogTriedProvider) => ({
 		label:
 			hopDisplayLabel(entry) || `${entry.provider_id}/${entry.channel_id}`,
 		error: entry.error || null,
 		upstreamStatus: entry.upstream_status ?? null,
+		durationMs: readNumber(entry.duration_ms),
 		outcome: 'failed'
 	}))
 	const terminalLabel = hopDisplayLabel({
@@ -317,6 +335,7 @@ export function retryAttemptRows(log: RequestLog): RetryAttemptRow[] {
 			label: terminalLabel,
 			error: log.status === 'error' ? log.error.message ?? null : null,
 			upstreamStatus: log.status === 'error' ? log.error.http_status ?? null : null,
+			durationMs: null,
 			outcome: log.status === 'error' ? 'failed' : 'served'
 		})
 	}

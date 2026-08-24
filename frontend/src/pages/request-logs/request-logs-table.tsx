@@ -12,7 +12,7 @@ interface RequestLogsTableProps {
 	onLoadMore: () => void
 	onTooltipOpenChange: (tooltipId: string, open: boolean) => void
 	showIp: boolean
-	t: (key: string) => string
+	t: (key: string, options?: Record<string, unknown>) => string
 }
 
 const tableComponents = {

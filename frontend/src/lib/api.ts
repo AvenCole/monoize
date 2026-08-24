@@ -520,6 +520,7 @@ export interface RequestLogTriedProvider {
   upstream_code?: string | null;
   upstream_type?: string | null;
   upstream_param?: string | null;
+  duration_ms?: number | null;
 }
 
 export interface RequestLog {

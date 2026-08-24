@@ -52,6 +52,7 @@ A request log row has:
   - `provider_name: string` (Provider display name at attempt time)
   - `channel_name: string` (Channel display name at attempt time)
   - `error: string`
+  - `duration_ms: integer?` (wall-clock milliseconds of that failed attempt)
   - `upstream_status: integer?`
   - `upstream_code: string?`
   - `upstream_type: string?`
@@ -237,7 +238,7 @@ RL16b. Each token line item MUST include `usage_class`, `unit`, `unit_price_nano
 
 RL16c. Each meter line item MUST include `usage_class`, `unit`, `unit_price_nano`, `quantity`, `charge_nano`, and whether the quantity was authoritative when that can be represented.
 
-RL17. When a request triggers waterfall fail-forward, `tried_providers_json` MUST record each failed upstream attempt. This rule applies to every upstream error class. Each persisted entry MUST contain `attempt_number`, `provider_id`, `channel_id`, `provider_name`, `channel_name`, and `error`. It MUST also persist `upstream_status`, `upstream_code`, `upstream_type`, and `upstream_param` when those values exist on the failed attempt. `provider_name` and `channel_name` MUST equal the Provider and Channel display names at attempt time. The array MUST be ordered chronologically. When no upstream attempt failed, the field MUST be null.
+RL17. When a request triggers waterfall fail-forward, `tried_providers_json` MUST record each failed upstream attempt. This rule applies to every upstream error class. Each persisted entry MUST contain `attempt_number`, `provider_id`, `channel_id`, `provider_name`, `channel_name`, and `error`. It MUST also persist `duration_ms`, `upstream_status`, `upstream_code`, `upstream_type`, and `upstream_param` when those values exist on the failed attempt. `duration_ms` MUST equal the wall-clock milliseconds from the start of that upstream attempt to the failure. `provider_name` and `channel_name` MUST equal the Provider and Channel display names at attempt time. The array MUST be ordered chronologically. When no upstream attempt failed, the field MUST be null.
 
 RL17a. `GET /api/dashboard/request-logs` MUST return `tried_providers` as that JSON array, or null. For each hop, if `provider_name` is missing or empty, the handler MUST set it from the current `monoize_providers` row for `provider_id` when that row exists. If `channel_name` is missing or empty, the handler MUST set it from the current `monoize_channels` row for `channel_id` when that row exists. In-memory SSE snapshots already contain write-time names and MUST NOT require this fill.
 
@@ -405,12 +406,14 @@ FL4. The `duration_ms`, `ttfb_ms`, and `is_stream` fields MUST be merged into a 
 - The row MUST render the duration badge when `duration_ms` is present.
 - The row MUST render the TTFB badge when `ttfb_ms` is present.
 - The row MUST render exactly one stream-mode badge (`流` or `非流`).
+- When `tried_providers` is non-empty, the row MUST also render a hop-count badge whose text is the localized retry-hop count for `tried_providers.length`. This hop-count badge is not a timing-value overflow control.
 - The row MUST NOT render a `+N` overflow badge for timing values.
 - Timing badges MUST NOT wrap.
 - The timing cell MAY use horizontal overflow when viewport space is insufficient; it MUST NOT hide badges behind a collapsed popover.
 
 FL4b. The frontend MUST treat request-log timing values as numeric-compatible inputs. For badge rendering and tooltip math, it MUST accept canonical fields `duration_ms` and `ttfb_ms`, and it MUST also accept the compatibility aliases `durationMs`, `elapsed_ms`, or `latency_ms` (total duration) and `ttfbMs`, `first_token_ms`, or `firstTokenMs` (TTFB) when those aliases are present. String values that parse to finite numbers MUST be rendered identically to numeric values.
 FL4c. Backend request-log API responses MUST include compatibility aliases for timing fields (`durationMs`, `elapsed_ms`, `latency_ms`, `ttfbMs`, `first_token_ms`, `firstTokenMs`) with values equal to canonical `duration_ms` / `ttfb_ms`, so updated frontend builds do not rely on client-side fallback only.
+
 FL4a. Hovering, focusing, or activating the timing badge row MUST show a tooltip containing a duration detail row with the total duration and a TTFB detail row when TTFB is present. The tooltip MUST include an "Average TPS" (tokens per second) metric when both the TPS numerator and generation window defined by FL4a-1 and FL4a-2 are greater than zero, and a "Visible window TPS" metric when the basis defined by FL4a-5 exists. Activation MUST work on touch devices; activating outside the tooltip or pressing Escape MUST close it.
 
 FL4a-1. The Average TPS numerator MUST be the total output token count: `usage_breakdown_json.output.total_tokens` takes precedence over scalar `output_tokens`. Reasoning tokens MUST NOT be subtracted. When neither total is present, the numerator MUST fall back to a positive `visible_output_tokens` value, and in that case the generation window MUST be the visible window defined in FL4a-5 instead of FL4a-2.
@@ -422,6 +425,8 @@ FL4a-3. The UI MUST compute `TPS = numerator / (generation_window_ms / 1000)`. E
 FL4a-4. When the numerator or generation window is absent or not greater than zero, the tooltip MUST omit the Average TPS row. It MUST NOT render an insufficient-sample state. The tooltip MUST NOT expose `tps_mode` or legacy/exact/estimated basis labels. Because the Average TPS window is the wall-clock span bounded by the duration and TTFB rows, the tooltip MUST NOT render an additional generation-window row for Average TPS.
 
 FL4a-5. When `visible_generation_ms > 0` and `visible_output_tokens > 0`, the tooltip MUST additionally render a localized "Visible window TPS" row computed as `visible_output_tokens / (visible_generation_ms / 1000)` with the same two-decimal `~`-prefixed `t/s` format, followed by exactly one localized generation-window row showing `visible_generation_ms` formatted per the shared duration format. When the visible basis is absent, both rows MUST be omitted. The visible basis MUST NOT be combined with the total output numerator of FL4a-1.
+
+FL4d. When `tried_providers` is non-empty, the timing tooltip MUST list those hops in stored order after the duration/TTFB/TPS rows. Each hop row MUST show the FL9a.3 label, `duration_ms` when present (same duration format as the duration badge), `upstream_status` when present, and `error`. The list MUST use the same served-terminal rule as FL9b.
 
 FL5. The `api_key_name` column header MUST be "Token" (referring to the API key name, not the literal token value).
 
@@ -442,11 +447,10 @@ FL8. Column order (left to right): `created_at`, `request_id` (with adjacent sta
 
 FL9. For the admin channel column display value:
 
-- If compact retry-chain hops defined by FL9a contain two or more hops, the cell MUST render those hop labels joined by the three-character separator ` → ` (space, U+2192, space) as the primary text.
-- Else if `provider_name` is non-empty, UI MUST render `provider_name` as the primary text.
-- Else if `provider_id` is non-empty, UI MUST render `provider_id`.
-- Else UI MUST render `-`.
-- The cell MUST truncate overflowing primary text.
+- If `provider_name` is non-empty, the first line MUST render `provider_name`.
+- Else if `provider_id` is non-empty, the first line MUST render `provider_id`.
+- Else the first line MUST render `-`.
+- If compact retry-chain hops defined by FL9a contain two or more hops, the cell MUST render a second line with those hop labels joined by the three-character separator ` → ` (space, U+2192, space). The second line MUST be visible without opening a tooltip. Each line MAY truncate independently.
 - On hover, focus, or activate, the tooltip MUST show the content defined by FL9b. Activation MUST work on touch devices; activating outside the tooltip or pressing Escape MUST close it.
 
 FL9a. Compact retry-chain hops:
@@ -459,7 +463,7 @@ FL9a. Compact retry-chain hops:
 
 FL9b. Channel tooltip:
 
-- If `tried_providers` is non-empty, the tooltip MUST first render a localized retry-chain heading, then one row per stored `tried_providers` entry in chronological order. Each row MUST show the hop label from FL9a.3, `upstream_status` when present, and `error`.
+- If `tried_providers` is non-empty, the tooltip MUST first render a localized retry-chain heading, then one row per stored `tried_providers` entry in chronological order. Each row MUST show the hop label from FL9a.3, `duration_ms` when present, `upstream_status` when present, and `error`.
 - After those failed-attempt rows, if a terminal hop identity exists and either (a) it differs from the last `tried_providers` identity, or (b) row `status` is `success` or `client_gone` and the last `tried_providers` identity equals the terminal identity, the tooltip MUST append one terminal row with the terminal hop label and a localized served marker. When `status` is `error` and the last `tried_providers` identity already equals the terminal identity, the tooltip MUST NOT append a duplicate terminal row.
 - The tooltip MUST then show `channel_name` (or `channel_id` as fallback) when available, `session_affinity_value` when present, and upstream model when it differs from the requested model.
 

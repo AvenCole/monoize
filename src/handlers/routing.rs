@@ -1240,6 +1240,7 @@ pub(super) async fn record_upstream_attempt_failure(
         attempt_number,
         attempt,
         app_err,
+        execution_state.last_attempt_duration_ms(),
     ));
     let Some(failure_class) = passive_failure_class else {
         return;

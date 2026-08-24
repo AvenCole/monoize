@@ -806,6 +806,7 @@
 		"triedProviders": "Tried Providers",
 		"retryChain": "Retry chain",
 		"retryHopServed": "Served",
+		"retryHopCount": "{{count}} hops",
 		"reasoningEffort": "Reasoning Effort",
 		"upstreamModel": "Upstream Model",
 		"modelProvider": "Provider",

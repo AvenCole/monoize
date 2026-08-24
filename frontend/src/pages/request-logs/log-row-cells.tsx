@@ -29,6 +29,7 @@ import {
 	readNumber,
 	readTokenCount,
 	retryAttemptRows,
+	triedProvidersOf,
 	type RetryAttemptRow
 } from './utils'
 
@@ -36,7 +37,7 @@ interface LogRowCellsProps {
 	log: RequestLog
 	isAdmin: boolean
 	showIp: boolean
-	t: (key: string) => string
+	t: (key: string, options?: Record<string, unknown>) => string
 	onTooltipOpenChange: (tooltipId: string, open: boolean) => void
 }
 
@@ -102,8 +103,9 @@ export function LogRowCells({
 	const providerDisplay = log.provider.name?.trim() || log.provider.id || null
 	const retryChainLabels = compactRetryChainLabels(log)
 	const retryChainText = retryChainLabels ? formatRetryChain(retryChainLabels) : null
-	const channelPrimaryText = retryChainText || providerDisplay
-	const hasTriedProviders = (log.tried_providers?.length ?? 0) > 0
+	const channelPrimaryText = providerDisplay
+	const triedProviders = triedProvidersOf(log)
+	const hasTriedProviders = triedProviders.length > 0
 	const attemptRows = hasTriedProviders ? retryAttemptRows(log) : []
 	const costDisplay = formatCost(log.billing.charge_nano_usd)
 	const usageSnapshot = asObject(log.usage)
@@ -351,6 +353,15 @@ export function LogRowCells({
 				{ttfb}
 			</Badge>
 		:	null
+	const hopCountBadge =
+		hasTriedProviders ?
+			<Badge
+				variant='secondary'
+				className='text-[10px] h-5 px-1 font-mono rounded-full border-warning-border bg-warning-soft text-warning-foreground'
+			>
+				{t('requestLogs.retryHopCount', { count: triedProviders.length })}
+			</Badge>
+		:	null
 	const streamBadge = log.is_stream ?
 		<Badge
 			variant='secondary'
@@ -398,6 +409,11 @@ export function LogRowCells({
 						{t('requestLogs.tpsGenerationWindow')}
 					</span>
 					<span className='font-mono'>{visibleTpsWindow}</span>
+				</div>
+			)}
+			{attemptRows.length > 0 && (
+				<div className='border-t border-border/50 pt-1 mt-1'>
+					<RetryAttemptList rows={attemptRows} t={t} />
 				</div>
 			)}
 		</div>
@@ -591,13 +607,18 @@ export function LogRowCells({
 			)}
 
 			{isAdmin && (
-				<td className='px-2 py-1 whitespace-nowrap align-middle text-[11px] leading-4 text-muted-foreground'>
+				<td className='px-2 py-1 align-middle text-[11px] leading-4 text-muted-foreground'>
 					{channelPrimaryText ? (
 						<TooltipProvider delayDuration={200}>
 							<Tooltip onOpenChange={channelTooltipOpenChange}>
 								<TooltipTrigger asChild>
-									<span className='inline-flex h-4 items-center cursor-default max-w-[16rem] truncate'>
-										{channelPrimaryText}
+									<span className='inline-flex max-w-[16rem] cursor-default flex-col items-start leading-tight'>
+										<span className='truncate'>{channelPrimaryText}</span>
+										{retryChainText ?
+											<span className='max-w-full truncate text-[10px] text-warning'>
+												{retryChainText}
+											</span>
+										:	null}
 									</span>
 								</TooltipTrigger>
 								<TooltipContent>
@@ -647,6 +668,7 @@ export function LogRowCells({
 							>
 								{durationBadge}
 								{ttfbBadge}
+								{hopCountBadge}
 								{streamBadge}
 							</button>
 						</TooltipTrigger>
@@ -919,7 +941,7 @@ function RetryAttemptList({
 	t
 }: {
 	rows: RetryAttemptRow[]
-	t: (key: string) => string
+	t: (key: string, options?: Record<string, unknown>) => string
 }) {
 	return (
 		<div className='space-y-1'>
@@ -927,6 +949,12 @@ function RetryAttemptList({
 			{rows.map((row, index) => (
 				<div key={`${row.label}-${index}`} className='break-words'>
 					<span className='font-mono'>{row.label}</span>
+					{row.durationMs != null && (
+						<span className='font-mono text-muted-foreground'>
+							{' '}
+							{formatDuration(row.durationMs)}
+						</span>
+					)}
 					{row.outcome === 'served' ?
 						<span className='text-success'> {t('requestLogs.retryHopServed')}</span>
 					:	<>

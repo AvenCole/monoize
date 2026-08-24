@@ -2329,6 +2329,7 @@ fn exhausted_upstream_error_preserves_final_machine_code() {
         upstream_code: Some("thinking_signature_invalid".to_string()),
         upstream_type: Some("invalid_request_error".to_string()),
         upstream_param: None,
+        duration_ms: Some(12),
     }];
 
     let err = build_exhausted_upstream_error("gpt-5.6-sol", &tried);

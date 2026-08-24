@@ -202,6 +202,40 @@ describe('retry chain', () => {
 		expect(hopDisplayLabel({ provider_id: 'p1', channel_id: 'c1' })).toBe('c1')
 	})
 
+	test('shows ciii then beikun for the production error payload', () => {
+		const labels = compactRetryChainLabels(
+			requestLog({
+				status: 'error',
+				provider: { id: '2iy0koao', name: 'beikun' },
+				channel: { id: 'mono_ch_e63df88ce165421aad3299f4e2a2816a', name: 'beikun' },
+				tried_providers: [
+					{
+						attempt_number: 1,
+						provider_id: 'mlprglfg',
+						channel_id: 'mono_ch_2c91e8fcd4b34cefa0264792b107ebe8',
+						provider_name: 'Ciii',
+						channel_name: 'ciii_1',
+						error: 'upstream status 502',
+						upstream_status: 502,
+						duration_ms: 98000
+					},
+					{
+						attempt_number: 2,
+						provider_id: '2iy0koao',
+						channel_id: 'mono_ch_e63df88ce165421aad3299f4e2a2816a',
+						provider_name: 'beikun',
+						channel_name: 'beikun',
+						error: 'upstream status 429',
+						upstream_status: 429,
+						duration_ms: 31000
+					}
+				]
+			})
+		)
+		expect(labels).toEqual(['ciii_1', 'beikun'])
+		expect(formatRetryChain(labels ?? [])).toBe('ciii_1 → beikun')
+	})
+
 	test('builds a compact unique hop chain including the terminal channel', () => {
 		const labels = compactRetryChainLabels(
 			requestLog({
@@ -266,12 +300,14 @@ describe('retry chain', () => {
 				label: 'ciii_1',
 				error: 'upstream status 429',
 				upstreamStatus: 429,
+				durationMs: null,
 				outcome: 'failed'
 			},
 			{
 				label: 'Input1',
 				error: null,
 				upstreamStatus: null,
+				durationMs: null,
 				outcome: 'served'
 			}
 		])
@@ -291,7 +327,8 @@ describe('retry chain', () => {
 						provider_name: 'Input',
 						channel_name: 'Input1',
 						error: 'upstream status 502',
-						upstream_status: 502
+						upstream_status: 502,
+						duration_ms: 1214
 					}
 				]
 			})
@@ -301,6 +338,7 @@ describe('retry chain', () => {
 				label: 'Input1',
 				error: 'upstream status 502',
 				upstreamStatus: 502,
+				durationMs: 1214,
 				outcome: 'failed'
 			}
 		])
@@ -310,6 +348,7 @@ describe('retry chain', () => {
 		for (const locale of [en, zh, zhTw, ja]) {
 			expect(locale.requestLogs.retryChain).toBeTruthy()
 			expect(locale.requestLogs.retryHopServed).toBeTruthy()
+			expect(locale.requestLogs.retryHopCount).toBeTruthy()
 		}
 	})
 })

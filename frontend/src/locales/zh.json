@@ -806,6 +806,7 @@
 		"triedProviders": "已尝试供应商",
 		"retryChain": "重试链路",
 		"retryHopServed": "最终成功",
+		"retryHopCount": "{{count}} 跳",
 		"reasoningEffort": "推理强度",
 		"upstreamModel": "上游模型",
 		"modelProvider": "供应商",

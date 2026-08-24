@@ -36,7 +36,7 @@ use axum::response::{IntoResponse, Response, Sse};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
 
 use billing::*;
@@ -947,10 +947,16 @@ struct TriedProvider {
     upstream_code: Option<String>,
     upstream_type: Option<String>,
     upstream_param: Option<String>,
+    duration_ms: Option<u64>,
 }
 
 impl TriedProvider {
-    fn from_app_error(attempt_number: u32, attempt: &MonoizeAttempt, app_err: &AppError) -> Self {
+    fn from_app_error(
+        attempt_number: u32,
+        attempt: &MonoizeAttempt,
+        app_err: &AppError,
+        duration_ms: Option<u64>,
+    ) -> Self {
         Self {
             attempt_number,
             provider_id: attempt.provider_id.clone(),
@@ -967,6 +973,7 @@ impl TriedProvider {
             ),
             upstream_type: app_err.upstream_type.clone(),
             upstream_param: app_err.upstream_param.clone(),
+            duration_ms,
         }
     }
 }
@@ -980,6 +987,7 @@ struct AttemptExecutionState {
     provider_attempts_used: HashMap<String, usize>,
     next_attempt_number: u32,
     shared_origin_skips: HashSet<String>,
+    current_attempt_started: Option<Instant>,
 }
 
 impl AttemptExecutionState {
@@ -1017,6 +1025,7 @@ impl AttemptExecutionState {
     }
 
     fn record_upstream_attempt(&mut self, attempt: &MonoizeAttempt) -> u32 {
+        self.current_attempt_started = Some(Instant::now());
         let used = self
             .provider_attempts_used
             .entry(attempt.provider_id.clone())
@@ -1024,6 +1033,11 @@ impl AttemptExecutionState {
         *used = used.saturating_add(1);
         self.next_attempt_number = self.next_attempt_number.saturating_add(1);
         self.next_attempt_number
+    }
+
+    fn last_attempt_duration_ms(&self) -> Option<u64> {
+        self.current_attempt_started
+            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
 }
 
