@@ -333,18 +333,31 @@ pub(super) async fn insert_pending_request_log(
         return Ok(None);
     };
     let request_id = canonical_request_id(request_id).ok_or_else(|| {
+        let error = "request id missing before request-log spool admission";
+        tracing::error!(
+            stage = "request_id",
+            request_id = "<missing>",
+            error,
+            "request-log spool admission failed"
+        );
         AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "request_log_spool_unavailable",
             "request log spool is unavailable",
         )
-        .with_internal_message("request id missing before request-log spool admission")
+        .with_internal_message(error)
         .with_type("server_error")
     })?;
     let admission = state
         .user_store
         .reserve_terminal_request_log()
         .map_err(|error| {
+            tracing::error!(
+                stage = "reserve",
+                request_id = %request_id,
+                error = %error,
+                "request-log spool admission failed"
+            );
             AppError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "request_log_spool_unavailable",
@@ -404,6 +417,12 @@ pub(super) async fn insert_pending_request_log(
         .arm_terminal_request_log(durable_fallback, &arm_reservation)
         .await
     {
+        tracing::error!(
+            stage = "arm",
+            request_id = %request_id,
+            error = %error,
+            "request-log spool admission failed"
+        );
         state.pending_request_logs.remove(&request_id);
         state
             .request_log_admissions
