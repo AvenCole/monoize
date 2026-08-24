@@ -670,12 +670,42 @@ pub(super) async fn collect_provider_attempts(
             routing_config_revision,
             proxy_url: channel.proxy_url.clone(),
             extra_headers: channel.extra_headers.clone(),
-            session_affinity_auto: channel.session_affinity_auto.unwrap_or(false),
+            session_affinity_auto: effective_session_affinity_auto(
+                &channel.base_url,
+                channel.session_affinity_auto,
+            ),
             client_session_id: None,
             derived_session_affinity: None,
             session_affinity_value: None,
         });
     }
+}
+
+/// CM-AFF-0: a null setting enables affinity only for the direct Workers AI URL.
+pub(super) fn effective_session_affinity_auto(base_url: &str, configured: Option<bool>) -> bool {
+    configured.unwrap_or_else(|| is_direct_cloudflare_workers_ai_url(base_url))
+}
+
+fn is_direct_cloudflare_workers_ai_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || url.host_str() != Some("api.cloudflare.com")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+
+    let path = url.path().strip_suffix('/').unwrap_or(url.path());
+    let Some(account_and_suffix) = path.strip_prefix("/client/v4/accounts/") else {
+        return false;
+    };
+    let account_id = account_and_suffix
+        .strip_suffix("/ai/v1")
+        .or_else(|| account_and_suffix.strip_suffix("/ai"));
+    account_id.is_some_and(|account_id| !account_id.is_empty() && !account_id.contains('/'))
 }
 
 /// CM-AFF-1a/1b/2: stamp every freshly built attempt with the client header,

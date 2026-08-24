@@ -2500,6 +2500,48 @@ fn session_affinity_resolution_priority_matches_spec() {
 }
 
 #[test]
+fn session_affinity_null_setting_auto_detects_direct_workers_ai_urls() {
+    for base_url in [
+        "https://api.cloudflare.com/client/v4/accounts/account-id/ai",
+        "https://api.cloudflare.com/client/v4/accounts/account-id/ai/",
+        "https://api.cloudflare.com/client/v4/accounts/account-id/ai/v1",
+    ] {
+        assert!(
+            routing::effective_session_affinity_auto(base_url, None),
+            "{base_url}"
+        );
+    }
+
+    for base_url in [
+        "http://api.cloudflare.com/client/v4/accounts/account-id/ai",
+        "https://api.cloudflare.com.example/client/v4/accounts/account-id/ai",
+        "https://api.cloudflare.com/client//v4/accounts/account-id/ai",
+        "https://api.cloudflare.com/client/v4/accounts/account-id/ai/run/model",
+        "https://api.cloudflare.com/client/v4/accounts/account-id/ai//",
+        "https://api.cloudflare.com/client/v4/accounts/account-id/ai?debug=1",
+        "https://example.com/client/v4/accounts/account-id/ai",
+    ] {
+        assert!(
+            !routing::effective_session_affinity_auto(base_url, None),
+            "{base_url}"
+        );
+    }
+}
+
+#[test]
+fn session_affinity_explicit_setting_overrides_url_detection() {
+    let workers_ai = "https://api.cloudflare.com/client/v4/accounts/account-id/ai";
+    assert!(!routing::effective_session_affinity_auto(
+        workers_ai,
+        Some(false)
+    ));
+    assert!(routing::effective_session_affinity_auto(
+        "https://example.com/v1",
+        Some(true)
+    ));
+}
+
+#[test]
 fn client_session_id_header_extraction_prefers_codex_session_id() {
     let mut headers = HeaderMap::new();
     headers.insert("x-session-affinity", "ses-a".parse().unwrap());

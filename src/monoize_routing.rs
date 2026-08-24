@@ -141,7 +141,7 @@ pub struct MonoizeChannel {
     /// CP-INV-15: static headers injected into every upstream request for this Channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_headers: Option<BTreeMap<String, String>>,
-    /// CM-AFF-2: derive per-request `x-session-affinity` when no explicit value exists.
+    /// CM-AFF-0: explicit override for URL-based automatic session affinity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_affinity_auto: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
