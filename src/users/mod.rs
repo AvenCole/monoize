@@ -485,6 +485,7 @@ pub struct InsertRequestLog {
 pub const REQUEST_LOG_STATUS_PENDING: &str = "pending";
 pub const REQUEST_LOG_STATUS_SUCCESS: &str = "success";
 pub const REQUEST_LOG_STATUS_ERROR: &str = "error";
+pub const REQUEST_LOG_STATUS_CLIENT_GONE: &str = "client_gone";
 
 #[derive(Debug, Serialize)]
 pub struct RequestLogProvider {
@@ -716,6 +717,13 @@ pub struct UserUsageRankingRow {
     pub username: Option<String>,
     pub call_count: i64,
     pub cost_nano_usd: i128,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelTodayUsage {
+    pub channel_id: String,
+    pub today_calls: i64,
+    pub today_cost_nano_usd: i128,
 }
 
 pub use utils::{format_nano_to_usd, parse_nano_usd, parse_usd_to_nano};

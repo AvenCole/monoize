@@ -116,15 +116,32 @@ M3. Before the charge path reports success on a replica, the delta MUST be durab
 
 ### 6.2 Ship loop
 
-M4. Every `MONOIZE_METERING_SHIP_INTERVAL_SECONDS`, the replica MUST send at most one batch POSTed as JSON to `POST {MONOIZE_PRIMARY_INTERNAL_URL}/internal/replica/metering` with header `Authorization: Bearer {MONOIZE_REPLICA_TOKEN}`. A tick with no entries MUST NOT POST. The batch is composed as:
+M4. Every `MONOIZE_METERING_SHIP_INTERVAL_SECONDS`, the replica MUST send at most one batch POSTed as JSON to `POST {MONOIZE_PRIMARY_INTERNAL_URL}/internal/replica/metering` with header `Authorization: Bearer {MONOIZE_REPLICA_TOKEN}`. The batch is composed as:
 
 1. the oldest queued request-log spool files, at most `MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES`;
 2. pending deltas, at most `MONOIZE_METERING_SHIP_BATCH_MAX_ENTRIES`;
 3. currently buffered last-used pairs, filling remaining capacity.
 
-Total entries across the three arrays MUST be at most 2000 (I3). Entries that do not fit MUST remain buffered or spooled for the next tick.
+Total entries across the three arrays MUST be at most 2000 (I3). Entries that do not fit MUST remain buffered or spooled for the next tick. Every tick, including a tick whose three arrays are empty, MUST include a `replica` heartbeat object (M4a) and MUST POST.
 
-M5. Spool files, buffered last-used pairs, pending deltas, and their pending-deduction counters MUST only be released after an HTTP 200 response. Any non-200 response or transport error MUST retain everything unchanged for the next tick. After 3 consecutive failed ticks the replica MUST log a `warn` naming the consecutive-failure count, repeated per subsequent failure.
+M4a. The `replica` heartbeat object is not counted toward the 2000-entry cap. Its schema is:
+
+```json
+{
+  "id": "uuid v4 string, stable for the replica process lifetime",
+  "hostname": "string",
+  "listen": "the replica MONOIZE_LISTEN value",
+  "version": "CARGO_PKG_VERSION",
+  "started_at": "RFC 3339 process start",
+  "uptime_seconds": 0,
+  "spool_pending_count": 0,
+  "spool_pending_bytes": 0
+}
+```
+
+A primary that authenticates an ingest request containing `replica` MUST upsert that replica into a process-local heartbeat map keyed by `id`, recording `last_seen_at = now`, before applying the batch. Heartbeat recording MUST NOT require a non-empty data array. The map is not persisted across primary restarts.
+
+M5. Spool files, buffered last-used pairs, pending deltas, and their pending-deduction counters MUST only be released after an HTTP 200 response. Any non-200 response or transport error MUST retain everything unchanged for the next tick. After 3 consecutive failed ticks the replica MUST log a `warn` naming the consecutive-failure count, repeated per subsequent failure. A heartbeat-only tick that receives HTTP 200 is a successful tick.
 
 M6. At graceful shutdown the replica MUST make one best-effort final ship attempt; leftover data persists on disk and ships after restart.
 
@@ -144,13 +161,14 @@ I3. Body schema:
 
 ```json
 {
+  "replica": { "id": "...", "hostname": "...", "listen": "...", "version": "...", "started_at": "...", "uptime_seconds": 0, "spool_pending_count": 0, "spool_pending_bytes": 0 },
   "request_logs": ["SpoolRequestLog objects per DPT-RL3"],
   "last_used": [{"api_key_id": "...", "last_used_at": "RFC 3339"}],
   "balance_deltas": [one object per M2]
 }
 ```
 
-All three arrays MAY be empty. If total entries across arrays exceed 2000, the endpoint MUST return HTTP 413 code `metering_batch_too_large` without partial apply. Any per-entry schema violation MUST return HTTP 422 code `metering_batch_invalid` without partial apply.
+All three arrays MAY be empty. `replica` MAY be omitted by older replicas; when present it MUST be recorded per M4a and MUST NOT count toward the entry cap. If total entries across the three arrays exceed 2000, the endpoint MUST return HTTP 413 code `metering_batch_too_large` without partial apply. Any per-entry schema violation MUST return HTTP 422 code `metering_batch_invalid` without partial apply.
 
 I4. The entire batch MUST apply inside one database transaction:
 

@@ -547,10 +547,29 @@ export interface AdminOverviewNode {
   upstream_proxy_url?: string | null;
 }
 
+export interface AdminOverviewReplicaNode {
+  id: string;
+  hostname: string;
+  listen: string;
+  version: string;
+  started_at: string;
+  last_seen_at: string;
+  uptime_seconds: number;
+  spool_pending_count: number;
+  spool_pending_bytes: number;
+  stale: boolean;
+}
+
 export interface AdminOverviewReplica {
   ingest_enabled: boolean;
   spool_pending_count: number;
   spool_pending_bytes: number;
+  replicas: AdminOverviewReplicaNode[];
+}
+
+export interface AdminOverviewToday {
+  calls: number;
+  cost_nano_usd: string;
 }
 
 export interface AdminOverviewSystem {
@@ -582,12 +601,16 @@ export interface AdminOverviewChannelHealth {
   probe_success_count: number;
   last_probe_at?: number | null;
   cooldown_active: boolean;
+  unhealthy_models: string[];
+  today_calls: number;
+  today_cost_nano_usd: string;
 }
 
 export interface AdminOverview {
   node: AdminOverviewNode;
   replica: AdminOverviewReplica;
   system: AdminOverviewSystem;
+  today: AdminOverviewToday;
   users_ranking: AdminOverviewUserRanking[];
   channel_health: AdminOverviewChannelHealth[];
 }

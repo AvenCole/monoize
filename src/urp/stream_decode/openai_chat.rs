@@ -94,9 +94,6 @@ pub(crate) async fn stream_chat_to_urp_events(
                 return Ok(());
             }
         };
-        if tx.is_closed() {
-            return Ok(());
-        }
         mark_stream_ttfb_if_needed(started_at, &runtime_metrics).await;
         if ev.data.trim() == "[DONE]" {
             record_stream_done_sentinel(&runtime_metrics).await;

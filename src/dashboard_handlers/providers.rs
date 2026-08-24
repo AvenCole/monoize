@@ -891,7 +891,7 @@ pub async fn test_channel(
                 format!("channel proxy_url cannot be used: {detail}"),
             )
         })?;
-    let (ok, _usage) = crate::monoize_routing::probe_channel_completion(
+    let outcome = crate::monoize_routing::probe_channel_completion(
         &test_http,
         channel,
         request_timeout_ms,
@@ -902,7 +902,7 @@ pub async fn test_channel(
     .await;
     let latency_ms = started_at.elapsed().as_millis() as u64;
 
-    if ok {
+    if outcome.ok {
         let now = chrono::Utc::now().timestamp();
         let mut health = state.channel_health.lock().await;
         if state.routing_config_revision.load(Ordering::Acquire) == routing_config_revision {
@@ -917,17 +917,11 @@ pub async fn test_channel(
         }
     }
 
-    let error_msg = if ok {
-        None
-    } else {
-        Some("upstream returned non-2xx status or connection failed".to_string())
-    };
-
     Ok(Json(json!({
-        "success": ok,
+        "success": outcome.ok,
         "latency_ms": latency_ms,
         "model": model_name,
-        "error": error_msg,
+        "error": outcome.error,
     })))
 }
 

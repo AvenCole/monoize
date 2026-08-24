@@ -48,10 +48,6 @@ pub(crate) async fn stream_replicate_to_urp_events(
             )
         })?;
 
-        if tx.is_closed() {
-            break;
-        }
-
         mark_stream_ttfb_if_needed(started_at, &runtime_metrics).await;
 
         match ev.event.as_str() {

@@ -30,7 +30,7 @@ A request log row has:
 - `rejected_prediction_tokens: integer?`
 - `provider_multiplier: string?` (canonical positive base-10 decimal string)
 - `charge_nano_usd: string?` (nano-dollar integer string)
-- `status: string` (`"pending"`, `"success"`, or `"error"`)
+- `status: string` (`"pending"`, `"success"`, `"error"`, or `"client_gone"`)
 - `usage_breakdown_json: object?` (normalized per-request usage detail snapshot; persisted as JSON text in DB)
 - `billing_breakdown_json: object?` (per-request pricing and charge breakdown snapshot at billing time; persisted as JSON text in DB)
 - `error_code: string?` (error code for failed requests, e.g. `upstream_error`)
@@ -72,7 +72,7 @@ RL1a. The lifecycle row MUST be accumulated in memory during request processing.
 
 RL1a-1. The server MUST broadcast an in-memory request-log snapshot with `status = "pending"` to the request-log SSE stream as soon as request processing begins. This SSE-only snapshot MUST NOT create or update any database row.
 
-RL1a-2. When provider/channel metadata for an in-flight request becomes known, the server SHOULD broadcast an updated in-memory `pending` snapshot for the same `request_id`. When the terminal `success` or `error` row is later broadcast, clients MUST treat it as replacing any earlier `pending` snapshot with the same `request_id`.
+RL1a-2. When provider/channel metadata for an in-flight request becomes known, the server SHOULD broadcast an updated in-memory `pending` snapshot for the same `request_id`. When the terminal `success`, `client_gone`, or `error` row is later broadcast, clients MUST treat it as replacing any earlier `pending` snapshot with the same `request_id`.
 
 RL1a-3. The server MUST maintain an in-memory map of current SSE-only `pending` snapshots keyed by `request_id`. Creating or updating a `pending` snapshot MUST upsert that key before broadcasting the snapshot. Enqueuing a terminal `success` or `error` row with the same `request_id` MUST remove that key from the map before broadcasting the terminal row. The map is process-local and starts empty after process startup.
 
@@ -80,7 +80,8 @@ RL1a-4. Pending and terminal snapshots MUST include `effective_provider_type`, `
 
 RL1b. The lifecycle row MUST transition from `"pending"` to exactly one terminal status:
 
-- `"success"` when the downstream client received a normal API response payload (including truncated/cutoff completion cases such as `finish_reason = "length"`, and including cases where the downstream client disconnected mid-stream after partial delivery),
+- `"success"` when the downstream client received a normal API response payload (including truncated/cutoff completion cases such as `finish_reason = "length"`),
+- `"client_gone"` when the downstream HTTP client disconnected after admission and the upstream attempt completed as a billable success (see RL1h),
 - `"error"` only when the request ends with an API error response.
 
 RL1b-1. The only exception to RL1b for an already-delivered normal streaming response is a post-response billing settlement failure. That lifecycle row MUST use `status = "error"` with `error_code = "billing_settlement_failed"`. No additional terminal status value is introduced.
@@ -107,7 +108,7 @@ RL1f. On server startup, all request-log rows with `status = "pending"` MUST be 
 
 RL1g. On receipt of SIGINT or SIGTERM, the server MUST initiate graceful shutdown: set the process-local background-shutdown flag, stop accepting new connections, allow in-flight requests to drain, wait for all tracked request-log and active-probe work to finish, flush all write batchers (including the request-log batcher), then transition any remaining `"pending"` rows (legacy) to `"error"` with the same fields as RL1f before process exit.
 
-RL1h. For pass-through streaming requests, if the downstream client disconnects (the response channel closes) before the upstream stream completes, the stream adapter MUST stop consuming upstream events at the next iteration boundary. The request MUST finalize as `status = "success"` with whatever usage was accumulated up to the point of disconnection, and billing MUST execute normally on that accumulated usage.
+RL1h. A downstream client disconnect MUST NOT cancel in-flight upstream work. After admission, Monoize MUST keep the forwarding task alive independently of the downstream HTTP connection: it MUST continue dispatching or consuming the upstream request until one of the L2/L2.1 terminal conditions in `user-billing-and-model-metadata.spec.md` holds. Encoded bytes that can no longer be delivered MAY be discarded. If that upstream attempt completes as a billable success, billing MUST execute normally on the accumulated or terminal upstream usage and the request log MUST finalize as `status = "client_gone"` with `error_code = "client_gone"`, `error_message = "client disconnected"`, and `error_http_status = 499`. If the upstream attempt fails as an API error, the request log MUST finalize as `status = "error"` with that upstream error (not as a local 500). `"client_gone"` is a billable terminal status and MUST NOT be treated as a server fault.
 
 RL1i. When a provider attempt is selected (upstream call succeeds or streaming begins), the provider metadata (`provider_id`, `channel_id`, `upstream_model`, `provider_multiplier`) MUST be captured in memory and included in the terminal INSERT. No intermediate database write is performed.
 
@@ -123,7 +124,12 @@ RL1k-2. One request-log lifecycle owns one preflight `RequestLogReservation` and
 
 RL1k-3. The lifecycle admission and pending snapshot MUST remain present until the winning terminal task has durably enqueued its row. After successful enqueue, `RequestLogBatcher` removes the pending snapshot before the lifecycle removes its admission entry. Admission removal MUST compare lifecycle identity while the map entry is locked. A terminal task from an older lifecycle MUST NOT remove a later lifecycle after canonical key reuse.
 
-RL1k-4. Dropping a request guard while `terminal_scheduled = false` MUST atomically win terminal scheduling and enqueue one `status = "error"` row from the latest pending snapshot. The fallback row MUST set `error_code = "request_finalization_aborted"`, `error_message = "request ended before terminal log scheduling"`, and `error_http_status = 500`. Guard drop MUST NOT silently release the reservation or delete the pending snapshot.
+RL1k-4. Dropping a request guard while `terminal_scheduled = false` MUST atomically win terminal scheduling and enqueue one terminal row from the latest pending snapshot. Guard drop MUST NOT silently release the reservation or delete the pending snapshot. The fallback classification is:
+
+- If the dropping thread is panicking, the row MUST use `status = "error"`, `error_code = "request_finalization_aborted"`, `error_message = "request ended before terminal log scheduling"`, and `error_http_status = 500`.
+- Otherwise the row MUST use `status = "client_gone"`, `error_code = "client_gone"`, `error_message = "client disconnected"`, and `error_http_status = 499`. This path is the last-resort marker when the downstream connection ended before an explicit terminal scheduler ran; it MUST NOT be used when RL1h's detached forwarding task can still complete and bill.
+
+The durable preflight arm written at admission (crash-recovery fallback) MUST keep `status = "error"`, `error_code = "request_finalization_aborted"`, `error_message = "request ended before terminal log scheduling"`, and `error_http_status = 500`, because an abrupt process death is a server interruption, not a client disconnect.
 
 RL2. Requests authenticated only by static config keys MUST NOT generate request logs.
 
@@ -245,7 +251,7 @@ RL19. For active probe logs, `api_key_id` MUST be null and UI token column label
   - `limit: integer` (default 50, clamped to [1, 200])
   - `offset: integer` (default 0, clamped to >= 0)
   - `model: string?` (filter by model name; supports comma-separated list for multi-model OR matching, e.g. `"gpt-4o, gpt-5"`. Each entry is trimmed and matched as a case-insensitive literal substring. `%`, `_`, and `\` in an entry are ordinary characters, not LIKE syntax.)
-  - `status: string?` (filter by status, exact match: `"pending"`, `"success"`, or `"error"`)
+  - `status: string?` (filter by status, exact match: `"pending"`, `"success"`, `"error"`, or `"client_gone"`)
   - `api_key_id: string?` (filter by specific API key ID)
   - `username: string?` (filter by username, exact match via JOIN on `users.username`; only effective when the caller has admin role — non-admin callers ignore this parameter)
   - `search: string?` (case-insensitive literal-substring search across model, upstream_model, request_id, request_ip; `%`, `_`, and `\` are ordinary characters)
@@ -372,7 +378,7 @@ FL1. The logs page MUST use a compact list format (dense table rows) with horizo
 
 FL2. The `created_at` field MUST be displayed as a localized timestamp in format `YYYY-MM-DD HH:mm:ss` using the browser's local timezone.
 
-FL2a. The `created_at` value displayed for a request row MUST remain stable across in-memory `pending` snapshots and the later terminal `success` or `error` row for the same `request_id`. Transitioning from `pending` to terminal state MUST NOT cause the displayed timestamp to jump forward.
+FL2a. The `created_at` value displayed for a request row MUST remain stable across in-memory `pending` snapshots and the later terminal `success`, `client_gone`, or `error` row for the same `request_id`. Transitioning from `pending` to terminal state MUST NOT cause the displayed timestamp to jump forward.
 
 FL3. The model column MUST use the `ModelBadge` component (same as Provider page).
 
@@ -485,9 +491,9 @@ FL27b. If neither the usage-breakdown totals nor the scalar token columns are av
 
 FL27c. When FL27b applies, hovering the Input or Output cell MUST show the standard token-detail tooltip shell with a localized unavailable message rather than an empty numeric breakdown.
 
-FL27d. When a row carries cached-input data (`usage_breakdown_json.input.cached_tokens` present, or scalar `cache_read_tokens` non-null), the visible Input cell MUST render the uncached-input token count as its primary line, prefixed with the localized label `requestLogs.uncachedInput` (e.g. `未缓存输入 19,624`). The uncached value MUST prefer `usage_breakdown_json.input.uncached_tokens` and otherwise fall back to `input_tokens - cache_read_tokens` clamped at zero, falling back to the input total when either operand is unknown. When the cached count is positive, the cell MUST render a secondary, visually subordinate line below the primary line with the localized label `requestLogs.cachedInput` and the formatted cached count (e.g. `缓存输入 47,872`). When no cached-input data exists, the cell MUST render the input total count alone per FL27a. A missing cached value MUST NOT render as `0` or `-`, and the secondary line MUST NOT interfere with the FL27 hover surface.
+FL27d. When a row carries cached-input data (`usage_breakdown_json.input.cached_tokens` present, or scalar `cache_read_tokens` non-null), the visible Input cell MUST render the uncached-input token count as its primary line with no localized uncached-input label (the number alone, e.g. `19,624`). The uncached value MUST prefer `usage_breakdown_json.input.uncached_tokens` and otherwise fall back to `input_tokens - cache_read_tokens` clamped at zero, falling back to the input total when either operand is unknown. When the cached count is positive, the cell MUST render a secondary, visually subordinate line below the primary line with the localized label `requestLogs.cachedInput` and the formatted cached count (e.g. `缓存输入 47,872`). When no cached-input data exists, the cell MUST render the input total count alone per FL27a. A missing cached value MUST NOT render as `0` or `-`, and the secondary line MUST NOT interfere with the FL27 hover surface.
 
-FL28. For rows with `status = "error"`, hovering the request-id/status indicator MUST show error details from `error_code`, `error_message`, and `error_http_status` when present.
+FL28. For rows with `status = "error"` or `status = "client_gone"`, hovering the request-id/status indicator MUST show error details from `error_code`, `error_message`, and `error_http_status` when present.
 
 FL29. When `tried_providers_json` is non-empty, the request-id tooltip MUST additionally display the list of tried providers/channels with their error messages, separated from the main error details by a visual divider.
 
@@ -507,7 +513,10 @@ FL36. In the request-id status indicator, status-color mapping MUST be:
 
 - `pending`: blue lamp,
 - `success`: green lamp,
+- `client_gone`: warning/amber lamp,
 - `error`: red lamp.
+
+Hovering a `client_gone` row MUST show `error_code`, `error_message`, and `error_http_status` the same way FL28 shows those fields for `error` rows. The status filter MUST include a `client_gone` option.
 
 FL37. The logs page MUST auto-refresh the newest page periodically so that terminal rows and aggregate totals refresh without manual reload. While an SSE connection is active, in-progress requests SHOULD first appear as SSE-delivered `pending` rows and later transition to terminal state by replacement. *(See FL49: when SSE is connected, SSE is the primary real-time mechanism; polling becomes fallback only.)*
 

@@ -878,16 +878,12 @@ pub(super) fn resolve_session_affinity_value(
     if !attempt.session_affinity_auto {
         return None;
     }
-    if let Some(value) = attempt
-        .extra_headers
-        .as_ref()
-        .and_then(|headers| {
-            headers.iter().find_map(|(name, value)| {
-                name.eq_ignore_ascii_case("x-session-affinity")
-                    .then_some(value.as_str())
-            })
+    if let Some(value) = attempt.extra_headers.as_ref().and_then(|headers| {
+        headers.iter().find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("x-session-affinity")
+                .then_some(value.as_str())
         })
-    {
+    }) {
         return Some(value.to_string());
     }
     if let Some(client) = attempt.client_session_id.as_deref() {

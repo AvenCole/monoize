@@ -217,6 +217,39 @@ export function AdminDashboardPage() {
 										{tt('adminDashboard.noReplicaToken', 'No replica token configured; there is nothing to monitor.')}
 									</p>
 								)}
+								{data.replica.ingest_enabled && (data.replica.replicas ?? []).length === 0 && (
+									<p className='pt-1 text-xs text-muted-foreground'>
+										{tt('adminDashboard.noReplicasYet', 'No replica has heartbeated yet.')}
+									</p>
+								)}
+								{(data.replica.replicas ?? []).map((replica) => (
+									<div key={replica.id} className='rounded-md border px-3 py-2'>
+										<div className='flex items-center justify-between gap-2'>
+											<span className='truncate font-mono text-xs'>
+												{replica.hostname || replica.id} · {replica.listen}
+											</span>
+											<Badge
+												variant='secondary'
+												className={cn(
+													replica.stale
+														? 'border-warning-border bg-warning-soft text-warning-foreground'
+														: 'border-success bg-success/10 text-success'
+												)}
+											>
+												{replica.stale
+													? tt('adminDashboard.stale', 'Stale')
+													: tt('adminDashboard.live', 'Live')}
+											</Badge>
+										</div>
+										<div className='mt-1 space-y-0.5'>
+											<MetricRow label={tt('adminDashboard.version', 'Version')} value={replica.version} />
+											<MetricRow label={tt('adminDashboard.uptime', 'Uptime')} value={humanizeUptime(replica.uptime_seconds)} />
+											<MetricRow label={tt('adminDashboard.lastSeen', 'Last seen')} value={formatTimestamp(Date.parse(replica.last_seen_at))} />
+											<MetricRow label={tt('adminDashboard.spoolPendingCount', 'Spool pending files')} value={formatNumber(replica.spool_pending_count)} />
+											<MetricRow label={tt('adminDashboard.spoolPendingBytes', 'Spool pending bytes')} value={formatBytes(replica.spool_pending_bytes)} />
+										</div>
+									</div>
+								))}
 							</>
 						)}
 					</CardContent>
@@ -268,9 +301,16 @@ export function AdminDashboardPage() {
 
 				<Card className='h-fit'>
 					<CardHeader className='p-4 pb-2'>
-						<CardTitle className='flex items-center gap-2 text-base'>
-							<HeartPulse className='h-4 w-4 text-primary' />
-							{tt('adminDashboard.channelHealth', 'Model / Channel Health')}
+						<CardTitle className='flex items-center justify-between gap-2 text-base'>
+							<span className='flex items-center gap-2'>
+								<HeartPulse className='h-4 w-4 text-primary' />
+								{tt('adminDashboard.channelHealth', 'Model / Channel Health')}
+							</span>
+							<span className='font-mono text-xs font-normal text-muted-foreground'>
+								{tt('adminDashboard.todaySpend', "Today's spend")}: {formatNanoUsd(data.today?.cost_nano_usd ?? '0', 2)}
+								<span className='mx-1'>·</span>
+								{tt('adminDashboard.todayCalls', "Today's calls")}: {formatNumber(data.today?.calls ?? 0)}
+							</span>
 						</CardTitle>
 					</CardHeader>
 					<CardContent className='p-4 pt-0'>
@@ -285,6 +325,7 @@ export function AdminDashboardPage() {
 											<th className='py-1 pr-2 font-medium'>{tt('adminDashboard.weight', 'Weight')}</th>
 											<th className='py-1 pr-2 font-medium'>{tt('adminDashboard.affinity', 'Affinity')}</th>
 											<th className='py-1 pr-2 font-medium'>{tt('adminDashboard.status', 'Status')}</th>
+											<th className='py-1 pr-2 text-right font-medium'>{tt('adminDashboard.todaySpend', "Today")}</th>
 											<th className='py-1 text-right font-medium'>{tt('adminDashboard.lastProbe', 'Last probe')}</th>
 										</tr>
 									</thead>
@@ -305,7 +346,22 @@ export function AdminDashboardPage() {
 														<span className='text-muted-foreground'>-</span>
 													)}
 												</td>
-												<td className='py-1 pr-2'>{healthBadge(channel, tt)}</td>
+												<td className='py-1 pr-2'>
+													<div className='flex flex-col gap-0.5'>
+														{healthBadge(channel, tt)}
+														{(channel.unhealthy_models ?? []).length > 0 && (
+															<span className='truncate font-mono text-[10px] text-destructive'>
+																{(channel.unhealthy_models ?? []).join(', ')}
+															</span>
+														)}
+													</div>
+												</td>
+												<td className='py-1 pr-2 text-right font-mono'>
+													<div>{formatNanoUsd(channel.today_cost_nano_usd ?? '0', 2)}</div>
+													<div className='text-[10px] text-muted-foreground'>
+														{formatNumber(channel.today_calls ?? 0)} {tt('adminDashboard.calls', 'Calls')}
+													</div>
+												</td>
 												<td className='py-1 text-right font-mono text-muted-foreground'>
 													{formatTimestamp(channel.last_probe_at)}
 												</td>

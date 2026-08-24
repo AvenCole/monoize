@@ -13,7 +13,7 @@ AD-1. `GET /api/dashboard/admin/overview` MUST require an authenticated
 dashboard admin session (`session_helpers::require_admin`). Non-admin requests
 MUST be rejected per the shared admin-session policy.
 
-AD-2. The response MUST be a JSON object with exactly these top-level fields:
+AD-2. The response MUST be a JSON object with exactly these top-level fields (`node`, `replica`, `system`, `today`, `users_ranking`, `channel_health`):
 
 - `node`: object:
   - `role`: `"primary"` or `"replica"` (from the runtime node role);
@@ -35,6 +35,26 @@ AD-2. The response MUST be a JSON object with exactly these top-level fields:
   - `spool_pending_bytes`: integer; 0 on primaries; on replicas the total byte
     size of unsent durable metering spool files, when the replica metering
     pipeline is present.
+  - `replicas`: array of objects, one per replica that has sent at least one
+    heartbeat to this primary (empty on replica nodes and on primaries with
+    ingest disabled). Each object:
+    - `id`: string, the replica process identity;
+    - `hostname`: string;
+    - `listen`: string, the replica listen address;
+    - `version`: string;
+    - `started_at`: RFC 3339;
+    - `last_seen_at`: RFC 3339 of the most recent heartbeat;
+    - `uptime_seconds`: integer;
+    - `spool_pending_count`: integer;
+    - `spool_pending_bytes`: integer;
+    - `stale`: boolean; true when `now - last_seen_at` is greater than
+      `3 * MONOIZE_METERING_SHIP_INTERVAL_SECONDS`.
+- `today`: object:
+  - `calls`: integer COUNT of request-log rows with
+    `created_at_unix_ms >= UTC calendar-day start` (same instant as
+    `GET /api/dashboard/analytics` `today_calls`);
+  - `cost_nano_usd`: nano-dollar integer string SUM of canonical in-range
+    `charge_nano_usd` (same aggregation as analytics `today_cost_nano_usd`).
 - `system`: object:
   - `pending_request_logs`: integer count of in-memory pending request-log
     snapshots;
@@ -59,11 +79,19 @@ AD-2. The response MUST be a JSON object with exactly these top-level fields:
   - `enabled`: boolean;
   - `weight`: integer;
   - `session_affinity_auto`: boolean;
-  - `healthy`: boolean (true when no health state is tracked);
+  - `healthy`: boolean (true when no health state is tracked for the channel
+    id or any `{channel_id}::{model}` key);
   - `last_success_at`: unix-milliseconds integer or null;
   - `cooldown_until`: unix-milliseconds integer or null;
   - `probe_success_count`: integer;
-  - `last_probe_at`: unix-milliseconds integer or null.
+  - `last_probe_at`: unix-milliseconds integer or null;
+  - `unhealthy_models`: array of model id strings whose per-model health key
+    is unhealthy or in cooldown; empty when `per_model_circuit_break` is
+    false or every model key is healthy;
+  - `today_calls`: integer COUNT of today's request-log rows for this
+    `channel_id` (UTC calendar-day start, same window as `today`);
+  - `today_cost_nano_usd`: nano-dollar integer string SUM of those rows'
+    canonical `charge_nano_usd`.
 
 AD-3. The endpoint MUST NOT expose credentials: no channel API keys, no
 provider API keys, no database passwords, no replica tokens.
@@ -98,14 +126,22 @@ endpoint returns them.
 
 ADF-5. Model/channel health card MUST render one row per channel with columns:
 provider name, channel name, enabled, weight, auto session affinity, health
-status (healthy/unhealthy/cooling-down), and last probe time. Health status
-MUST derive from `healthy` and `cooldown_until`: a channel with
-`cooldown_until > now` renders as cooling-down regardless of `healthy`.
+status (healthy/unhealthy/cooling-down), last probe time, today's calls, and
+today's cost formatted as USD with 2 fractional digits. Health status MUST
+derive from `healthy` and `cooldown_until`: a channel with
+`cooldown_until > now` renders as cooling-down regardless of `healthy`. When
+`unhealthy_models` is non-empty, the status cell MUST list those model ids.
+The card header MUST also show the process-wide `today.cost_nano_usd` and
+`today.calls` totals.
 
 ADF-6. Replica status card MUST render the node role, ingest-enabled state,
 spool pending count, and spool pending bytes. When the node is a primary and
 ingest is disabled, the card MUST state that no replica token is configured
-and there is nothing to monitor.
+and there is nothing to monitor. When ingest is enabled, the card MUST list
+every object in `replica.replicas` with hostname, listen address, version,
+uptime, last-seen time, spool pending files/bytes, and a stale/live badge.
+An enabled ingest with an empty `replicas` array MUST state that no replica
+has heartbeated yet.
 
 ADF-7. Data fetching MUST use SWR with a 10-second refresh interval, skeleton
 fallbacks while loading, and an error state with retry on failure. Mutations

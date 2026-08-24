@@ -184,6 +184,8 @@ pub struct AppState {
     pub metering: Option<Arc<crate::replica::metering::ReplicaMetering>>,
     /// SHA-256 digest of MONOIZE_REPLICA_TOKEN on primaries with ingest enabled.
     pub metering_token_digest: Option<[u8; 32]>,
+    /// Process-local replica heartbeats observed on the primary ingest path.
+    pub replica_heartbeats: Arc<DashMap<String, crate::replica::metering::ReplicaHeartbeatRecord>>,
     pub metrics: PrometheusHandle,
     pub user_store: UserStore,
     pub settings_store: SettingsStore,
@@ -688,7 +690,7 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                         break 'scheduler;
                     }
                     let probe_started_at = std::time::Instant::now();
-                    let (ok, usage_snapshot) = probe_channel_completion(
+                    let probe_outcome = probe_channel_completion(
                         &probe_http,
                         &channel,
                         rt_snap.request_timeout_ms,
@@ -697,6 +699,8 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
                         &provider.api_type_overrides,
                     )
                     .await;
+                    let ok = probe_outcome.ok;
+                    let usage_snapshot = probe_outcome.usage;
                     if !ok {
                         if let Err(error) = probe_user_store
                             .cancel_terminal_request_log(&request_log_reservation)
@@ -833,7 +837,13 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
     });
 
     let node = Arc::new(runtime.node.clone());
+    let started_at = chrono::Utc::now();
     let metering = if is_replica {
+        let hostname = std::env::var("HOSTNAME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
         let metering = crate::replica::metering::ReplicaMetering::new(
             runtime.node.metering_spool_dir.clone(),
             runtime.node.metering_spool_max_bytes,
@@ -841,6 +851,15 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
             runtime.node.replica_token.as_deref().unwrap_or(""),
             runtime.node.metering_ship_batch_max_entries,
         )
+        .map(|metering| {
+            metering.with_heartbeat_source(crate::replica::metering::ReplicaHeartbeatSource {
+                id: uuid::Uuid::new_v4().to_string(),
+                hostname,
+                listen: runtime.listen.clone(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                started_at: started_at.to_rfc3339(),
+            })
+        })
         .map_err(|err| {
             AppError::new(
                 axum::http::StatusCode::BAD_REQUEST,
@@ -894,7 +913,7 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
 
     Ok(AppState {
         runtime: Arc::new(runtime),
-        started_at: chrono::Utc::now(),
+        started_at,
         auth,
         http,
         http_clients,
@@ -902,6 +921,7 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         db_pool: db.clone(),
         metering,
         metering_token_digest,
+        replica_heartbeats: Arc::new(DashMap::new()),
         metrics,
         user_store,
         settings_store,

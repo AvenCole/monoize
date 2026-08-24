@@ -268,6 +268,15 @@ CP-DEL-2. After delete completes, in-flight work created before deletion MUST NO
 - On success, when no candidate health entry exists and capacity remains, insert and reset only the base Channel health key. When capacity is full, do not insert an entry.
 - A successful test MUST NOT inspect or mutate health-map keys outside the candidate set. Its health-map work MUST be `O(channel.models.length)` and independent of the number of global health entries.
 - Response: `{ "success": boolean, "latency_ms": integer, "model": string, "error": string | null }`
+- On probe failure, `error` MUST identify the upstream outcome rather than a generic sentence:
+  - HTTP non-2xx: `upstream returned {status} {reason}: {body}` where `{status}` is the
+    numeric status (e.g. `500`, `503`), `{reason}` is the canonical reason phrase when
+    known (e.g. `Service Unavailable`), and `{body}` is the upstream response body
+    truncated to at most 512 bytes. An empty body omits the `: {body}` suffix.
+  - Transport/connection failure: `connection failed: {detail}` using the underlying
+    client error text.
+  - `error` MUST NOT be the undifferentiated string
+    `upstream returned non-2xx status or connection failed`.
 
 ## 4. Security
 

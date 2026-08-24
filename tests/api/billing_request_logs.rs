@@ -237,7 +237,7 @@ async fn chat_streaming_downstream_disconnect_still_drains_final_usage_and_bills
                 100,
                 0,
                 Some("gpt-5-mini-chat"),
-                Some("success"),
+                Some("client_gone"),
                 None,
                 None,
                 None,
@@ -251,6 +251,8 @@ async fn chat_streaming_downstream_disconnect_still_drains_final_usage_and_bills
                 && log.tokens.input == Some(12)
                 && log.tokens.output == Some(8)
                 && log.billing.charge_nano_usd.as_deref() == Some("20000")
+                && log.status == "client_gone"
+                && log.error.code.as_deref() == Some("client_gone")
         });
         if matched.is_some() {
             break;

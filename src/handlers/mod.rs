@@ -24,13 +24,15 @@ use crate::transforms::{self, Phase, TransformRuleConfig};
 use crate::upstream::{self, UpstreamCallError, UpstreamErrorKind};
 use crate::urp;
 use crate::users::BillingErrorKind;
-use crate::users::{InsertRequestLog, REQUEST_LOG_STATUS_ERROR, REQUEST_LOG_STATUS_SUCCESS};
+use crate::users::{
+    InsertRequestLog, REQUEST_LOG_STATUS_CLIENT_GONE, REQUEST_LOG_STATUS_ERROR,
+    REQUEST_LOG_STATUS_SUCCESS,
+};
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
-use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -117,6 +119,34 @@ fn api_stream_keep_alive() -> KeepAlive {
     KeepAlive::new()
         .interval(Duration::from_secs(15))
         .text("heartbeat")
+}
+
+struct DownstreamGone(std::sync::Arc<AdmittedRequestTaskState>);
+
+impl Drop for DownstreamGone {
+    fn drop(&mut self) {
+        self.0.mark_client_gone();
+    }
+}
+
+async fn join_while_client_present<T: Send + 'static>(
+    handle: tokio::task::JoinHandle<T>,
+    watch: DownstreamGone,
+) -> T {
+    match handle.await {
+        Ok(value) => {
+            std::mem::forget(watch);
+            value
+        }
+        Err(err) if err.is_panic() => {
+            std::mem::forget(watch);
+            std::panic::resume_unwind(err.into_panic())
+        }
+        Err(_) => {
+            std::mem::forget(watch);
+            panic!("request worker was cancelled")
+        }
+    }
 }
 
 fn messages_stream_keep_alive() -> KeepAlive {
@@ -278,18 +308,28 @@ pub async fn create_response(
             .into_response());
     }
 
-    let value = forward_nonstream_typed(
-        &state,
-        &auth,
-        req,
-        max_multiplier,
-        DownstreamProtocol::Responses,
-        request_id,
-        request_ip,
-        extract_client_session_id(&headers),
-        capture,
-    )
-    .await?;
+    let session_id = extract_client_session_id(&headers);
+    let task_state = std::sync::Arc::new(AdmittedRequestTaskState::new(std::time::Instant::now()));
+    let watch = DownstreamGone(task_state.clone());
+    let handle = tokio::spawn({
+        let task_state = task_state.clone();
+        async move {
+            forward_nonstream_typed_with_task_state(
+                &state,
+                &auth,
+                req,
+                max_multiplier,
+                DownstreamProtocol::Responses,
+                request_id,
+                request_ip,
+                session_id,
+                capture,
+                Some(&task_state),
+            )
+            .await
+        }
+    });
+    let value = join_while_client_present(handle, watch).await?;
     Ok(Json(value).into_response())
 }
 
@@ -340,18 +380,28 @@ pub async fn create_chat_completions(
             .keep_alive(api_stream_keep_alive())
             .into_response());
     }
-    let value = forward_nonstream_typed(
-        &state,
-        &auth,
-        req,
-        max_multiplier,
-        DownstreamProtocol::ChatCompletions,
-        request_id,
-        request_ip,
-        extract_client_session_id(&headers),
-        capture,
-    )
-    .await?;
+    let session_id = extract_client_session_id(&headers);
+    let task_state = std::sync::Arc::new(AdmittedRequestTaskState::new(std::time::Instant::now()));
+    let watch = DownstreamGone(task_state.clone());
+    let handle = tokio::spawn({
+        let task_state = task_state.clone();
+        async move {
+            forward_nonstream_typed_with_task_state(
+                &state,
+                &auth,
+                req,
+                max_multiplier,
+                DownstreamProtocol::ChatCompletions,
+                request_id,
+                request_ip,
+                session_id,
+                capture,
+                Some(&task_state),
+            )
+            .await
+        }
+    });
+    let value = join_while_client_present(handle, watch).await?;
     Ok(Json(value).into_response())
 }
 
@@ -414,18 +464,28 @@ async fn create_messages_inner(
             .keep_alive(messages_stream_keep_alive())
             .into_response());
     }
-    let value = forward_nonstream_typed(
-        &state,
-        &auth,
-        req,
-        max_multiplier,
-        DownstreamProtocol::AnthropicMessages,
-        request_id,
-        request_ip,
-        extract_client_session_id(&headers),
-        capture,
-    )
-    .await?;
+    let session_id = extract_client_session_id(&headers);
+    let task_state = std::sync::Arc::new(AdmittedRequestTaskState::new(std::time::Instant::now()));
+    let watch = DownstreamGone(task_state.clone());
+    let handle = tokio::spawn({
+        let task_state = task_state.clone();
+        async move {
+            forward_nonstream_typed_with_task_state(
+                &state,
+                &auth,
+                req,
+                max_multiplier,
+                DownstreamProtocol::AnthropicMessages,
+                request_id,
+                request_ip,
+                session_id,
+                capture,
+                Some(&task_state),
+            )
+            .await
+        }
+    });
+    let value = join_while_client_present(handle, watch).await?;
     Ok(Json(value).into_response())
 }
 
@@ -681,6 +741,7 @@ pub async fn create_embeddings(
                         None,
                         None,
                         tried_providers,
+                        false,
                     );
 
                     return Ok(Json(value).into_response());

@@ -41,7 +41,7 @@ impl Drop for PendingRequestLogGuard {
     }
 }
 
-fn guard_fallback_terminal_log(
+fn aborted_fallback_terminal_log(
     mut log: InsertRequestLog,
     request_id: &str,
     duration_ms: u64,
@@ -55,6 +55,44 @@ fn guard_fallback_terminal_log(
     log.error_http_status = Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
     log.duration_ms = Some(duration_ms);
     log
+}
+
+fn client_gone_fallback_terminal_log(
+    mut log: InsertRequestLog,
+    request_id: &str,
+    duration_ms: u64,
+) -> InsertRequestLog {
+    log.request_id = Some(request_id.to_string());
+    log.status = REQUEST_LOG_STATUS_CLIENT_GONE.to_string();
+    log.charge_nano_usd = None;
+    log.billing_breakdown_json = None;
+    log.error_code = Some("client_gone".to_string());
+    log.error_message = Some("client disconnected".to_string());
+    log.error_http_status = Some(499);
+    log.duration_ms = Some(duration_ms);
+    log
+}
+
+fn guard_fallback_terminal_log(
+    log: InsertRequestLog,
+    request_id: &str,
+    duration_ms: u64,
+) -> InsertRequestLog {
+    if std::thread::panicking() {
+        aborted_fallback_terminal_log(log, request_id, duration_ms)
+    } else {
+        client_gone_fallback_terminal_log(log, request_id, duration_ms)
+    }
+}
+
+fn apply_client_gone_if_needed(log: &mut InsertRequestLog, client_gone: bool) {
+    if !client_gone || log.status != REQUEST_LOG_STATUS_SUCCESS {
+        return;
+    }
+    log.status = REQUEST_LOG_STATUS_CLIENT_GONE.to_string();
+    log.error_code = Some("client_gone".to_string());
+    log.error_message = Some("client disconnected".to_string());
+    log.error_http_status = Some(499);
 }
 
 struct ClaimedRequestLogTerminal {
@@ -315,7 +353,7 @@ pub(super) async fn insert_pending_request_log(
         .get(&request_id)
         .map(|entry| entry.value().clone())
         .expect("pending request-log snapshot exists after broadcast");
-    let durable_fallback = guard_fallback_terminal_log(
+    let durable_fallback = aborted_fallback_terminal_log(
         fallback_log.clone(),
         &request_id,
         started_at.elapsed().as_millis() as u64,
@@ -410,6 +448,7 @@ pub(super) fn spawn_request_log(
     stream_terminal_diagnostics: Option<StreamTerminalDiagnostics>,
     reasoning_effort: Option<String>,
     tried_providers: Vec<TriedProvider>,
+    client_gone: bool,
 ) {
     let Some(user_id) = auth.user_id.clone() else {
         return;
@@ -474,7 +513,7 @@ pub(super) fn spawn_request_log(
             "stream request completed without usage snapshot"
         );
     }
-    let log = InsertRequestLog {
+    let mut log = InsertRequestLog {
         request_id,
         user_id,
         api_key_id,
@@ -548,6 +587,7 @@ pub(super) fn spawn_request_log(
         session_affinity_value,
         created_at,
     };
+    apply_client_gone_if_needed(&mut log, client_gone);
     spawn_claimed_terminal_log(
         state.user_store.clone(),
         state.request_log_admissions.clone(),
@@ -956,17 +996,26 @@ mod admission_tests {
     }
 
     #[test]
-    fn guard_fallback_builds_explicit_error_terminal() {
+    fn guard_fallback_builds_client_gone_when_not_panicking() {
         let pending = pending_log("original");
         let terminal = guard_fallback_terminal_log(pending, "canonical", 42);
         assert_eq!(terminal.request_id.as_deref(), Some("canonical"));
+        assert_eq!(terminal.status, REQUEST_LOG_STATUS_CLIENT_GONE);
+        assert_eq!(terminal.error_code.as_deref(), Some("client_gone"));
+        assert_eq!(terminal.error_http_status, Some(499));
+        assert_eq!(terminal.duration_ms, Some(42));
+    }
+
+    #[test]
+    fn admission_arm_fallback_remains_server_abort() {
+        let pending = pending_log("original");
+        let terminal = aborted_fallback_terminal_log(pending, "canonical", 42);
         assert_eq!(terminal.status, REQUEST_LOG_STATUS_ERROR);
         assert_eq!(
             terminal.error_code.as_deref(),
             Some("request_finalization_aborted")
         );
         assert_eq!(terminal.error_http_status, Some(500));
-        assert_eq!(terminal.duration_ms, Some(42));
     }
 
     #[tokio::test]

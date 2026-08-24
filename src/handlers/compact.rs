@@ -246,6 +246,7 @@ pub async fn compact_response(
                         None,
                         None,
                         tried_providers,
+                        false,
                     );
                     if let Some(session) = capture.session.as_ref() {
                         session.persist_with_result(usage.as_ref(), false).await;

@@ -59,8 +59,13 @@ impl MigrationTrait for Migration {
         if !matches!(backend, DbBackend::Sqlite | DbBackend::Postgres) {
             return Ok(());
         }
-        add_column_if_missing(manager.get_connection(), backend, "session_affinity_auto", "INTEGER")
-            .await
+        add_column_if_missing(
+            manager.get_connection(),
+            backend,
+            "session_affinity_auto",
+            "INTEGER",
+        )
+        .await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {

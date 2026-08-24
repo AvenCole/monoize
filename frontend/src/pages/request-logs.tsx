@@ -555,6 +555,9 @@ export function RequestLogsPage() {
 										<SelectItem value='success'>
 											{t('requestLogs.success')}
 										</SelectItem>
+										<SelectItem value='client_gone'>
+											{t('requestLogs.clientGone')}
+										</SelectItem>
 										<SelectItem value='error'>{t('requestLogs.error')}</SelectItem>
 									</SelectContent>
 								</Select>

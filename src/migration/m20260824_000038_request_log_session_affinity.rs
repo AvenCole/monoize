@@ -12,7 +12,8 @@ pub struct Migration;
 const UP_COLUMN_SQLITE: &str = "ALTER TABLE request_logs ADD COLUMN session_affinity_value TEXT";
 const UP_COLUMN_PG: &str = "ALTER TABLE request_logs ADD COLUMN session_affinity_value TEXT";
 const DOWN_COLUMN_SQLITE: &str = "ALTER TABLE request_logs DROP COLUMN session_affinity_value";
-const DOWN_COLUMN_PG: &str = "ALTER TABLE request_logs DROP COLUMN IF EXISTS session_affinity_value";
+const DOWN_COLUMN_PG: &str =
+    "ALTER TABLE request_logs DROP COLUMN IF EXISTS session_affinity_value";
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {

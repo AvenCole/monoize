@@ -229,7 +229,7 @@ L2.3. A billable successful response MUST NOT silently become free because autho
 
 L2.4. A pass-through stream has already committed its HTTP status before post-response settlement. A settlement storage or pricing error therefore MUST be recorded as a billing failure and MUST NOT be replaced with a successful zero-charge computation. This rule does not permit an insufficient-balance error during settlement because L4 requires admitted requests to settle into negative balances.
 
-L2a. Requests that return a normal model response payload (including truncated/cutoff completions such as `finish_reason = "length"`) MUST be treated as billable-success requests, not failed requests.
+L2a. Requests that return a normal model response payload (including truncated/cutoff completions such as `finish_reason = "length"`) MUST be treated as billable-success requests, not failed requests. A request whose downstream client disconnected after admission but whose upstream attempt still produced that normal payload MUST still be billed; its request-log status is `"client_gone"` per `request-logs.spec.md` RL1h, which is not an API-error failure under L2b.
 
 L2b. Requests that terminate as API errors (`4xx`/`5xx` error response) MUST NOT be billed.
 

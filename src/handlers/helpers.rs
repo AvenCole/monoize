@@ -91,8 +91,7 @@ pub(super) fn extract_request_id(headers: &HeaderMap) -> Option<String> {
 pub(super) fn extract_client_session_id(headers: &HeaderMap) -> Option<String> {
     for name in ["session_id", "x-session-affinity"] {
         if let Some(raw) = headers.get(name).and_then(|value| value.to_str().ok()) {
-            let sanitized =
-                crate::handlers::routing::sanitize_session_affinity(raw);
+            let sanitized = crate::handlers::routing::sanitize_session_affinity(raw);
             if !sanitized.is_empty() {
                 return Some(sanitized);
             }

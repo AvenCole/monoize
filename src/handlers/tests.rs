@@ -2525,9 +2525,11 @@ fn session_affinity_sanitizer_strips_controls_and_truncates() {
     let sanitized = sanitize_session_affinity(&dirty);
     assert!(sanitized.starts_with("ok"));
     assert_eq!(sanitized.len(), 128);
-    assert!(sanitized
-        .chars()
-        .all(|c| ('\u{20}'..='\u{7e}').contains(&c)));
+    assert!(
+        sanitized
+            .chars()
+            .all(|c| ('\u{20}'..='\u{7e}').contains(&c))
+    );
 
     assert_eq!(sanitize_session_affinity("\u{7}\u{7}"), "");
 }
@@ -2986,14 +2988,18 @@ fn session_affinity_is_stable_within_conversation_and_differs_across_sessions() 
     });
     let grown = {
         let mut body = base.clone();
-        body["messages"].as_array_mut().unwrap().push(
-            serde_json::json!({ "role": "assistant", "content": "working" })
-        );
+        body["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "role": "assistant", "content": "working" }));
         body
     };
     let first = routing::derive_session_affinity(&base).unwrap();
     let second = routing::derive_session_affinity(&grown).unwrap();
-    assert_eq!(first, second, "appending messages must keep affinity stable");
+    assert_eq!(
+        first, second,
+        "appending messages must keep affinity stable"
+    );
 
     let other_session = serde_json::json!({
         "model": "cf-model",
@@ -3003,7 +3009,10 @@ fn session_affinity_is_stable_within_conversation_and_differs_across_sessions() 
         ]
     });
     let other = routing::derive_session_affinity(&other_session).unwrap();
-    assert_ne!(first, other, "distinct sessions must derive distinct affinities");
+    assert_ne!(
+        first, other,
+        "distinct sessions must derive distinct affinities"
+    );
 }
 
 #[test]

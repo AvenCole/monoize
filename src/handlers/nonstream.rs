@@ -41,6 +41,7 @@ pub(super) struct AdmittedRequestTaskState {
     started_at: std::time::Instant,
     admitted: std::sync::atomic::AtomicBool,
     is_stream: std::sync::atomic::AtomicBool,
+    client_gone: std::sync::atomic::AtomicBool,
     attempt: std::sync::Mutex<Option<MonoizeAttempt>>,
     pending_guard: std::sync::Mutex<Option<PendingRequestLogGuard>>,
 }
@@ -51,9 +52,19 @@ impl AdmittedRequestTaskState {
             started_at,
             admitted: std::sync::atomic::AtomicBool::new(false),
             is_stream: std::sync::atomic::AtomicBool::new(false),
+            client_gone: std::sync::atomic::AtomicBool::new(false),
             attempt: std::sync::Mutex::new(None),
             pending_guard: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(super) fn mark_client_gone(&self) {
+        self.client_gone
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn client_gone(&self) -> bool {
+        self.client_gone.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(super) fn set_stream(&self, is_stream: bool) {
@@ -93,6 +104,10 @@ impl AdmittedRequestTaskState {
     }
 }
 
+fn client_gone_flag(task_state: Option<&AdmittedRequestTaskState>) -> bool {
+    task_state.is_some_and(AdmittedRequestTaskState::client_gone)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn finish_nonstream_error(
     state: &AppState,
@@ -129,6 +144,7 @@ async fn finish_nonstream_error(
     error
 }
 
+#[allow(dead_code)]
 pub(super) async fn execute_nonstream_typed(
     state: &AppState,
     auth: &crate::auth::AuthResult,
@@ -139,6 +155,33 @@ pub(super) async fn execute_nonstream_typed(
     request_ip: Option<String>,
     client_session_id: Option<String>,
     capture: RequestCaptureContext,
+) -> AppResult<(urp::UrpResponse, String)> {
+    execute_nonstream_typed_owned(
+        state,
+        auth,
+        req,
+        max_multiplier,
+        downstream,
+        request_id,
+        request_ip,
+        client_session_id,
+        capture,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn execute_nonstream_typed_owned(
+    state: &AppState,
+    auth: &crate::auth::AuthResult,
+    req: urp::UrpRequest,
+    max_multiplier: Option<Multiplier>,
+    downstream: DownstreamProtocol,
+    request_id: Option<String>,
+    request_ip: Option<String>,
+    client_session_id: Option<String>,
+    capture: RequestCaptureContext,
+    task_state: Option<&AdmittedRequestTaskState>,
 ) -> AppResult<(urp::UrpResponse, String)> {
     execute_nonstream_typed_with_validator(
         state,
@@ -151,7 +194,7 @@ pub(super) async fn execute_nonstream_typed(
         client_session_id,
         capture,
         None,
-        None,
+        task_state,
     )
     .await
 }
@@ -816,6 +859,7 @@ pub(super) async fn execute_nonstream_typed_with_validator(
                         None,
                         req.reasoning.as_ref().and_then(|r| r.effort.clone()),
                         tried_providers,
+                        client_gone_flag(task_state),
                     );
                     if let Some(session) = capture.session.as_ref() {
                         session
@@ -1027,6 +1071,7 @@ async fn collect_streamed_upstream_response(
     })
 }
 
+#[allow(dead_code)]
 pub(super) async fn forward_nonstream_typed(
     state: &AppState,
     auth: &crate::auth::AuthResult,
@@ -1038,7 +1083,7 @@ pub(super) async fn forward_nonstream_typed(
     client_session_id: Option<String>,
     capture: RequestCaptureContext,
 ) -> AppResult<Value> {
-    let (resp, logical_model) = execute_nonstream_typed(
+    forward_nonstream_typed_with_task_state(
         state,
         auth,
         req,
@@ -1048,6 +1093,34 @@ pub(super) async fn forward_nonstream_typed(
         request_ip,
         client_session_id,
         capture,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn forward_nonstream_typed_with_task_state(
+    state: &AppState,
+    auth: &crate::auth::AuthResult,
+    req: urp::UrpRequest,
+    max_multiplier: Option<Multiplier>,
+    downstream: DownstreamProtocol,
+    request_id: Option<String>,
+    request_ip: Option<String>,
+    client_session_id: Option<String>,
+    capture: RequestCaptureContext,
+    task_state: Option<&AdmittedRequestTaskState>,
+) -> AppResult<Value> {
+    let (resp, logical_model) = execute_nonstream_typed_owned(
+        state,
+        auth,
+        req,
+        max_multiplier,
+        downstream,
+        request_id,
+        request_ip,
+        client_session_id,
+        capture,
+        task_state,
     )
     .await?;
     Ok(encode_response_for_downstream(

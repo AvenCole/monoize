@@ -46,10 +46,6 @@ pub(crate) async fn stream_image_to_urp_events(
                 err.to_string(),
             )
         })?;
-        if tx.is_closed() {
-            break;
-        }
-
         mark_stream_ttfb_if_needed(started_at, &runtime_metrics).await;
         if ev.data.trim() == "[DONE]" {
             record_stream_done_sentinel(&runtime_metrics).await;

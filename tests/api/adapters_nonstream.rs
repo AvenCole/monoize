@@ -426,9 +426,10 @@ async fn auto_session_affinity_is_stable_per_conversation_and_distinct_across_se
         "max_completion_tokens": 32
     });
     let mut turn_two = turn_one.clone();
-    turn_two["messages"].as_array_mut().unwrap().push(
-        serde_json::json!({ "role": "assistant", "content": "partial answer" }),
-    );
+    turn_two["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({ "role": "assistant", "content": "partial answer" }));
 
     for body in [&turn_one, &turn_two] {
         let (status, resp) = json_post(&ctx, "/v1/chat/completions", body.clone()).await;

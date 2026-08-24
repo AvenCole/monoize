@@ -1,6 +1,7 @@
 use super::*;
 use crate::urp::stream_decode::stream_upstream_to_urp_events;
 use crate::urp::stream_encode::encode_urp_stream;
+use futures_util::StreamExt;
 
 type ForwardEventStream = futures_util::stream::Map<
     tokio_stream::wrappers::ReceiverStream<Event>,
@@ -41,9 +42,7 @@ async fn retain_decoded_terminal_output(
         if let urp::UrpStreamEvent::ResponseDone { output, .. } = &event {
             *terminal_output.lock().await = output.clone();
         }
-        if tx.send(event).await.is_err() {
-            break;
-        }
+        let _ = tx.send(event).await;
     }
     Ok(())
 }
@@ -144,14 +143,29 @@ where
     F: std::future::Future<Output = AppResult<S>> + Send + 'static,
     S: futures_util::Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static,
 {
-    futures_util::stream::once(async move {
+    let (tx, rx) = mpsc::channel::<Event>(64);
+    tokio::spawn(async move {
         match forwarding.await {
-            Ok(stream) => stream.boxed(),
-            Err(err) => prestream_error_stream(downstream, err).boxed(),
+            Ok(stream) => {
+                tokio::pin!(stream);
+                while let Some(Ok(event)) = stream.next().await {
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(err) => {
+                let err_stream = prestream_error_stream(downstream, err);
+                tokio::pin!(err_stream);
+                while let Some(Ok(event)) = err_stream.next().await {
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            }
         }
-    })
-    .flatten()
-    .boxed()
+    });
+    receiver_event_stream(rx).boxed()
 }
 
 pub(super) async fn forward_stream_typed(
@@ -609,6 +623,7 @@ pub(super) async fn forward_stream_typed(
                                             None,
                                             reasoning_effort_for_log,
                                             tried_providers_for_log,
+                                            tx_err.is_closed(),
                                         ),
                                         Err(err) => {
                                             tracing::error!(
@@ -1299,6 +1314,7 @@ pub(super) async fn forward_stream_typed(
                             Some(terminal_diagnostics),
                             reasoning_effort_for_log,
                             tried_providers_for_log,
+                            tx_err.is_closed(),
                         );
 
                         if let Some(session) = capture_session.as_ref() {

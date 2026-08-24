@@ -382,7 +382,6 @@ pub(crate) async fn stream_messages_to_urp_events(
         };
         if tx.is_closed() {
             downstream_closed = true;
-            break;
         }
         mark_stream_ttfb_if_needed(started_at, &runtime_metrics).await;
         if ev.data.trim() == "[DONE]" {
@@ -521,34 +520,34 @@ pub(crate) async fn stream_messages_to_urp_events(
             .saw_terminal_delta
             .then_some("message_delta_stream_end")
     });
-    if !downstream_closed {
-        if let Some(terminal_event) = terminal_event {
-            let output_nodes = ordered_completed_nodes(&state);
-            crate::handlers::usage::increment_estimated_output_tokens(
-                &runtime_metrics,
-                estimated_output_chars(&output_nodes),
-            )
-            .await;
-            record_stream_terminal_event(
-                &runtime_metrics,
-                terminal_event,
-                state.finish_reason.as_ref().map(finish_reason_name),
-            )
-            .await;
-            if let Some(event) = take_response_done(&mut state, &response_extra) {
-                let _ = tx.send(event).await;
-            }
-        } else {
-            emit_messages_terminal_protocol_error(
-                &tx,
-                &runtime_metrics,
-                "upstream_stream_missing_terminal",
-                "upstream Messages stream ended without message_stop, [DONE], or a non-null stop_reason"
-                    .to_string(),
-                HashMap::new(),
-            )
-            .await;
+    if let Some(terminal_event) = terminal_event {
+        let output_nodes = ordered_completed_nodes(&state);
+        crate::handlers::usage::increment_estimated_output_tokens(
+            &runtime_metrics,
+            estimated_output_chars(&output_nodes),
+        )
+        .await;
+        record_stream_terminal_event(
+            &runtime_metrics,
+            terminal_event,
+            state.finish_reason.as_ref().map(finish_reason_name),
+        )
+        .await;
+        if let Some(event) = take_response_done(&mut state, &response_extra)
+            && !downstream_closed
+        {
+            let _ = tx.send(event).await;
         }
+    } else if !downstream_closed {
+        emit_messages_terminal_protocol_error(
+            &tx,
+            &runtime_metrics,
+            "upstream_stream_missing_terminal",
+            "upstream Messages stream ended without message_stop, [DONE], or a non-null stop_reason"
+                .to_string(),
+            HashMap::new(),
+        )
+        .await;
     }
 
     Ok(())

@@ -75,6 +75,7 @@ async fn ingest_applies_balance_delta_idempotently() {
         .expect("seed balance");
 
     let batch = monoize::replica::metering::MeteringBatch {
+        replica: None,
         request_logs: vec![],
         last_used: vec![],
         balance_deltas: vec![delta("request_charge", &user.id, None, 1_000_000_000)],
@@ -139,6 +140,7 @@ async fn ingest_allows_negative_result_and_counts_unlimited_as_applied_without_u
 
     // T3 negative result allowed on the limited user.
     let batch = monoize::replica::metering::MeteringBatch {
+        replica: None,
         request_logs: vec![],
         last_used: vec![],
         balance_deltas: vec![delta("request_charge", &limited.id, None, 100)],
@@ -157,6 +159,7 @@ async fn ingest_allows_negative_result_and_counts_unlimited_as_applied_without_u
 
     // T3 unlimited owner: ledger event recorded but balance untouched.
     let batch_u = monoize::replica::metering::MeteringBatch {
+        replica: None,
         request_logs: vec![],
         last_used: vec![],
         balance_deltas: vec![delta("request_charge", &unlimited.id, None, 77)],
@@ -510,6 +513,7 @@ async fn t3_ingest_rejects_oversized_batch_without_apply() {
     state.metering_token_digest = Some(monoize::replica::metering::sha256_hex_lower("tok"));
     let app = monoize::app::build_app(state);
     let batch = monoize::replica::metering::MeteringBatch {
+        replica: None,
         request_logs: vec![],
         last_used: (0..2001)
             .map(|i| monoize::replica::metering::LastUsedPair {
@@ -722,6 +726,7 @@ async fn t8_postgres_ingest_parity_when_configured() {
         .await
         .expect("seed");
     let batch = monoize::replica::metering::MeteringBatch {
+        replica: None,
         request_logs: vec![],
         last_used: vec![],
         balance_deltas: vec![delta("request_charge", &user.id, None, 1_000_000_000)],

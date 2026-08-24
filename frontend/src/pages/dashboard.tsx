@@ -195,7 +195,7 @@ export function DashboardPage() {
     let ttfbCount = 0;
 
     for (const log of rawLogs) {
-      if (log.status === "success") successCount++;
+      if (log.status === "success" || log.status === "client_gone") successCount++;
       const ttfbMs = Number(log.timing?.ttfb_ms);
       if (Number.isFinite(ttfbMs) && ttfbMs > 0) {
         ttfbSum += ttfbMs;

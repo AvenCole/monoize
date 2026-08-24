@@ -45,8 +45,31 @@ pub struct LastUsedPair {
     pub last_used_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicaHeartbeat {
+    pub id: String,
+    pub hostname: String,
+    pub listen: String,
+    pub version: String,
+    pub started_at: String,
+    #[serde(default)]
+    pub uptime_seconds: u64,
+    #[serde(default)]
+    pub spool_pending_count: usize,
+    #[serde(default)]
+    pub spool_pending_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplicaHeartbeatRecord {
+    pub heartbeat: ReplicaHeartbeat,
+    pub last_seen_unix_ms: i64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MeteringBatch {
+    #[serde(default)]
+    pub replica: Option<ReplicaHeartbeat>,
     #[serde(default)]
     pub request_logs: Vec<SpoolRequestLog>,
     #[serde(default)]
@@ -333,7 +356,7 @@ async fn sync_dir(dir: &std::path::Path) -> Result<(), String> {
 // Replica-side metering context and shipment loop (M4–M6)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct ShipExtras {
     last_used: Vec<LastUsedPair>,
     deltas: Vec<(PathBuf, u64, BalanceDelta)>,
@@ -346,6 +369,7 @@ impl ShipExtras {
 
     fn into_batch(self, request_logs: Vec<SpoolRequestLog>) -> MeteringBatch {
         MeteringBatch {
+            replica: None,
             request_logs,
             last_used: self.last_used,
             balance_deltas: self.deltas.into_iter().map(|(_, _, delta)| delta).collect(),
@@ -424,6 +448,15 @@ pub fn next_consecutive_failures(current: usize, tick: ShipTick) -> usize {
 }
 
 #[derive(Clone)]
+pub struct ReplicaHeartbeatSource {
+    pub id: String,
+    pub hostname: String,
+    pub listen: String,
+    pub version: String,
+    pub started_at: String,
+}
+
+#[derive(Clone)]
 pub struct ReplicaMetering {
     delta_spool: Arc<DeltaSpool>,
     pending: Arc<PendingDeductions>,
@@ -431,6 +464,7 @@ pub struct ReplicaMetering {
     endpoint: String,
     token: String,
     ship_batch_max: usize,
+    heartbeat_source: Option<ReplicaHeartbeatSource>,
 }
 
 impl ReplicaMetering {
@@ -466,6 +500,39 @@ impl ReplicaMetering {
             endpoint,
             token: token.to_string(),
             ship_batch_max: ship_batch_max.clamp(1, METERING_BATCH_HARD_CAP),
+            heartbeat_source: None,
+        })
+    }
+
+    pub fn with_heartbeat_source(mut self, source: ReplicaHeartbeatSource) -> Self {
+        self.heartbeat_source = Some(source);
+        self
+    }
+
+    fn current_heartbeat(&self) -> Option<ReplicaHeartbeat> {
+        let source = self.heartbeat_source.as_ref()?;
+        let started_at = chrono::DateTime::parse_from_rfc3339(&source.started_at)
+            .ok()
+            .map(|value| value.with_timezone(&chrono::Utc));
+        let uptime_seconds = started_at
+            .and_then(|started| {
+                chrono::Utc::now()
+                    .signed_duration_since(started)
+                    .to_std()
+                    .ok()
+            })
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let (spool_pending_count, spool_pending_bytes) = self.delta_spool.pending_stats();
+        Some(ReplicaHeartbeat {
+            id: source.id.clone(),
+            hostname: source.hostname.clone(),
+            listen: source.listen.clone(),
+            version: source.version.clone(),
+            started_at: source.started_at.clone(),
+            uptime_seconds,
+            spool_pending_count,
+            spool_pending_bytes,
         })
     }
 
@@ -526,8 +593,9 @@ impl ReplicaMetering {
         request_logs: Vec<SpoolRequestLog>,
         extras: &ShipExtras,
     ) -> Result<(), String> {
-        let batch = extras.clone().into_batch(request_logs);
-        if batch.is_empty() {
+        let mut batch = extras.clone().into_batch(request_logs);
+        batch.replica = self.current_heartbeat();
+        if batch.is_empty() && batch.replica.is_none() {
             return Ok(());
         }
         let response = self
@@ -636,10 +704,8 @@ impl ReplicaMetering {
             return ShipTick::Failure;
         }
 
-        let Some(leftovers) = sink.take_extras() else {
-            return ShipTick::Idle;
-        };
-        if leftovers.is_empty() {
+        let leftovers = sink.take_extras().unwrap_or_default();
+        if leftovers.is_empty() && self.heartbeat_source.is_none() {
             return ShipTick::Idle;
         }
         match self.send_composed(Vec::new(), leftovers, last_used).await {
@@ -796,6 +862,24 @@ pub(crate) async fn ingest_metering_handler(
                 "api_key_charge requires api_key_id",
             );
         }
+    }
+
+    if let Some(replica) = batch.replica.clone() {
+        if replica.id.trim().is_empty() {
+            return metering_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "metering_batch_invalid",
+                "replica.id must be non-empty",
+            );
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        state.replica_heartbeats.insert(
+            replica.id.clone(),
+            ReplicaHeartbeatRecord {
+                heartbeat: replica,
+                last_seen_unix_ms: now_ms,
+            },
+        );
     }
 
     match apply_metering_batch(&state.db_pool, &batch).await {
@@ -1062,6 +1146,7 @@ pub async fn drain_delta_spool_to_local_db(db: &DbPool, spool: &DeltaSpool) -> R
             return Ok(());
         }
         let batch = MeteringBatch {
+            replica: None,
             request_logs: Vec::new(),
             last_used: Vec::new(),
             balance_deltas: files.iter().map(|(_, _, delta)| delta.clone()).collect(),

@@ -422,6 +422,7 @@ export function LogRowCells({
 	const statusIndicatorClass =
 		log.status === 'success' ? 'bg-success'
 		: log.status === 'pending' ? 'bg-info'
+		: log.status === 'client_gone' ? 'bg-warning'
 		: log.status === 'error' ? 'bg-destructive'
 		: 'bg-zinc-400'
 	const baseCharge = readNanoString(billingSnapshot, 'base_charge_nano')
@@ -465,7 +466,7 @@ export function LogRowCells({
 							<TooltipContent>
 								<div className='text-xs space-y-0.5 max-w-[480px]'>
 									<div className='font-mono'>{log.request_id}</div>
-									{log.status === 'error' && (
+									{(log.status === 'error' || log.status === 'client_gone') && (
 										<>
 											{log.error.http_status != null && (
 												<div>
@@ -656,16 +657,11 @@ export function LogRowCells({
 				<TooltipProvider delayDuration={200}>
 					<Tooltip onOpenChange={inputTooltipOpenChange}>
 						<TooltipTrigger asChild>
-							<span className='inline-flex cursor-default flex-col items-end leading-4'>
-								<span>
-									{inputCached != null ? (
-										<>
-											{t('requestLogs.uncachedInput')}{' '}
-											{formatTokenCount(inputUncached)}
-										</>
-									) : (
-										formatTokenCount(inputTokensForDisplay)
-									)}
+							<span className='inline-flex cursor-default flex-col items-end leading-tight'>
+								<span className='text-sm font-medium tabular-nums'>
+									{inputCached != null
+										? formatTokenCount(inputUncached)
+										: formatTokenCount(inputTokensForDisplay)}
 								</span>
 								{inputCached ? (
 									<span className='text-[10px] text-success'>

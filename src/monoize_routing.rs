@@ -2076,8 +2076,7 @@ impl MonoizeRoutingStore {
                         .into(),
                     opt_u64_to_value(input.affinity_failback_delay_seconds_override),
                     normalized_proxy_url(input.proxy_url.as_deref()).into(),
-                    normalized_extra_headers_json(input.extra_headers.as_ref())
-                        .into(),
+                    normalized_extra_headers_json(input.extra_headers.as_ref()).into(),
                     opt_bool_to_value(input.session_affinity_auto),
                     now.clone().into(),
                     now.clone().into(),
@@ -2418,6 +2417,40 @@ fn glob_match(pattern: &str, value: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub struct ChannelProbeOutcome {
+    pub ok: bool,
+    pub usage: Option<Value>,
+    pub error: Option<String>,
+}
+
+const PROBE_ERROR_BODY_MAX_CHARS: usize = 512;
+
+fn truncate_probe_body(body: &str) -> String {
+    let body = body.trim();
+    if body.chars().count() <= PROBE_ERROR_BODY_MAX_CHARS {
+        return body.to_string();
+    }
+    let truncated: String = body.chars().take(PROBE_ERROR_BODY_MAX_CHARS).collect();
+    format!("{truncated}…")
+}
+
+pub fn format_probe_http_error(status: reqwest::StatusCode, body: &str) -> String {
+    let code = status.as_u16();
+    let reason = status.canonical_reason().unwrap_or("");
+    let body = truncate_probe_body(body);
+    if body.is_empty() {
+        if reason.is_empty() {
+            format!("upstream returned {code}")
+        } else {
+            format!("upstream returned {code} {reason}")
+        }
+    } else if reason.is_empty() {
+        format!("upstream returned {code}: {body}")
+    } else {
+        format!("upstream returned {code} {reason}: {body}")
+    }
+}
+
 pub async fn probe_channel_completion(
     client: &reqwest::Client,
     channel: &MonoizeChannel,
@@ -2425,7 +2458,7 @@ pub async fn probe_channel_completion(
     model: &str,
     provider_type: MonoizeProviderType,
     api_type_overrides: &[ApiTypeOverride],
-) -> (bool, Option<Value>) {
+) -> ChannelProbeOutcome {
     let effective_type = resolve_effective_api_type(api_type_overrides, provider_type, model);
     let base = channel.base_url.trim_end_matches('/');
     let (url, body, extra_headers, use_google_api_key_header) =
@@ -2449,16 +2482,30 @@ pub async fn probe_channel_completion(
 
     match result {
         Ok(resp) => {
-            if !resp.status().is_success() {
-                return (false, None);
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return ChannelProbeOutcome {
+                    ok: false,
+                    usage: None,
+                    error: Some(format_probe_http_error(status, &body)),
+                };
             }
             let usage = match resp.json::<Value>().await {
                 Ok(value) => extract_probe_usage(&value),
                 Err(_) => None,
             };
-            (true, usage)
+            ChannelProbeOutcome {
+                ok: true,
+                usage,
+                error: None,
+            }
         }
-        Err(_) => (false, None),
+        Err(error) => ChannelProbeOutcome {
+            ok: false,
+            usage: None,
+            error: Some(format!("connection failed: {error}")),
+        },
     }
 }
 
@@ -3049,6 +3096,21 @@ mod tests {
     }
 
     #[test]
+    fn format_probe_http_error_includes_status_reason_and_body() {
+        assert_eq!(
+            format_probe_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, ""),
+            "upstream returned 500 Internal Server Error"
+        );
+        assert_eq!(
+            format_probe_http_error(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "upstream requests error."
+            ),
+            "upstream returned 503 Service Unavailable: upstream requests error."
+        );
+    }
+
+    #[test]
     fn extract_probe_usage_supports_gemini_usage_metadata() {
         let usage = extract_probe_usage(&json!({
             "usageMetadata": {
@@ -3147,7 +3209,11 @@ mod tests {
     #[test]
     fn extra_headers_decode_roundtrips_and_rejects_garbage() {
         assert!(decode_extra_headers(None).unwrap().is_none());
-        assert!(decode_extra_headers(Some("  ".to_string())).unwrap().is_none());
+        assert!(
+            decode_extra_headers(Some("  ".to_string()))
+                .unwrap()
+                .is_none()
+        );
         let decoded = decode_extra_headers(Some(r#"{"X-A":"1"}"#.to_string()));
         assert!(decoded.is_ok());
         assert!(decode_extra_headers(Some("not-json".to_string())).is_err());
