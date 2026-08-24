@@ -3,6 +3,9 @@ include!("api/support.rs");
 #[path = "api/auth_validation.rs"]
 mod auth_validation;
 
+#[path = "api/balance_compatibility.rs"]
+mod balance_compatibility;
+
 #[path = "api/routing_models.rs"]
 mod routing_models;
 

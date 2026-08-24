@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useCallback, useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { Languages, Sun, Moon } from "lucide-react";
@@ -7,6 +7,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Skeleton } from "@/components/ui/skeleton";
+import { CapCaptcha } from "@/components/CapCaptcha";
 import { useAuth } from "@/hooks/use-auth";
 import { useTheme } from "@/hooks/use-theme";
 import { usePublicSettings } from "@/lib/swr";
@@ -30,20 +32,35 @@ const itemVariants = {
 };
 
 export function LoginPage() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [isLogin, setIsLogin] = useState(true);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [captchaToken, setCaptchaToken] = useState("");
+  const [captchaResetKey, setCaptchaResetKey] = useState(0);
   const { resolvedTheme, setTheme } = useTheme();
 
-  const { data: publicSettings } = usePublicSettings();
+  const {
+    data: publicSettings,
+    error: publicSettingsError,
+    isLoading: publicSettingsLoading,
+  } = usePublicSettings();
   const registrationEnabled = publicSettings?.registration_enabled ?? true;
   const siteName = publicSettings?.site_name ?? "Monoize Dashboard";
 
   const { login, register, user } = useAuth();
   const navigate = useNavigate();
+
+  const handleCaptchaError = useCallback(() => {
+    setError(t("auth.captchaError"));
+  }, [t]);
+
+  const resetCaptcha = useCallback(() => {
+    setCaptchaToken("");
+    setCaptchaResetKey((key) => key + 1);
+  }, []);
 
   useEffect(() => {
     if (user) {
@@ -58,13 +75,14 @@ export function LoginPage() {
 
     try {
       if (isLogin) {
-        await login(username, password);
+        await login(username, password, captchaToken);
       } else {
-        await register(username, password);
+        await register(username, password, captchaToken);
       }
       navigate("/dashboard");
     } catch (err) {
       setError(err instanceof Error ? err.message : "An error occurred");
+      resetCaptcha();
     } finally {
       setLoading(false);
     }
@@ -175,6 +193,24 @@ export function LoginPage() {
                   className="transition-all"
                 />
               </motion.div>
+              <motion.div variants={itemVariants}>
+                {publicSettingsLoading ? (
+                  <Skeleton className="h-[54px] w-full" />
+                ) : publicSettingsError || !publicSettings?.cap_api_endpoint ? (
+                  <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                    {t("auth.captchaUnavailable")}
+                  </div>
+                ) : (
+                  <CapCaptcha
+                    key={i18n.language}
+                    apiEndpoint={publicSettings.cap_api_endpoint}
+                    language={i18n.language}
+                    resetKey={captchaResetKey}
+                    onTokenChange={setCaptchaToken}
+                    onError={handleCaptchaError}
+                  />
+                )}
+              </motion.div>
               <AnimatePresence mode="wait">
                 {error && (
                   <motion.div
@@ -193,7 +229,16 @@ export function LoginPage() {
                   whileHover={{ scale: 1.02 }}
                   whileTap={{ scale: 0.98 }}
                 >
-                  <Button type="submit" className="w-full" disabled={loading}>
+                  <Button
+                    type="submit"
+                    className="w-full"
+                    disabled={
+                      loading ||
+                      publicSettingsLoading ||
+                      !publicSettings?.cap_api_endpoint ||
+                      !captchaToken
+                    }
+                  >
                     {loading ? t("common.loading") : isLogin ? t("auth.signIn") : t("auth.signUp")}
                   </Button>
                 </motion.div>
@@ -217,7 +262,11 @@ export function LoginPage() {
                         {t("auth.noAccount")}{" "}
                         <button
                           type="button"
-                          onClick={() => setIsLogin(false)}
+                          onClick={() => {
+                            setIsLogin(false);
+                            setError("");
+                            resetCaptcha();
+                          }}
                           className="text-primary underline-offset-4 hover:underline"
                         >
                           {t("auth.signUp")}
@@ -228,7 +277,11 @@ export function LoginPage() {
                         {t("auth.hasAccount")}{" "}
                         <button
                           type="button"
-                          onClick={() => setIsLogin(true)}
+                          onClick={() => {
+                            setIsLogin(true);
+                            setError("");
+                            resetCaptcha();
+                          }}
                           className="text-primary underline-offset-4 hover:underline"
                         >
                           {t("auth.signIn")}

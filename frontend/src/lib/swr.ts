@@ -82,7 +82,7 @@ const defaultConfig: SWRConfiguration = {
 // Current user hook
 export function useCurrentUser(config?: SWRConfiguration) {
   return useSWR<User>(
-    api.getToken() ? SWR_KEYS.ME : null,
+    SWR_KEYS.ME,
     fetchers.me,
     { ...defaultConfig, ...config }
   );
@@ -212,7 +212,7 @@ export function usePricingProfilePatterns(config?: SWRConfiguration) {
 
 export function useMarketplaceModels(config?: SWRConfiguration) {
   return useSWR<ModelMetadataRecord[]>(
-    api.getToken() ? SWR_KEYS.MARKETPLACE_MODELS : null,
+    SWR_KEYS.MARKETPLACE_MODELS,
     fetchers.marketplaceModels,
     { ...defaultConfig, ...config }
   );

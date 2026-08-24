@@ -43,7 +43,9 @@
 		"noAccount": "还没有账户？",
 		"hasAccount": "已有账户？",
 		"accessDenied": "访问被拒绝",
-		"needAdminPrivileges": "您需要管理员权限才能查看此页面"
+		"needAdminPrivileges": "您需要管理员权限才能查看此页面",
+		"captchaError": "人机验证失败，请重试。",
+		"captchaUnavailable": "人机验证未配置或暂时不可用。"
 	},
 	"nav": {
 		"dashboard": "仪表盘",
@@ -582,9 +584,14 @@
 		"email": "邮箱",
 		"emailDescription": "用于显示 Gravatar 头像",
 		"security": "安全",
-		"securityDescription": "管理您的密码和安全设置",
+		"securityDescription": "修改密码会退出其他所有会话",
+		"currentPassword": "当前密码",
 		"newPassword": "新密码",
 		"confirmPassword": "确认密码",
+		"passwordRequirements": "至少使用 8 个字符。",
+		"passwordTooShort": "新密码必须至少包含 8 个字符。",
+		"passwordMismatch": "两次输入的密码不一致。",
+		"passwordChanged": "密码已修改，其他会话已退出。",
 		"changePassword": "更改密码",
 		"preferences": "偏好设置",
 		"preferencesDescription": "自定义您的体验",

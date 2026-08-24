@@ -43,7 +43,9 @@
 		"noAccount": "還沒有帳戶？",
 		"hasAccount": "已有帳戶？",
 		"accessDenied": "存取被拒絕",
-		"needAdminPrivileges": "您需要管理員權限才能檢視此頁面"
+		"needAdminPrivileges": "您需要管理員權限才能檢視此頁面",
+		"captchaError": "人機驗證失敗，請重試。",
+		"captchaUnavailable": "人機驗證尚未設定或暫時無法使用。"
 	},
 	"nav": {
 		"dashboard": "儀表板",
@@ -579,9 +581,14 @@
 		"email": "電子郵件",
 		"emailDescription": "用於顯示 Gravatar 頭像",
 		"security": "安全性",
-		"securityDescription": "管理您的密碼與安全性設定",
+		"securityDescription": "變更密碼會登出其他所有工作階段",
+		"currentPassword": "目前密碼",
 		"newPassword": "新密碼",
 		"confirmPassword": "確認密碼",
+		"passwordRequirements": "請使用至少 8 個字元。",
+		"passwordTooShort": "新密碼必須至少包含 8 個字元。",
+		"passwordMismatch": "兩次輸入的密碼不一致。",
+		"passwordChanged": "密碼已變更，其他工作階段已登出。",
 		"changePassword": "變更密碼",
 		"preferences": "偏好設定",
 		"preferencesDescription": "自訂您的體驗",

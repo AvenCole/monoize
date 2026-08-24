@@ -32,21 +32,19 @@ AKP1. Monoize MUST attempt database API key validation first **only** if:
 
 AKP2. If AKP1 holds, Monoize MUST:
 
-1. Reject a token longer than 512 bytes as invalid before hashing or querying it.
-2. Compute the deterministic complete-token lookup hash and look up candidate API-key rows through the indexed `api_keys.key_hash` column.
-   Before indexed authentication, startup compatibility migration MUST recompute the current lookup hash from the full token for every existing row and MUST replace any null, empty, legacy, or otherwise mismatched `key_hash`. Startup migration MUST use ascending-ID keyset batches of at most 300 rows. Each non-empty batch MUST select at most 300 rows, update all mismatches through one CASE statement, and commit before the next batch begins. A batch whose hashes already match MUST perform no UPDATE. Memory use and one transaction's row count MUST therefore remain bounded by 300. The migration MUST NOT issue one UPDATE statement per API key.
-3. Read the candidate API-key row and its owning user in the same database query.
-4. Compare the complete supplied token with the stored full token before accepting a hash candidate. A hash match alone MUST NOT authenticate a request.
-5. Use the complete token as the in-memory authentication-cache identity. The first 12 characters MUST NOT identify a cache entry.
-6. If no row exists, treat the token as invalid.
-7. If a row exists, Monoize MUST validate the token as follows:
+1. Reject a token longer than 512 bytes as invalid before querying it.
+2. Look up the API-key row by complete-token equality through the indexed plaintext `api_keys.key` column.
+3. Read the API-key row and its owning user in the same database query.
+4. Use the complete token as the in-memory authentication-cache identity. The first 12 characters MUST NOT identify a cache entry.
+5. If no row exists, treat the token as invalid.
+6. If a row exists, Monoize MUST validate the token as follows:
    - `enabled` MUST be true.
    - `expires_at` MUST be null or a future timestamp.
    - the stored full key value MUST equal the full token.
    - the referenced user MUST exist and have `enabled` true.
    - if an in-memory cache entry for the same complete token exists but fails cache-side validation, Monoize MUST invalidate that cache entry and continue with the database validation path in the same request.
    - if cache invalidation occurs after the database read but before cache publication, Monoize MUST discard that result and repeat database validation.
-8. If validation succeeds:
+7. If validation succeeds:
    - Monoize MUST update `last_used_at` to the current time.
    - Monoize MUST authenticate the request with `tenant_id = user.id`.
    - Monoize MUST attach API key routing policy and runtime guards (`max_multiplier`, `effective_groups`, ordered `transforms`, `reasoning_envelope_enabled`) to the authenticated context.
@@ -84,7 +82,7 @@ AKG7. Authentication MUST succeed even when `effective_groups = []`. The downstr
 
 ## 5. Error response uniformity
 
-AKE1. Authentication failures MUST NOT reveal whether a token partially matched (e.g. prefix exists but hash mismatch).
+AKE1. Authentication failures MUST NOT reveal whether a token partially matched an existing prefix.
 
 AKE2. The number of database rows decoded for one invalid token MUST be bounded independently of the total API-key count.
 

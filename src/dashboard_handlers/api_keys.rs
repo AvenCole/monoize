@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::dashboard_handlers::session_helpers::get_current_user;
+use crate::dashboard_handlers::session_helpers::{get_current_user, require_admin};
 use crate::error::{AppError, AppResult};
 use crate::exact_decimal::Multiplier;
 use crate::transforms::TransformRuleConfig;
@@ -433,7 +433,11 @@ pub async fn batch_delete_api_keys(
     ))
 }
 
-pub async fn get_apikey_presets() -> AppResult<impl IntoResponse> {
+pub async fn get_apikey_presets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<impl IntoResponse> {
+    require_admin(&headers, &state).await?;
     Ok(Json(crate::presets::apikey_presets()))
 }
 

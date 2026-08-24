@@ -1,3 +1,4 @@
+mod account_balance;
 mod billing;
 mod compact;
 pub(crate) mod helpers;
@@ -47,6 +48,7 @@ use routing::*;
 use streaming::*;
 use usage::*;
 
+pub use account_balance::{codex_usage, deepseek_user_balance};
 pub use compact::compact_response;
 pub use responses_websocket::responses_websocket;
 
@@ -67,14 +69,12 @@ fn ensure_model_allowed(auth: &crate::auth::AuthResult, logical_model: &str) -> 
 
 fn apply_first_model_redirect(
     model: &mut String,
-    rules: &[crate::users::ModelRedirectRule],
+    rules: &[crate::users::CompiledModelRedirectRule],
 ) -> bool {
     for rule in rules {
-        if let Ok(re) = regex::Regex::new(&format!("^(?:{})$", rule.pattern)) {
-            if re.is_match(model) {
-                *model = rule.replace.clone();
-                return true;
-            }
+        if rule.is_match(model) {
+            *model = rule.replace().to_string();
+            return true;
         }
     }
     false
@@ -82,8 +82,8 @@ fn apply_first_model_redirect(
 
 fn apply_model_redirects_to_model(
     model: &mut String,
-    api_key_rules: &[crate::users::ModelRedirectRule],
-    global_rules: &[crate::users::ModelRedirectRule],
+    api_key_rules: &[crate::users::CompiledModelRedirectRule],
+    global_rules: &[crate::users::CompiledModelRedirectRule],
 ) {
     if !apply_first_model_redirect(model, api_key_rules) {
         apply_first_model_redirect(model, global_rules);
@@ -99,7 +99,7 @@ async fn apply_configured_model_redirects_to_model(
     apply_model_redirects_to_model(
         model,
         &auth.model_redirects,
-        &runtime.global_model_redirects,
+        &runtime.compiled_global_model_redirects,
     );
 }
 

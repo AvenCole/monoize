@@ -18,9 +18,9 @@ PRP3. A replica node MUST reject a SQLite DSN (`sqlite://...`, `sqlite::memory:`
 
 PRP4. A replica node MUST require `MONOIZE_PRIMARY_INTERNAL_URL`. The value MUST be a valid absolute `http://` or `https://` URL; otherwise startup MUST fail with error `replica_primary_url_required`.
 
-PRP5. A replica node MUST require a non-empty `MONOIZE_REPLICA_TOKEN`; an absent or empty value MUST stop startup with error `replica_token_required`.
+PRP5. A replica node MUST require `MONOIZE_REPLICA_TOKEN`. An absent or empty value MUST stop startup with error `replica_token_required`. A configured value with fewer than 32 Unicode scalar values MUST stop startup with error `replica_token_too_short` on every node role.
 
-PRP6. A primary node with a non-empty `MONOIZE_REPLICA_TOKEN` MUST mount the metering ingest endpoint defined in section 7. A primary without it runs in single-node compatibility mode: the ingest endpoint MUST NOT be mounted, and requests to its path MUST return 404.
+PRP6. A primary node with a valid `MONOIZE_REPLICA_TOKEN` MUST mount the metering ingest endpoint defined in section 7. A primary without it runs in single-node compatibility mode: the ingest endpoint MUST NOT be mounted, and requests to its path MUST return 404.
 
 PRP7. Tuning variables, each read once at startup:
 
@@ -239,7 +239,7 @@ T4a. Request-log shipment discovers on-disk `.json` spool files even when the in
 
 T5. Epoch: primary mutation increments epoch within its transaction; replica poll observes change and swaps snapshot; failed poll keeps prior snapshot.
 
-T6. Replica surface: `/api/dashboard/**` and `/` return 404 `replica_dashboard_disabled` on a replica; `/v1/**` and `/metrics` are served locally; no dashboard route exists in the router.
+T6. Replica surface: `/api/dashboard/**` and `/` return 404 `replica_dashboard_disabled` on a replica; `/v1/**` and `/metrics` are served locally; no dashboard route exists in the router. `/metrics` MUST enforce `security-access-control.spec.md` SAC-1 through SAC-5 instead of returning `replica_dashboard_disabled`.
 
 T7. Promotion drain: a data directory with leftover delta spool entries started as primary applies them before serving and then serves with empty spool.
 

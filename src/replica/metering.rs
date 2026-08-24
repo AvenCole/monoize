@@ -1271,10 +1271,7 @@ mod tests {
             let result = DeltaSpool::new(dir.clone(), 1024);
             let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
             if let Err(error) = result {
-                assert!(
-                    error.starts_with("metering_spool_unwritable"),
-                    "{error}"
-                );
+                assert!(error.starts_with("metering_spool_unwritable"), "{error}");
             }
         }
     }

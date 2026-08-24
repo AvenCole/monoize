@@ -2,9 +2,23 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Save, User, Lock, Globe, Mail, Coins } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Field,
+  FieldDescription,
+  FieldError,
+  FieldGroup,
+  FieldLabel,
+} from "@/components/ui/field";
 import { Separator } from "@/components/ui/separator";
 import {
   DropdownMenu,
@@ -26,9 +40,10 @@ import { toast } from "sonner";
 
 export function UserSettingsPage() {
   const { t } = useTranslation();
-  const { user, refreshUser } = useAuth();
+  const { user, changePassword, refreshUser } = useAuth();
   const { theme, setTheme } = useTheme();
-  const [password, setPassword] = useState("");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -36,18 +51,32 @@ export function UserSettingsPage() {
   const [savingEmail, setSavingEmail] = useState(false);
   const [savedEmail, setSavedEmail] = useState(false);
   const currentLang = getCurrentLanguage();
+  const passwordTooShort = newPassword.length > 0 && newPassword.length < 8;
+  const passwordMismatch =
+    confirmPassword.length > 0 && newPassword !== confirmPassword;
 
   const handleSavePassword = async () => {
-    if (!password || password !== confirmPassword) return;
+    if (
+      !currentPassword ||
+      newPassword.length < 8 ||
+      newPassword !== confirmPassword
+    ) {
+      return;
+    }
     setSaving(true);
-    // TODO: Implement password change API
-    setTimeout(() => {
-      setSaving(false);
-      setSaved(true);
-      setPassword("");
+    try {
+      await changePassword(currentPassword, newPassword);
+      setCurrentPassword("");
+      setNewPassword("");
       setConfirmPassword("");
+      setSaved(true);
+      toast.success(t("userSettings.passwordChanged"));
       setTimeout(() => setSaved(false), 2000);
-    }, 1000);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t("common.error"));
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleSaveEmail = async () => {
@@ -213,35 +242,75 @@ export function UserSettingsPage() {
               </CardTitle>
               <CardDescription>{t("userSettings.securityDescription")}</CardDescription>
             </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="new-password">{t("userSettings.newPassword")}</Label>
-                <Input
-                  id="new-password"
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="confirm-password">{t("userSettings.confirmPassword")}</Label>
-                <Input
-                  id="confirm-password"
-                  type="password"
-                  value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  placeholder="••••••••"
-                />
-              </div>
+            <CardContent>
+              <FieldGroup>
+                <Field>
+                  <FieldLabel htmlFor="current-password">
+                    {t("userSettings.currentPassword")}
+                  </FieldLabel>
+                  <Input
+                    id="current-password"
+                    type="password"
+                    autoComplete="current-password"
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                  />
+                </Field>
+                <Field data-invalid={passwordTooShort || undefined}>
+                  <FieldLabel htmlFor="new-password">
+                    {t("userSettings.newPassword")}
+                  </FieldLabel>
+                  <Input
+                    id="new-password"
+                    type="password"
+                    autoComplete="new-password"
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    aria-invalid={passwordTooShort || undefined}
+                  />
+                  <FieldDescription>
+                    {t("userSettings.passwordRequirements")}
+                  </FieldDescription>
+                  {passwordTooShort && (
+                    <FieldError>{t("userSettings.passwordTooShort")}</FieldError>
+                  )}
+                </Field>
+                <Field data-invalid={passwordMismatch || undefined}>
+                  <FieldLabel htmlFor="confirm-password">
+                    {t("userSettings.confirmPassword")}
+                  </FieldLabel>
+                  <Input
+                    id="confirm-password"
+                    type="password"
+                    autoComplete="new-password"
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    aria-invalid={passwordMismatch || undefined}
+                  />
+                  {passwordMismatch && (
+                    <FieldError>{t("userSettings.passwordMismatch")}</FieldError>
+                  )}
+                </Field>
+              </FieldGroup>
+            </CardContent>
+            <CardFooter>
               <Button
                 onClick={handleSavePassword}
-                disabled={saving || !password || password !== confirmPassword}
+                disabled={
+                  saving ||
+                  !currentPassword ||
+                  newPassword.length < 8 ||
+                  newPassword !== confirmPassword
+                }
               >
-                <Save className="mr-2 h-4 w-4" />
-                {saving ? t("common.saving") : saved ? t("common.saved") : t("userSettings.changePassword")}
+                <Save data-icon="inline-start" />
+                {saving
+                  ? t("common.saving")
+                  : saved
+                    ? t("common.saved")
+                    : t("userSettings.changePassword")}
               </Button>
-            </CardContent>
+            </CardFooter>
           </Card>
         </StaggerItem>
 

@@ -220,6 +220,10 @@ Runtime bootstrap uses environment variables. Providers, Channels, models, routi
 | `MONOIZE_HTTP_BODY_MAX_BYTES` | `52428800` | Forwarding request-body limit |
 | `MONOIZE_TRUSTED_PROXY_CIDRS` | `127.0.0.0/8,::1/128` | Trusted reverse-proxy networks; an explicitly empty value disables trust |
 | `MONOIZE_UPSTREAM_PROXY_URL` | unset | Node-local outbound HTTP(S) proxy for upstream calls; channels may override per channel via `proxy_url` |
+| `MONOIZE_CAP_API_ENDPOINT` | unset | Public Cap site endpoint, including the site key path; login and registration fail closed when unset |
+| `MONOIZE_CAP_SECRET_KEY` | unset | Secret key for the configured Cap site; configure it together with `MONOIZE_CAP_API_ENDPOINT` |
+
+Dashboard login and registration require a [Cap Standalone](https://capjs.js.org/guide/) deployment. Create one site key, set its public endpoint and secret through the two variables above, and allow the dashboard origin in Cap's CORS configuration. Monoize verifies each token through the site's `/siteverify` endpoint. Monoize does not apply an IP-based authentication rate limit.
 
 Monoize supports SQLite and PostgreSQL. One Monoize application process is the supported writer for its business tables.
 

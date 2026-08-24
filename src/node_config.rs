@@ -176,6 +176,16 @@ impl NodeSettings {
 
     pub fn validate_for_dsn(&self, database_dsn: &str) -> Result<(), (&'static str, String)> {
         self.validate()?;
+        if self
+            .replica_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty() && token.chars().count() < 32)
+        {
+            return Err((
+                "replica_token_too_short",
+                "`MONOIZE_REPLICA_TOKEN` must contain at least 32 characters".to_string(),
+            ));
+        }
         if self.role == NodeRole::Replica {
             let lowered = database_dsn.to_ascii_lowercase();
             if lowered.starts_with("sqlite://")
@@ -328,7 +338,7 @@ mod tests {
 
     #[test]
     fn replica_rejects_sqlite_dsn() {
-        let err = replica_with(Some("http://p:1"), Some("t"))
+        let err = replica_with(Some("http://p:1"), Some("0123456789abcdef0123456789abcdef"))
             .validate_for_dsn("sqlite://./data/monoize.db")
             .unwrap_err();
         assert_eq!(err.0, "replica_requires_postgres");
@@ -336,19 +346,19 @@ mod tests {
 
     #[test]
     fn replica_accepts_postgres_dsn() {
-        replica_with(Some("http://p:1"), Some("t"))
+        replica_with(Some("http://p:1"), Some("0123456789abcdef0123456789abcdef"))
             .validate_for_dsn("postgres://u:p@localhost/db")
             .unwrap();
     }
 
     #[test]
     fn replica_requires_primary_url() {
-        let err = replica_with(None, Some("t"))
+        let err = replica_with(None, Some("0123456789abcdef0123456789abcdef"))
             .validate_for_dsn("postgres://u:p@localhost/db")
             .unwrap_err();
         assert_eq!(err.0, "replica_primary_url_required");
 
-        let err = replica_with(Some("ftp://p"), Some("t"))
+        let err = replica_with(Some("ftp://p"), Some("0123456789abcdef0123456789abcdef"))
             .validate_for_dsn("postgres://u:p@localhost/db")
             .unwrap_err();
         assert_eq!(err.0, "replica_primary_url_required");
@@ -360,6 +370,21 @@ mod tests {
             .validate_for_dsn("postgres://u:p@localhost/db")
             .unwrap_err();
         assert_eq!(err.0, "replica_token_required");
+    }
+
+    #[test]
+    fn every_node_role_rejects_short_replica_token() {
+        let err = replica_with(Some("http://p:1"), Some("short"))
+            .validate_for_dsn("postgres://u:p@localhost/db")
+            .unwrap_err();
+        assert_eq!(err.0, "replica_token_too_short");
+
+        let mut primary = NodeSettings::primary_default();
+        primary.replica_token = Some("short".to_string());
+        let err = primary
+            .validate_for_dsn("sqlite://./data/monoize.db")
+            .unwrap_err();
+        assert_eq!(err.0, "replica_token_too_short");
     }
 
     #[test]

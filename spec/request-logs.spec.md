@@ -590,7 +590,7 @@ FL44. Active preset buttons (including `All Time`) MUST use a high-contrast fore
 FL45. The server MUST expose a streaming endpoint at `GET /api/dashboard/request-logs/stream`.
 
 - Content-Type of the response MUST be `text/event-stream`.
-- Authentication MUST use the `Authorization: Bearer <token>` header, validated by the same `get_current_user()` mechanism as all other dashboard endpoints.
+- Authentication MUST use the dashboard session validated by the same `get_current_user()` mechanism as all other dashboard endpoints. The dashboard browser MUST send the `monoize_session` cookie and MUST NOT add an `Authorization` header, as specified by `dashboard-session-authentication.spec.md` DSA2 and DSA5.
 - If the token is missing or invalid, the server MUST respond with HTTP 401 before entering streaming mode.
 
 ### 6.2 SSE event types
@@ -628,7 +628,7 @@ FL47. SSE event visibility MUST obey the same permission rules as the REST endpo
 
 FL48. The SSE connection lifecycle MUST follow these phases:
 
-1. **Connect**: The client MUST open the SSE stream using a `fetch()`-based reader (NOT the native `EventSource` API, because `EventSource` cannot send custom `Authorization` headers).
+1. **Connect**: The client MUST open the SSE stream using a `fetch()`-based reader with `credentials: "include"` and without an `Authorization` header.
     The frontend integration layer for this stream MUST be implemented through SWR subscription state, so stream lifecycle and event delivery are owned by the SWR data layer rather than a page-local ad hoc subscription mechanism.
     The client MUST begin attempting this SSE connection as soon as the logs page mounts; it MUST NOT gate connection startup on completion of the initial REST page fetch.
     After authentication succeeds, the server MUST emit an initial SSE frame without waiting for a future request-log broadcast. If the current pending-snapshot map defined in RL1a-3 contains one or more entries visible to the authenticated user, the initial frame MUST be a `log_batch` event containing those entries ordered by `created_at DESC`. Otherwise, the initial frame MUST be an SSE comment frame. This initial frame exists so the client can mark the stream connected promptly and so in-flight `pending` requests that began before stream establishment become visible.

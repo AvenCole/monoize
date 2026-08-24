@@ -52,7 +52,6 @@ export interface BillingPlanInput {
 }
 
 export interface AuthResponse {
-  token: string;
   user: User;
 }
 
@@ -181,10 +180,11 @@ export interface PublicSystemSettings {
   site_name: string;
   site_description: string;
   api_base_url: string;
+  cap_api_endpoint: string | null;
 }
 
 export interface DashboardStats {
-  user_count: number;
+  user_count: number | null;
   my_api_keys_count: number;
   providers_count: number;
   config_providers_count: number;
@@ -680,24 +680,6 @@ export interface FetchChannelModelsInput {
 }
 
 class ApiClient {
-  private token: string | null = null;
-
-  setToken(token: string | null) {
-    this.token = token;
-    if (token) {
-      localStorage.setItem("token", token);
-    } else {
-      localStorage.removeItem("token");
-    }
-  }
-
-  getToken(): string | null {
-    if (!this.token) {
-      this.token = localStorage.getItem("token");
-    }
-    return this.token;
-  }
-
   private async request<T>(
     path: string,
     options: RequestInit = {}
@@ -706,11 +688,6 @@ class ApiClient {
       "Content-Type": "application/json",
       ...(options.headers as Record<string, string>),
     };
-
-    const token = this.getToken();
-    if (token) {
-      headers["Authorization"] = `Bearer ${token}`;
-    }
 
     const response = await fetch(`${API_BASE}${path}`, {
       ...options,
@@ -728,27 +705,36 @@ class ApiClient {
   }
 
   // Auth
-  async register(username: string, password: string): Promise<AuthResponse> {
+  async register(username: string, password: string, captchaToken: string): Promise<AuthResponse> {
     return this.request("/auth/register", {
       method: "POST",
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, captcha_token: captchaToken }),
     });
   }
 
-  async login(username: string, password: string): Promise<AuthResponse> {
+  async login(username: string, password: string, captchaToken: string): Promise<AuthResponse> {
     return this.request("/auth/login", {
       method: "POST",
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, captcha_token: captchaToken }),
     });
   }
 
   async logout(): Promise<void> {
     await this.request("/auth/logout", { method: "POST" });
-    this.setToken(null);
   }
 
   async me(): Promise<User> {
     return this.request("/auth/me");
+  }
+
+  async changePassword(currentPassword: string, newPassword: string): Promise<AuthResponse> {
+    return this.request("/auth/password", {
+      method: "PUT",
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+    });
   }
 
   // Users

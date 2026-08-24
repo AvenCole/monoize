@@ -11,9 +11,13 @@
 - Authorization: any authenticated dashboard session.
 - Response body shape: `{ "groups": string[] }`.
 
+DG-A1. For role `admin` or `super_admin`, the endpoint MUST return the global group-label set defined by DG-1 through DG-8.
+
+DG-A2. For role `user`, the endpoint MUST return only the canonicalized labels in the authenticated user's `users.allowed_groups` value. It MUST NOT read group labels from providers, other users, or API keys.
+
 ## 2. Data sources
 
-DG-1. The response `groups` array MUST be derived from the union of values stored in:
+DG-1. The global response `groups` array MUST be derived from the union of values stored in:
 
 - `monoize_providers.groups`
 - `users.allowed_groups`

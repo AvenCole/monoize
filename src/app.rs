@@ -1,5 +1,6 @@
 use crate::auth::AuthState;
 use crate::billing_rate_store::{BillingRateStore, DbBillingRateRecord};
+use crate::captcha::CapVerifier;
 use crate::client_ip::TrustedProxyConfig;
 use crate::db::DbPool;
 use crate::error::{AppError, AppResult};
@@ -12,13 +13,14 @@ use crate::monoize_routing::{
     probe_channel_completion,
 };
 use crate::node_config::{HttpClients, NodeRole, NodeSettings};
-use crate::rate_limit::RateLimiter;
 use crate::request_capture::RequestCaptureStore;
 use crate::settings::{PricingProfilePattern, SettingsStore, normalize_pricing_model_key};
 use crate::transforms::TransformRegistry;
 use crate::users::{InsertRequestLog, UserRole, UserStore};
 use axum::Router;
+use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
+use axum::http::{Request, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use dashmap::DashMap;
@@ -198,7 +200,7 @@ pub struct AppState {
     pub model_registry_store: ModelRegistryStore,
     pub billing_rate_store: BillingRateStore,
     pub transform_registry: Arc<TransformRegistry>,
-    pub auth_rate_limiter: RateLimiter,
+    pub cap_verifier: CapVerifier,
     pub log_broadcast: tokio::sync::broadcast::Sender<Vec<InsertRequestLog>>,
     pub pending_request_logs: Arc<DashMap<String, InsertRequestLog>>,
     pub request_log_admissions: Arc<DashMap<String, Arc<RequestLogLifecycle>>>,
@@ -305,6 +307,13 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         AppError::new(
             axum::http::StatusCode::BAD_REQUEST,
             "trusted_proxy_config_invalid",
+            error,
+        )
+    })?;
+    let cap_verifier = CapVerifier::from_env().map_err(|error| {
+        AppError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "cap_config_invalid",
             error,
         )
     })?;
@@ -935,7 +944,7 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         model_registry_store,
         billing_rate_store,
         transform_registry,
-        auth_rate_limiter: RateLimiter::new(10, std::time::Duration::from_secs(60)),
+        cap_verifier,
         log_broadcast,
         pending_request_logs,
         request_log_admissions: Arc::new(DashMap::new()),
@@ -1792,7 +1801,7 @@ pub(crate) fn runtime_config_from_settings(
         .max(1);
     runtime.active_probe_model = settings_snapshot.monoize_active_probe_model.clone();
     runtime.global_transforms = settings_snapshot.global_transforms.clone();
-    runtime.global_model_redirects = settings_snapshot.global_model_redirects.clone();
+    let _ = runtime.set_global_model_redirects(settings_snapshot.global_model_redirects.clone());
     runtime.reasoning_suffix_map = settings_snapshot.reasoning_suffix_map.clone();
     runtime.pricing_profile_model_patterns =
         settings_snapshot.pricing_profile_model_patterns.clone();
@@ -1837,8 +1846,11 @@ pub fn build_app(state: AppState) -> Router {
     let is_replica = state.node.is_replica();
     let root_api_router = build_root_api_router(&metrics_path);
     let dashboard_api_router = build_dashboard_api_router();
+    let csp = ContentSecurityPolicy::new(state.cap_verifier.api_origin());
 
-    let mut app = Router::<AppState>::new().merge(root_api_router.clone());
+    let mut app = Router::<AppState>::new()
+        .merge(root_api_router.clone())
+        .merge(build_balance_compatibility_router());
     if is_replica {
         // D1/D2: API-only surface; /v1/** and /metrics stay local.
         app = app.fallback(replica_disabled_fallback);
@@ -1854,8 +1866,7 @@ pub fn build_app(state: AppState) -> Router {
         }
         app = app.fallback(crate::frontend::frontend_fallback);
     }
-    app
-        .with_state(state)
+    app.with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             trusted_proxies,
             crate::client_ip::canonical_client_ip_middleware,
@@ -1864,9 +1875,7 @@ pub fn build_app(state: AppState) -> Router {
         .layer(PropagateRequestIdLayer::new(
             axum::http::header::HeaderName::from_static("x-request-id"),
         ))
-        .layer(axum::middleware::from_fn(
-            canonical_request_id_middleware,
-        ))
+        .layer(axum::middleware::from_fn(canonical_request_id_middleware))
         .layer(SetRequestIdLayer::new(
             axum::http::header::HeaderName::from_static("x-request-id"),
             MakeRequestUuid,
@@ -1882,10 +1891,49 @@ pub fn build_app(state: AppState) -> Router {
             axum::http::header::HeaderName::from_static("x-frame-options"),
             axum::http::HeaderValue::from_static("DENY"),
         ))
-        .layer(SetResponseHeaderLayer::overriding(
-            axum::http::header::HeaderName::from_static("content-security-policy"),
-            axum::http::HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fontsapi.zeoseven.com; img-src 'self' data: https://www.gravatar.com; connect-src 'self'; font-src 'self' https://fonts.gstatic.com https://fontsapi.zeoseven.com; frame-ancestors 'none'"),
+        .layer(axum::middleware::from_fn_with_state(
+            csp,
+            content_security_policy_middleware,
         ))
+}
+
+#[derive(Clone)]
+struct ContentSecurityPolicy {
+    connect_src: String,
+}
+
+impl ContentSecurityPolicy {
+    fn new(cap_origin: Option<String>) -> Self {
+        let connect_src = match cap_origin {
+            Some(origin) => format!("'self' {origin}"),
+            None => "'self'".to_string(),
+        };
+        Self { connect_src }
+    }
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct CspNonce(pub String);
+
+async fn content_security_policy_middleware(
+    axum::extract::State(config): axum::extract::State<ContentSecurityPolicy>,
+    mut request: Request<Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    request.extensions_mut().insert(CspNonce(nonce.clone()));
+    let mut response = next.run(request).await;
+    let policy = format!(
+        "default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fontsapi.zeoseven.com; img-src 'self' data: https://www.gravatar.com; connect-src {}; font-src 'self' https://fonts.gstatic.com https://fontsapi.zeoseven.com; worker-src 'self' blob:; frame-ancestors 'none'",
+        config.connect_src
+    );
+    if let Ok(value) = header::HeaderValue::from_str(&policy) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, value);
+    }
+    response
 }
 
 fn build_v1_router() -> Router<AppState> {
@@ -1918,7 +1966,7 @@ fn build_v1_router() -> Router<AppState> {
 
 fn build_root_api_router(metrics_path: &str) -> Router<AppState> {
     build_v1_router()
-        .route(metrics_path, get(crate::handlers::metrics))
+        .route(metrics_path, get(crate::dashboard_handlers::get_metrics))
         .route(
             "/presets/providers",
             get(crate::dashboard_handlers::get_provider_presets),
@@ -1927,6 +1975,13 @@ fn build_root_api_router(metrics_path: &str) -> Router<AppState> {
             "/presets/apikeys",
             get(crate::dashboard_handlers::get_apikey_presets),
         )
+}
+
+fn build_balance_compatibility_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/codex/usage", get(crate::handlers::codex_usage))
+        .route("/user/balance", get(crate::handlers::deepseek_user_balance))
+        .layer(CorsLayer::very_permissive())
 }
 
 fn build_dashboard_api_router() -> Router<AppState> {
@@ -1947,6 +2002,10 @@ fn build_dashboard_api_router() -> Router<AppState> {
         .route(
             "/dashboard/auth/me",
             put(crate::dashboard_handlers::update_me),
+        )
+        .route(
+            "/dashboard/auth/password",
+            put(crate::dashboard_handlers::change_password),
         )
         .route(
             "/dashboard/users",

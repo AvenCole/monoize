@@ -132,16 +132,30 @@ pub struct ModelRedirectRule {
     pub replace: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompiledModelRedirectRule {
+    regex: regex::Regex,
+    replace: String,
+}
+
+impl CompiledModelRedirectRule {
+    pub(crate) fn is_match(&self, model: &str) -> bool {
+        self.regex.is_match(model)
+    }
+
+    pub(crate) fn replace(&self) -> &str {
+        &self.replace
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     pub id: String,
     pub user_id: String,
     pub name: String,
     pub key_prefix: String,
-    /// The full API key (stored for display purposes)
+    /// The full API key, stored as plaintext and used for authentication and display.
     pub key: String,
-    #[serde(skip_serializing)]
-    pub key_hash: String,
     pub created_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
@@ -171,6 +185,8 @@ pub struct ApiKey {
     pub transforms: Vec<TransformRuleConfig>,
     #[serde(default)]
     pub model_redirects: Vec<ModelRedirectRule>,
+    #[serde(skip)]
+    pub(crate) compiled_model_redirects: Vec<CompiledModelRedirectRule>,
     #[serde(default = "default_true")]
     pub reasoning_envelope_enabled: bool,
     #[serde(default)]
@@ -284,23 +300,42 @@ fn default_true() -> bool {
     true
 }
 
-pub fn validate_model_redirects(rules: &[ModelRedirectRule]) -> Result<(), String> {
+pub const MAX_MODEL_REDIRECT_PATTERN_BYTES: usize = 256;
+
+pub fn compile_model_redirects(
+    rules: &[ModelRedirectRule],
+) -> Result<Vec<CompiledModelRedirectRule>, String> {
     if rules.len() > 32 {
         return Err("too many model redirect rules (max 32)".to_string());
     }
 
-    for rule in rules {
-        if rule.pattern.trim().is_empty() {
-            return Err("model redirect pattern must not be empty".to_string());
-        }
-        if rule.replace.trim().is_empty() {
-            return Err("model redirect replace must not be empty".to_string());
-        }
-        regex::Regex::new(&rule.pattern)
-            .map_err(|e| format!("invalid model redirect pattern: {e}"))?;
-    }
+    rules
+        .iter()
+        .map(|rule| {
+            if rule.pattern.trim().is_empty() {
+                return Err("model redirect pattern must not be empty".to_string());
+            }
+            if rule.replace.trim().is_empty() {
+                return Err("model redirect replace must not be empty".to_string());
+            }
+            if rule.pattern.len() > MAX_MODEL_REDIRECT_PATTERN_BYTES {
+                return Err(format!(
+                    "model redirect pattern exceeds {MAX_MODEL_REDIRECT_PATTERN_BYTES} bytes"
+                ));
+            }
 
-    Ok(())
+            let regex = regex::Regex::new(&format!("^(?:{})$", rule.pattern))
+                .map_err(|e| format!("invalid model redirect pattern: {e}"))?;
+            Ok(CompiledModelRedirectRule {
+                regex,
+                replace: rule.replace.clone(),
+            })
+        })
+        .collect()
+}
+
+pub fn validate_model_redirects(rules: &[ModelRedirectRule]) -> Result<(), String> {
+    compile_model_redirects(rules).map(|_| ())
 }
 
 pub fn canonicalize_groups(groups: &[String]) -> Vec<String> {
@@ -731,8 +766,9 @@ pub use utils::{format_nano_to_usd, parse_nano_usd, parse_usd_to_nano};
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelRedirectRule, canonicalize_groups, compute_effective_groups,
-        is_channel_group_eligible, parse_groups_json, validate_model_redirects,
+        MAX_MODEL_REDIRECT_PATTERN_BYTES, ModelRedirectRule, canonicalize_groups,
+        compute_effective_groups, is_channel_group_eligible, parse_groups_json,
+        validate_model_redirects,
     };
 
     #[test]
@@ -842,6 +878,15 @@ mod tests {
             }])
             .unwrap_err(),
             "model redirect replace must not be empty"
+        );
+
+        assert_eq!(
+            validate_model_redirects(&[ModelRedirectRule {
+                pattern: "a".repeat(MAX_MODEL_REDIRECT_PATTERN_BYTES + 1),
+                replace: "gpt-5.4".to_string(),
+            }])
+            .unwrap_err(),
+            "model redirect pattern exceeds 256 bytes"
         );
 
         let err = validate_model_redirects(&[ModelRedirectRule {

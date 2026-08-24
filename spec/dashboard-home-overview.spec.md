@@ -60,6 +60,8 @@ DH-8. Row C analysis charts MUST be driven by the server-side analytics endpoint
 
 DH-9. `GET /api/dashboard/stats` MUST compute `my_api_keys_count` with a database count aggregate scoped to the current user. It MUST NOT load the user's API-key records to compute their count.
 
+DH-9a. `GET /api/dashboard/stats` MUST return `user_count` as the global user count when the authenticated user has role `admin` or `super_admin`. It MUST return `user_count: null` for role `user`. The role `user` path MUST NOT query the global user count.
+
 ### Analytics Endpoint Contract
 
 - **Endpoint:** `GET /api/dashboard/analytics`

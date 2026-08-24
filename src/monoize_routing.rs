@@ -309,6 +309,8 @@ pub struct MonoizeRuntimeConfig {
     pub active_probe_model: Option<String>,
     pub global_transforms: Vec<TransformRuleConfig>,
     pub global_model_redirects: Vec<crate::users::ModelRedirectRule>,
+    #[serde(skip)]
+    pub(crate) compiled_global_model_redirects: Vec<crate::users::CompiledModelRedirectRule>,
     pub reasoning_suffix_map: HashMap<String, String>,
     pub codex_model_ids: Vec<String>,
     pub pricing_profile_model_patterns: Vec<PricingProfilePattern>,
@@ -339,6 +341,7 @@ impl Default for MonoizeRuntimeConfig {
             active_probe_model: None,
             global_transforms: Vec::new(),
             global_model_redirects: Vec::new(),
+            compiled_global_model_redirects: Vec::new(),
             reasoning_suffix_map: default_reasoning_suffix_map(),
             codex_model_ids: Vec::new(),
             pricing_profile_model_patterns: default_pricing_profile_model_patterns(),
@@ -351,6 +354,18 @@ impl Default for MonoizeRuntimeConfig {
             affinity_failback_mode: AffinityFailbackMode::Sticky,
             affinity_failback_delay_seconds: 5 * 60,
         }
+    }
+}
+
+impl MonoizeRuntimeConfig {
+    pub fn set_global_model_redirects(
+        &mut self,
+        rules: Vec<crate::users::ModelRedirectRule>,
+    ) -> Result<(), String> {
+        let compiled = crate::users::compile_model_redirects(&rules)?;
+        self.global_model_redirects = rules;
+        self.compiled_global_model_redirects = compiled;
+        Ok(())
     }
 }
 

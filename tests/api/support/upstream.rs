@@ -5297,7 +5297,7 @@ async fn setup_with_unknown_fields() -> TestContext {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("monoize.db");
-    let state = monoize::app::load_state_with_runtime(monoize::app::RuntimeConfig {
+    let mut state = monoize::app::load_state_with_runtime(monoize::app::RuntimeConfig {
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: format!("sqlite://{}", db_path.display()),
@@ -5306,6 +5306,7 @@ async fn setup_with_unknown_fields() -> TestContext {
             node: monoize::node_config::NodeSettings::primary_default(),})
     .await
     .expect("load state");
+    state.cap_verifier = start_test_cap_verifier().await;
     configure_test_extra_fields_whitelist(&state).await;
 
     let user = state
@@ -5493,6 +5494,7 @@ async fn dashboard_session_cookie(ctx: &TestContext, username: &str, password: &
             json!({
                 "username": username,
                 "password": password,
+                "captcha_token": "test-captcha-token",
             })
             .to_string(),
         ))

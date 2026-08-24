@@ -925,7 +925,12 @@ pub async fn test_channel(
     })))
 }
 
-pub async fn get_transform_registry(State(state): State<AppState>) -> AppResult<impl IntoResponse> {
+pub async fn get_transform_registry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<impl IntoResponse> {
+    require_admin(&headers, &state).await?;
+
     let mut items: Vec<Value> = state
         .transform_registry
         .values()
@@ -956,7 +961,11 @@ pub async fn get_transform_registry(State(state): State<AppState>) -> AppResult<
     Ok(Json(items))
 }
 
-pub async fn get_provider_presets() -> AppResult<impl IntoResponse> {
+pub async fn get_provider_presets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<impl IntoResponse> {
+    require_admin(&headers, &state).await?;
     Ok(Json(crate::presets::provider_presets()))
 }
 

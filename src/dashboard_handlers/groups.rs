@@ -1,6 +1,7 @@
 use crate::app::AppState;
 use crate::dashboard_handlers::session_helpers::get_current_user;
 use crate::error::{AppError, AppResult};
+use crate::users::canonicalize_groups;
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -15,13 +16,17 @@ pub async fn list_dashboard_groups(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<DashboardGroupsResponse>> {
-    get_current_user(&headers, &state).await?;
+    let user = get_current_user(&headers, &state).await?;
 
-    let groups = state
-        .monoize_store
-        .list_dashboard_group_labels()
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    let groups = if user.role.can_manage_users() {
+        state
+            .monoize_store
+            .list_dashboard_group_labels()
+            .await
+            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?
+    } else {
+        canonicalize_groups(&user.allowed_groups)
+    };
 
     Ok(Json(DashboardGroupsResponse { groups }))
 }
@@ -37,7 +42,7 @@ mod tests {
     use sea_orm::ConnectionTrait;
 
     #[tokio::test]
-    async fn dashboard_groups_endpoint_returns_aggregated_labels_for_authenticated_user() {
+    async fn dashboard_groups_endpoint_scopes_labels_by_role() {
         let state = load_state_with_runtime(RuntimeConfig {
             listen: "127.0.0.1:0".to_string(),
             metrics_path: "/metrics".to_string(),
@@ -48,6 +53,16 @@ mod tests {
         .await
         .expect("state loads");
 
+        let admin = state
+            .user_store
+            .create_user("dashboard_admin", "password123", UserRole::Admin, &[])
+            .await
+            .expect("admin created");
+        let admin_session = state
+            .user_store
+            .create_session(&admin.id, 7)
+            .await
+            .expect("admin session created");
         let user = state
             .user_store
             .create_user(
@@ -198,13 +213,14 @@ mod tests {
             ]
         );
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
+        let mut admin_headers = HeaderMap::new();
+        admin_headers.insert(
             "authorization",
-            HeaderValue::from_str(&format!("Bearer {}", session.token)).expect("header value"),
+            HeaderValue::from_str(&format!("Bearer {}", admin_session.token))
+                .expect("header value"),
         );
 
-        let response = list_dashboard_groups(State(state), headers)
+        let response = list_dashboard_groups(State(state.clone()), admin_headers)
             .await
             .expect("handler succeeds");
         let Json(body) = response;
@@ -220,5 +236,17 @@ mod tests {
                 "team-a".to_string(),
             ]
         );
+
+        let mut user_headers = HeaderMap::new();
+        user_headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", session.token)).expect("header value"),
+        );
+        let response = list_dashboard_groups(State(state), user_headers)
+            .await
+            .expect("handler succeeds");
+        let Json(body) = response;
+
+        assert_eq!(body.groups, vec!["team-a".to_string()]);
     }
 }

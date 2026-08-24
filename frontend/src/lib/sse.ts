@@ -1,7 +1,6 @@
 import { useState } from "react";
 import useSWRSubscription from "swr/subscription";
 import type { SWRSubscriptionOptions } from "swr/subscription";
-import { api } from "./api";
 import type { RequestLog } from "./api";
 
 const INITIAL_RECONNECT_DELAY_MS = 1_000;
@@ -151,21 +150,13 @@ export function useRequestLogSSE(enabled: boolean) {
         return;
       }
 
-      const token = api.getToken();
-      if (!token) {
-        scheduleReconnect();
-        return;
-      }
-
       controller = new AbortController();
       const decoder = new TextDecoder();
 
       try {
         clearStaleTimer();
         const response = await fetch("/api/dashboard/request-logs/stream", {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
+          credentials: "include",
           signal: controller.signal,
         });
 

@@ -38,6 +38,10 @@ FD-C1. The embedded frontend entry document (`frontend/dist/index.html`) MUST re
 
 FD-C2. The entry document MUST NOT contain inline `<script>` blocks or inline event-handler attributes. Any startup logic required before React mounts (for example theme resolution) MUST be delivered through same-origin external script modules.
 
+FD-C3. The backend MUST replace the entry document's CSP nonce placeholder with the request's fresh nonce before returning `index.html`. Hashed static assets MUST be returned without content substitution.
+
+FD-C4. The backend MUST set `script-src 'self' 'nonce-<request-nonce>'`. The nonce MUST differ between independent requests. The frontend MAY read the nonce from a metadata element and pass it to a library that creates inline scripts, but the frontend MUST NOT create its own executable inline script in `index.html`.
+
 ## 6. HTTP Caching
 
 FD-H1. Responses serving the embedded SPA entry document (`index.html`) for `GET /` and SPA fallback routes (for example `/dashboard/*`) MUST include `Cache-Control: no-store`.

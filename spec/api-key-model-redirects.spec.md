@@ -12,7 +12,7 @@ An API-key rule overrides a global rule for the same request.
 
 | Field     | Type   | Constraints                                       |
 |-----------|--------|---------------------------------------------------|
-| `pattern` | string | Non-empty regex. Matched against the full model string using `^(pattern)$` anchoring. |
+| `pattern` | string | Non-empty Rust regex with a maximum UTF-8 length of 256 bytes. Matched against the full model string using `^(pattern)$` anchoring. |
 | `replace` | string | Non-empty literal target model name.              |
 
 ### Storage
@@ -22,7 +22,7 @@ An API-key rule overrides a global rule for the same request.
 - Added via migration `m20260327_000010_api_key_model_redirects`.
 - System setting `global_model_redirects`, stored as a JSON-serialized
   `Vec<ModelRedirectRule>`.
-- A missing, invalid, or non-array `global_model_redirects` setting resolves to `[]`.
+- A missing, invalid, non-array, or constraint-violating `global_model_redirects` setting resolves to `[]`.
 
 ## Behavior
 
@@ -37,9 +37,8 @@ An API-key rule overrides a global rule for the same request.
 2. Let `global_rules` = the current system setting `global_model_redirects`
    (possibly empty).
 3. Let `original_model` = `urp_request.model`.
-4. For each `rule` in `api_key_rules` (order preserved):
-   a. Compile `rule.pattern` as a regex (case-sensitive).
-   b. If `original_model` matches `^(rule.pattern)$`:
+4. For each precompiled `rule` in `api_key_rules` (order preserved):
+   a. If `original_model` matches `^(rule.pattern)$`:
       - Set `urp_request.model = rule.replace`.
       - **Stop** (first match wins).
 5. If no API-key rule matched, repeat step 4 using `global_rules`.
@@ -83,9 +82,14 @@ the internal URP subrequests that feed routing and billing.
 
 - Maximum 32 rules per API key.
 - Maximum 32 global rules.
+- Each `pattern` has a maximum UTF-8 length of 256 bytes.
 - Each `pattern` must be a valid Rust regex (the `regex` crate).
 - Invalid patterns are rejected at create/update time with a 400 error.
 - Empty `pattern` or empty `replace` is rejected.
+- API-key create and update validation MUST compile every accepted pattern.
+- Loading an API key from storage MUST compile every persisted pattern before the key can authenticate a forwarding request.
+- Loading or updating `global_model_redirects` MUST compile every accepted pattern before publishing the runtime snapshot.
+- A forwarding request MUST reuse the compiled API-key and global patterns. It MUST NOT compile a model redirect pattern.
 
 ## API Surface
 
@@ -218,4 +222,5 @@ optimistic settings mutation and error-toast behavior.
 | Invalid regex in `pattern`   | 400  | `invalid_request`       | `"invalid model redirect pattern: {detail}"` |
 | Empty `pattern`              | 400  | `invalid_request`       | `"model redirect pattern must not be empty"` |
 | Empty `replace`              | 400  | `invalid_request`       | `"model redirect replace must not be empty"` |
+| `pattern` longer than 256 bytes | 400 | `invalid_request`    | `"model redirect pattern exceeds 256 bytes"` |
 | More than 32 rules           | 400  | `invalid_request`       | `"too many model redirect rules (max 32)"`   |

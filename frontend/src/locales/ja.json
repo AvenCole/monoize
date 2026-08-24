@@ -43,7 +43,9 @@
 		"noAccount": "アカウントをお持ちでない方",
 		"hasAccount": "既にアカウントをお持ちの方",
 		"accessDenied": "アクセス拒否",
-		"needAdminPrivileges": "このページを閲覧するには管理者権限が必要です"
+		"needAdminPrivileges": "このページを閲覧するには管理者権限が必要です",
+		"captchaError": "人間確認に失敗しました。もう一度お試しください。",
+		"captchaUnavailable": "人間確認が設定されていないか、一時的に利用できません。"
 	},
 	"nav": {
 		"dashboard": "ダッシュボード",
@@ -579,9 +581,14 @@
 		"email": "メールアドレス",
 		"emailDescription": "Gravatar アバター表示に使用",
 		"security": "セキュリティ",
-		"securityDescription": "パスワードとセキュリティ設定の管理",
+		"securityDescription": "パスワードを変更すると、他のすべてのセッションからログアウトします",
+		"currentPassword": "現在のパスワード",
 		"newPassword": "新しいパスワード",
 		"confirmPassword": "パスワード確認",
+		"passwordRequirements": "8文字以上を使用してください。",
+		"passwordTooShort": "新しいパスワードは8文字以上にしてください。",
+		"passwordMismatch": "パスワードが一致しません。",
+		"passwordChanged": "パスワードを変更し、他のセッションからログアウトしました。",
 		"changePassword": "パスワードを変更",
 		"preferences": "プリファレンス",
 		"preferencesDescription": "表示のカスタマイズ",

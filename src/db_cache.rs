@@ -2232,7 +2232,6 @@ mod tests {
             name: id.to_string(),
             key_prefix: token.chars().take(12).collect(),
             key: token.to_string(),
-            key_hash: String::new(),
             created_at: Utc::now(),
             expires_at: None,
             last_used_at: None,
@@ -2246,6 +2245,7 @@ mod tests {
             max_multiplier: None,
             transforms: Vec::new(),
             model_redirects: Vec::new(),
+            compiled_model_redirects: Vec::new(),
             reasoning_envelope_enabled: true,
             request_capture_mode: RequestCaptureMode::Off,
         }

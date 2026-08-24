@@ -21,6 +21,10 @@ SDK6. Each runner MUST set `MOCK_API_KEY` in the environment used for the Monoiz
 
 SDK7. Each runner MUST NOT require repository-committed credentials, fixtures, or snapshots.
 
+SDK7a. Each runner MUST start one process-local test Cap verification server on an operating-system-selected loopback port before it starts Monoize. The server MUST accept only `POST /site-key/siteverify`. It MUST return `success: true` only when the request contains the runner's fixed test secret and fixed test token.
+
+SDK7b. Each runner MUST set `MONOIZE_CAP_API_ENDPOINT` to the test server's `/site-key/` endpoint and `MONOIZE_CAP_SECRET_KEY` to the fixed test secret in the Monoize child environment. The runner MUST stop the test server during final cleanup.
+
 ## 2. Process orchestration
 
 SDK8. Before starting a mock child process, each runner MUST probe `GET http://127.0.0.1:{MOCK_PORT}/health`.
@@ -31,13 +35,13 @@ SDK10. If the health probe in SDK8 does not succeed, the runner MUST start the m
 
 SDK11. Each runner MUST start Monoize by executing `cargo run --quiet` in the repository root.
 
-SDK12. After starting Monoize, each runner MUST wait for `GET http://127.0.0.1:{MONOIZE_PORT}/metrics` to return an HTTP success status before sending dashboard setup requests.
+SDK12. After starting Monoize, each runner MUST wait for `GET http://127.0.0.1:{MONOIZE_PORT}/api/dashboard/settings/public` to return an HTTP success status before sending dashboard setup requests. The runner MUST NOT use the admin-authenticated metrics endpoint as a pre-registration readiness probe.
 
 SDK13. If the Monoize child process exits before SDK12 completes, the runner MUST fail.
 
 ## 3. Dashboard bootstrap
 
-SDK14. Each runner MUST register a dashboard user by sending `POST /api/dashboard/auth/register` with a username derived from the Monoize port and a fixed password.
+SDK14. Each runner MUST register a dashboard user by sending `POST /api/dashboard/auth/register` with a username derived from the Monoize port, a fixed password, and the fixed test Cap token as `captcha_token`.
 
 SDK15. The registration response in SDK14 MUST contain both:
 

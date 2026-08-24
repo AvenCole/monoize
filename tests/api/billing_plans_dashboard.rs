@@ -1,3 +1,4 @@
+use axum::Json;
 use axum::body::Body;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Method, Request, StatusCode};
@@ -13,7 +14,26 @@ struct TestContext {
 }
 
 async fn setup() -> TestContext {
-    let state = load_state_with_runtime(RuntimeConfig {
+    async fn siteverify(Json(body): Json<Value>) -> Json<Value> {
+        Json(json!({
+            "success": body["secret"] == json!("test-cap-secret")
+                && body["response"] == json!("test-captcha-token")
+        }))
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test Cap server");
+    let address = listener.local_addr().expect("test Cap address");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().route("/site-key/siteverify", axum::routing::post(siteverify)),
+        )
+        .await
+        .expect("serve test Cap endpoint");
+    });
+
+    let mut state = load_state_with_runtime(RuntimeConfig {
         listen: "127.0.0.1:0".to_string(),
         metrics_path: "/metrics".to_string(),
         database_dsn: "sqlite::memory:".to_string(),
@@ -22,6 +42,11 @@ async fn setup() -> TestContext {
     })
     .await
     .expect("state loads");
+    state.cap_verifier = monoize::captcha::CapVerifier::configured(
+        &format!("http://{address}/site-key/"),
+        "test-cap-secret".to_string(),
+    )
+    .expect("configure test Cap verifier");
     let admin = state
         .user_store
         .create_user("admin_billing_plans", "password", UserRole::Admin, &[])
@@ -268,7 +293,8 @@ async fn assigned_plan_is_embedded_on_user_and_me_payloads() {
         "/api/dashboard/auth/login",
         Some(json!({
             "username": "subscriber",
-            "password": "password"
+            "password": "password",
+            "captcha_token": "test-captcha-token"
         })),
     )
     .await;

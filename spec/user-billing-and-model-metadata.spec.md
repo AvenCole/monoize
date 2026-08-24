@@ -66,6 +66,14 @@ U11. Public registration MUST read the `registration_enabled` setting and call o
 
 U12. Username and password syntax validation MUST finish before the atomic registration operation. The operation MUST report a duplicate username separately from storage failure so the endpoint preserves HTTP `409 username_exists`.
 
+U13. A mutation of `users.password_hash` or `users.role` MUST delete every `sessions` row for that user in the same transaction. A transition of `users.enabled` to `false` MUST do the same. A later transition of `users.enabled` to `true` MUST NOT restore a deleted session.
+
+U14. Any authenticated user MAY change their password through `PUT /api/dashboard/auth/password`. The request body MUST contain `current_password: string` and `new_password: string`. The endpoint MUST reject a `new_password` shorter than 8 characters with HTTP `400` and code `invalid_password`. The endpoint MUST reject an incorrect `current_password` with HTTP `401` and code `invalid_current_password`.
+
+U15. A successful self-service password change MUST update `users.password_hash`, delete every existing session for the user, and insert one replacement session in one transaction. The replacement session MUST use the configured session TTL. The response MUST return the replacement token and user object with the same schema as login. The response MUST also replace the `monoize_session` cookie. The old bearer token and all other old session tokens MUST fail authentication after the transaction commits.
+
+U16. The authenticated user settings page MUST provide current-password, new-password, and confirmation fields. The page MUST prevent submission when the new password is shorter than 8 characters or differs from the confirmation. After a successful response, the page MUST keep the replacement session active, clear all three password fields, and report that other sessions were signed out.
+
 ## 3. Admin mutation rules
 
 A1. Only admin/super-admin endpoints MAY mutate user balance fields.

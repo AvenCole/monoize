@@ -670,7 +670,7 @@ async fn t6_replica_surface_disables_dashboard_and_keeps_api() {
         )
         .await
         .unwrap();
-    assert_eq!(metrics.status(), axum::http::StatusCode::OK);
+    assert_eq!(metrics.status(), axum::http::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

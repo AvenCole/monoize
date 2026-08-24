@@ -24,6 +24,325 @@ async fn auth_required_for_forwarding_endpoints() {
 }
 
 #[tokio::test]
+async fn dashboard_auth_requires_a_valid_cap_token() {
+    let ctx = setup().await;
+
+    for path in ["/api/dashboard/auth/login", "/api/dashboard/auth/register"] {
+        let missing = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"username": "tenant-1", "password": "test-password"}).to_string(),
+            ))
+            .unwrap();
+        let response = ctx.router.clone().oneshot(missing).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["error"]["code"], json!("captcha_required"));
+
+        let invalid = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "username": "tenant-1",
+                    "password": "test-password",
+                    "captcha_token": "invalid-token"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = ctx.router.clone().oneshot(invalid).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["error"]["code"], json!("captcha_invalid"));
+    }
+}
+
+#[tokio::test]
+async fn dashboard_auth_fails_closed_when_cap_is_unconfigured() {
+    let ctx = setup().await;
+    let mut state = ctx.state.clone();
+    state.cap_verifier = monoize::captcha::CapVerifier::unconfigured();
+    let router = monoize::app::build_app(state);
+
+    for path in ["/api/dashboard/auth/login", "/api/dashboard/auth/register"] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "username": "tenant-1",
+                    "password": "test-password",
+                    "captcha_token": "present-token"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["error"]["code"], json!("captcha_unavailable"));
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/dashboard/settings/public")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csp = response
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("connect-src 'self';"));
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(body["cap_api_endpoint"].is_null());
+}
+
+#[tokio::test]
+async fn public_settings_and_csp_publish_only_cap_public_configuration() {
+    let ctx = setup().await;
+    let request = || {
+        Request::builder()
+            .method("GET")
+            .uri("/api/dashboard/settings/public")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let first = ctx.router.clone().oneshot(request()).await.unwrap();
+    let first_csp = first
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(first_csp.contains("connect-src 'self' http://127.0.0.1:"));
+    assert!(first_csp.contains("worker-src 'self' blob:"));
+    assert!(!first_csp.contains("script-src 'self' 'unsafe-inline'"));
+    let body: Value =
+        serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(
+        body["cap_api_endpoint"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://127.0.0.1:")
+    );
+    assert!(!body.to_string().contains("test-cap-secret"));
+
+    let second = ctx.router.clone().oneshot(request()).await.unwrap();
+    let second_csp = second
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_ne!(first_csp, second_csp);
+}
+
+#[tokio::test]
+async fn password_change_rotates_current_session_and_revokes_other_sessions() {
+    let ctx = setup().await;
+    let login_request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/api/dashboard/auth/login")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "username": "tenant-1",
+                    "password": "test-password",
+                    "captcha_token": "test-captcha-token"
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let first_login = ctx.router.clone().oneshot(login_request()).await.unwrap();
+    assert_eq!(first_login.status(), StatusCode::OK);
+    let first_body: Value =
+        serde_json::from_slice(&first_login.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    let first_token = first_body["token"].as_str().unwrap().to_string();
+
+    let second_login = ctx.router.clone().oneshot(login_request()).await.unwrap();
+    assert_eq!(second_login.status(), StatusCode::OK);
+    let second_body: Value =
+        serde_json::from_slice(&second_login.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    let second_token = second_body["token"].as_str().unwrap().to_string();
+
+    let change = Request::builder()
+        .method("PUT")
+        .uri("/api/dashboard/auth/password")
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, format!("Bearer {first_token}"))
+        .body(Body::from(
+            json!({
+                "current_password": "test-password",
+                "new_password": "changed-password"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let changed = ctx.router.clone().oneshot(change).await.unwrap();
+    assert_eq!(changed.status(), StatusCode::OK);
+    assert!(
+        changed
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("monoize_session=urp_session_"))
+    );
+    let changed_body: Value =
+        serde_json::from_slice(&changed.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let replacement_token = changed_body["token"].as_str().unwrap().to_string();
+
+    assert!(
+        ctx.state
+            .user_store
+            .get_session_by_token(&first_token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ctx.state
+            .user_store
+            .get_session_by_token(&second_token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ctx.state
+            .user_store
+            .get_session_by_token(&replacement_token)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let old_session_request = Request::builder()
+        .uri("/api/dashboard/auth/me")
+        .header(AUTHORIZATION, format!("Bearer {second_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let old_session_response = ctx
+        .router
+        .clone()
+        .oneshot(old_session_request)
+        .await
+        .unwrap();
+    assert_eq!(old_session_response.status(), StatusCode::UNAUTHORIZED);
+
+    let replacement_request = Request::builder()
+        .uri("/api/dashboard/auth/me")
+        .header(AUTHORIZATION, format!("Bearer {replacement_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let replacement_response = ctx
+        .router
+        .clone()
+        .oneshot(replacement_request)
+        .await
+        .unwrap();
+    assert_eq!(replacement_response.status(), StatusCode::OK);
+
+    let user = ctx
+        .state
+        .user_store
+        .get_user_by_username("tenant-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        monoize::users::UserStore::verify_password_async("changed-password", &user.password_hash,)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn password_change_rejects_an_incorrect_current_password_without_revocation() {
+    let ctx = setup().await;
+    let login = ctx
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/dashboard/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "username": "tenant-1",
+                        "password": "test-password",
+                        "captcha_token": "test-captcha-token"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let login_body: Value =
+        serde_json::from_slice(&login.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let token = login_body["token"].as_str().unwrap().to_string();
+
+    let response = ctx
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/dashboard/auth/password")
+                .header(CONTENT_TYPE, "application/json")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(
+                    json!({
+                        "current_password": "wrong-password",
+                        "new_password": "changed-password"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["error"]["code"], json!("invalid_current_password"));
+    assert!(
+        ctx.state
+            .user_store
+            .get_session_by_token(&token)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn create_api_key_rejects_disallowed_transform() {
     let ctx = setup().await;
     let cookie = dashboard_session_cookie(&ctx, "tenant-1", "test-password").await;

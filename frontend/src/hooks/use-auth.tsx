@@ -7,8 +7,9 @@ import { clearCache } from "@/lib/swr";
 interface AuthContextType {
   user: User | null;
   loading: boolean;
-  login: (username: string, password: string) => Promise<void>;
-  register: (username: string, password: string) => Promise<void>;
+  login: (username: string, password: string, captchaToken: string) => Promise<void>;
+  register: (username: string, password: string, captchaToken: string) => Promise<void>;
+  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshUser: () => Promise<void>;
 }
@@ -25,7 +26,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setUser(userData);
     } catch {
       setUser(null);
-      api.setToken(null);
       await clearCache();
     }
   };
@@ -34,17 +34,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     refreshUser().finally(() => setLoading(false));
   }, []);
 
-  const login = async (username: string, password: string) => {
-    const response = await api.login(username, password);
+  const login = async (username: string, password: string, captchaToken: string) => {
+    const response = await api.login(username, password, captchaToken);
     await clearCache();
-    api.setToken(response.token);
     setUser(response.user);
   };
 
-  const register = async (username: string, password: string) => {
-    const response = await api.register(username, password);
+  const register = async (username: string, password: string, captchaToken: string) => {
+    const response = await api.register(username, password, captchaToken);
     await clearCache();
-    api.setToken(response.token);
+    setUser(response.user);
+  };
+
+  const changePassword = async (currentPassword: string, newPassword: string) => {
+    const response = await api.changePassword(currentPassword, newPassword);
+    await clearCache();
     setUser(response.user);
   };
 
@@ -52,7 +56,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       await api.logout();
     } finally {
-      api.setToken(null);
       setUser(null);
       await clearCache();
     }
@@ -60,7 +63,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, login, register, logout, refreshUser }}
+      value={{ user, loading, login, register, changePassword, logout, refreshUser }}
     >
       {children}
     </AuthContext.Provider>

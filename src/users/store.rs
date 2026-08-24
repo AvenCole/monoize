@@ -3,7 +3,7 @@ use super::{
     AdminUpdateUserInput, ApiKey, BillingError, BillingErrorKind, CreateApiKeyInput,
     CreateApiKeyWithLimitError, ModelRedirectRule, RESERVED_INTERNAL_USER_PREFIX,
     RegisterUserError, RequestCaptureMode, Session, UpdateApiKeyInput, User, UserBalance, UserRole,
-    UserStore, canonicalize_groups, validate_model_redirects,
+    UserStore, canonicalize_groups, compile_model_redirects, validate_model_redirects,
 };
 use crate::transforms::{
     TransformRuleConfig, canonical_transform_id, canonicalize_transform_rule,
@@ -63,10 +63,6 @@ fn session_cleanup_interval() -> std::time::Duration {
                 .as_deref(),
         ))
     })
-}
-
-fn api_key_lookup_hash(key: &str) -> String {
-    format!("{:032x}", xxhash_rust::xxh3::xxh3_128(key.as_bytes()))
 }
 
 fn canonicalize_ip_whitelist(entries: &[String]) -> Result<Vec<String>, String> {
@@ -311,8 +307,8 @@ impl UserStore {
         .await
     }
 
-    /// `is_replica` skips the startup write passes (PRP11): transform-id canonicalization,
-    /// key-hash backfill, and expired-session deletion are primary responsibilities.
+    /// `is_replica` skips the startup write passes (PRP11): transform-id canonicalization
+    /// and expired-session deletion are primary responsibilities.
     pub async fn new_for_role(
         db: crate::db::DbPool,
         log_broadcast: tokio::sync::broadcast::Sender<Vec<super::InsertRequestLog>>,
@@ -337,91 +333,9 @@ impl UserStore {
         };
         if !is_replica {
             store.migrate_transform_rule_ids().await?;
-            store.migrate_api_key_lookup_hashes().await?;
             store.cleanup_expired_sessions().await?;
         }
         Ok(store)
-    }
-
-    async fn migrate_api_key_lookup_hashes(&self) -> Result<(), String> {
-        const HASH_BACKFILL_CHUNK_SIZE: usize = 300;
-        let mut cursor: Option<String> = None;
-        loop {
-            let tx = self.db.begin_write().await.map_err(|e| e.to_string())?;
-            let rows = match cursor.as_deref() {
-                Some(cursor) => {
-                    tx.query_all(self.db.stmt(
-                        &format!(
-                            "SELECT id, key, key_hash FROM api_keys
-                             WHERE id > $1
-                             ORDER BY id LIMIT {HASH_BACKFILL_CHUNK_SIZE}"
-                        ),
-                        vec![cursor.into()],
-                    ))
-                    .await
-                }
-                None => {
-                    tx.query_all(self.db.stmt(
-                        &format!(
-                            "SELECT id, key, key_hash FROM api_keys
-                             ORDER BY id LIMIT {HASH_BACKFILL_CHUNK_SIZE}"
-                        ),
-                        vec![],
-                    ))
-                    .await
-                }
-            }
-            .map_err(|e| e.to_string())?;
-            if rows.is_empty() {
-                tx.commit().await.map_err(|e| e.to_string())?;
-                break;
-            }
-            let mut updates = Vec::with_capacity(rows.len());
-            for row in rows {
-                let id: String = row.try_get("", "id").map_err(|e| e.to_string())?;
-                let key: String = row.try_get("", "key").map_err(|e| e.to_string())?;
-                cursor = Some(id.clone());
-                let stored_hash: Option<String> =
-                    row.try_get("", "key_hash").map_err(|e| e.to_string())?;
-                let expected_hash = api_key_lookup_hash(&key);
-                if stored_hash.as_deref() != Some(expected_hash.as_str()) {
-                    updates.push((id, expected_hash));
-                }
-            }
-            if updates.is_empty() {
-                tx.commit().await.map_err(|e| e.to_string())?;
-                continue;
-            }
-            let mut values: Vec<SeaValue> = Vec::with_capacity(updates.len() * 3);
-            let mut cases = Vec::with_capacity(updates.len());
-            let mut ids = Vec::with_capacity(updates.len());
-            for (id, key_hash) in &updates {
-                let id_index = values.len() + 1;
-                values.push(id.clone().into());
-                let hash_index = values.len() + 1;
-                values.push(key_hash.clone().into());
-                cases.push(format!("WHEN ${id_index} THEN ${hash_index}"));
-            }
-            for (id, _) in &updates {
-                let id_index = values.len() + 1;
-                values.push(id.clone().into());
-                ids.push(format!("${id_index}"));
-            }
-            tx.execute(self.db.stmt(
-                &format!(
-                    "UPDATE api_keys
-                     SET key_hash = CASE id {} ELSE key_hash END
-                     WHERE id IN ({})",
-                    cases.join(" "),
-                    ids.join(", ")
-                ),
-                values,
-            ))
-            .await
-            .map_err(|e| e.to_string())?;
-            tx.commit().await.map_err(|e| e.to_string())?;
-        }
-        Ok(())
     }
 
     async fn migrate_transform_rule_ids(&self) -> Result<(), String> {
@@ -620,6 +534,22 @@ impl UserStore {
             .is_ok())
     }
 
+    /// Runs Argon2 outside the Tokio worker pool so request futures remain schedulable.
+    pub async fn hash_password_async(password: &str) -> Result<String, String> {
+        let password = password.to_string();
+        tokio::task::spawn_blocking(move || Self::hash_password(&password))
+            .await
+            .map_err(|error| format!("password hashing task failed: {error}"))?
+    }
+
+    pub async fn verify_password_async(password: &str, hash: &str) -> Result<bool, String> {
+        let password = password.to_string();
+        let hash = hash.to_string();
+        tokio::task::spawn_blocking(move || Self::verify_password(&password, &hash))
+            .await
+            .map_err(|error| format!("password verification task failed: {error}"))?
+    }
+
     pub async fn user_count(&self) -> Result<i64, String> {
         let row = self.db.read()
             .query_one(self.db.stmt(
@@ -640,7 +570,7 @@ impl UserStore {
         allowed_groups: &[String],
     ) -> Result<User, String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let password_hash = Self::hash_password(password)?;
+        let password_hash = Self::hash_password_async(password).await?;
         let now = Utc::now();
         let allowed_groups = canonicalize_groups(allowed_groups);
         let allowed_groups_json = serialize_allowed_groups_json(&allowed_groups)?;
@@ -769,6 +699,11 @@ impl UserStore {
         email: Option<Option<&str>>,
         allowed_groups: Option<&[String]>,
     ) -> Result<(), String> {
+        let revokes_sessions = password.is_some() || role.is_some() || enabled == Some(false);
+        let password_hash = match password {
+            Some(password) => Some(Self::hash_password_async(password).await?),
+            None => None,
+        };
         let mut set_clauses = Vec::new();
         let mut values: Vec<SeaValue> = Vec::new();
         let mut idx = 1usize;
@@ -778,9 +713,9 @@ impl UserStore {
             values.push(u.into());
             idx += 1;
         }
-        if let Some(p) = password {
+        if let Some(password_hash) = password_hash {
             set_clauses.push(format!("password_hash = ${idx}"));
-            values.push(Self::hash_password(p)?.into());
+            values.push(password_hash.into());
             idx += 1;
         }
         if let Some(r) = role {
@@ -836,12 +771,17 @@ impl UserStore {
             set_clauses.join(", ")
         );
 
-        self.db
-            .write()
-            .await
-            .execute(self.db.stmt(&query, values))
+        let write = self.db.write().await;
+        let tx = write.begin().await.map_err(|e| e.to_string())?;
+        tx.execute(self.db.stmt(&query, values))
             .await
             .map_err(|e| e.to_string())?;
+
+        if revokes_sessions {
+            self.delete_user_sessions_tx(&tx, id).await?;
+        }
+
+        tx.commit().await.map_err(|e| e.to_string())?;
 
         if !set_clauses.is_empty() {
             self.api_key_cache.invalidate_by_user_id(id);
@@ -872,6 +812,7 @@ impl UserStore {
         } = input;
         let has_balance_change = balance_nano_usd.is_some() || balance_unlimited.is_some();
         let has_plan_change = billing_plan_id.is_some();
+        let revokes_sessions = password.is_some() || role.is_some() || enabled == Some(false);
         if username.is_none()
             && password.is_none()
             && role.is_none()
@@ -884,7 +825,10 @@ impl UserStore {
             return Ok(());
         }
 
-        let password_hash = password.as_deref().map(Self::hash_password).transpose()?;
+        let password_hash = match password.as_deref() {
+            Some(password) => Some(Self::hash_password_async(password).await?),
+            None => None,
+        };
         let parsed_balance = balance_nano_usd
             .as_deref()
             .map(parse_nano_usd)
@@ -1020,6 +964,10 @@ impl UserStore {
         ))
         .await
         .map_err(|e| e.to_string())?;
+
+        if revokes_sessions {
+            self.delete_user_sessions_tx(&tx, id).await?;
+        }
 
         if has_balance_change {
             let delta = new_balance
@@ -1162,6 +1110,75 @@ impl UserStore {
         })
     }
 
+    pub async fn change_password_and_rotate_session(
+        &self,
+        user_id: &str,
+        expected_password_hash: &str,
+        new_password: &str,
+        session_ttl_days: i64,
+    ) -> Result<Session, String> {
+        let password_hash = Self::hash_password_async(new_password).await?;
+        let now = Utc::now();
+        let session = Session {
+            id: uuid::Uuid::new_v4().to_string(),
+            user_id: user_id.to_string(),
+            token: format!(
+                "urp_session_{}",
+                uuid::Uuid::new_v4().to_string().replace('-', "")
+            ),
+            created_at: now,
+            expires_at: now + chrono::Duration::days(session_ttl_days),
+        };
+
+        let write = self.db.write().await;
+        let tx = write.begin().await.map_err(|e| e.to_string())?;
+        let lock_sql = if self.db.is_postgres() {
+            "SELECT password_hash FROM users WHERE id = $1 FOR UPDATE"
+        } else {
+            "SELECT password_hash FROM users WHERE id = $1"
+        };
+        let row = tx
+            .query_one(self.db.stmt(lock_sql, vec![user_id.into()]))
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "user not found".to_string())?;
+        let current_password_hash: String = row
+            .try_get("", "password_hash")
+            .map_err(|e| e.to_string())?;
+        if current_password_hash != expected_password_hash {
+            return Err("password changed concurrently".to_string());
+        }
+
+        tx.execute(self.db.stmt(
+            "UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3",
+            vec![
+                password_hash.into(),
+                session.created_at.to_rfc3339().into(),
+                user_id.into(),
+            ],
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+        self.delete_user_sessions_tx(&tx, user_id).await?;
+        tx.execute(self.db.stmt(
+            r#"INSERT INTO sessions (id, user_id, token, created_at, expires_at)
+               VALUES ($1, $2, $3, $4, $5)"#,
+            vec![
+                session.id.clone().into(),
+                session.user_id.clone().into(),
+                session.token.clone().into(),
+                session.created_at.to_rfc3339().into(),
+                session.expires_at.to_rfc3339().into(),
+            ],
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+
+        self.api_key_cache.invalidate_by_user_id(user_id);
+        Ok(session)
+    }
+
     pub async fn cleanup_expired_sessions(&self) -> Result<u64, String> {
         let result = self
             .db
@@ -1228,16 +1245,17 @@ impl UserStore {
         Ok(())
     }
 
-    pub async fn delete_user_sessions(&self, user_id: &str) -> Result<(), String> {
-        self.db
-            .write()
-            .await
-            .execute(self.db.stmt(
-                "DELETE FROM sessions WHERE user_id = $1",
-                vec![user_id.into()],
-            ))
-            .await
-            .map_err(|e| e.to_string())?;
+    async fn delete_user_sessions_tx(
+        &self,
+        tx: &DatabaseTransaction,
+        user_id: &str,
+    ) -> Result<(), String> {
+        tx.execute(self.db.stmt(
+            "DELETE FROM sessions WHERE user_id = $1",
+            vec![user_id.into()],
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -1277,7 +1295,7 @@ impl UserStore {
     ) -> Result<(ApiKey, String), String> {
         canonicalize_transform_rules(&mut input.transforms);
         validate_api_key_transforms(&input.transforms, is_admin)?;
-        validate_model_redirects(&input.model_redirects)?;
+        let compiled_model_redirects = compile_model_redirects(&input.model_redirects)?;
         input.ip_whitelist = canonicalize_ip_whitelist(&input.ip_whitelist)?;
         if input.sub_account_balance_nano_usd.is_some() && !is_admin {
             return Err("only admins may set an initial sub-account balance".to_string());
@@ -1311,7 +1329,6 @@ impl UserStore {
         let id = uuid::Uuid::new_v4().to_string();
         let key = format!("sk-{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
         let key_prefix = key[..12].to_string();
-        let key_hash = api_key_lookup_hash(&key);
         let now = Utc::now();
         let expires_at = input
             .expires_in_days
@@ -1331,15 +1348,14 @@ impl UserStore {
             .await
             .map_err(|e| e.message)?;
         tx.execute(self.db.stmt(
-                r#"INSERT INTO api_keys (id, user_id, name, key_prefix, key, key_hash, created_at, expires_at, enabled, sub_account_enabled, sub_account_balance_nano, model_limits_enabled, model_limits, ip_whitelist, allowed_groups, token_group, max_multiplier, transforms, model_redirects, reasoning_envelope_enabled, request_capture_enabled, request_capture_mode)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)"#,
+                r#"INSERT INTO api_keys (id, user_id, name, key_prefix, key, created_at, expires_at, enabled, sub_account_enabled, sub_account_balance_nano, model_limits_enabled, model_limits, ip_whitelist, allowed_groups, token_group, max_multiplier, transforms, model_redirects, reasoning_envelope_enabled, request_capture_enabled, request_capture_mode)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)"#,
                 vec![
                     id.clone().into(),
                     user_id.into(),
                     input.name.clone().into(),
                     key_prefix.clone().into(),
                     key.clone().into(),
-                    key_hash.clone().into(),
                     now.to_rfc3339().into(),
                     expires_at.map(|e| e.to_rfc3339()).into(),
                     SeaValue::Int(Some(if input.sub_account_enabled { 1 } else { 0 })),
@@ -1384,7 +1400,6 @@ impl UserStore {
             name: input.name,
             key_prefix,
             key: key.clone(),
-            key_hash,
             created_at: now,
             expires_at,
             last_used_at: None,
@@ -1398,6 +1413,7 @@ impl UserStore {
             max_multiplier: input.max_multiplier,
             transforms: input.transforms,
             model_redirects: input.model_redirects,
+            compiled_model_redirects,
             reasoning_envelope_enabled: input.reasoning_envelope_enabled,
             request_capture_mode: input.request_capture_mode,
         };
@@ -1435,7 +1451,7 @@ impl UserStore {
     pub async fn get_api_key_by_prefix(&self, prefix: &str) -> Result<Option<ApiKey>, String> {
         let row = self.db.read()
             .query_one(self.db.stmt(
-                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.key_hash, a.created_at, a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled, a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits, a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier, a.transforms, a.model_redirects, a.reasoning_envelope_enabled, a.request_capture_enabled, a.request_capture_mode, u.role AS owner_role FROM api_keys a JOIN users u ON u.id = a.user_id WHERE a.key_prefix = $1",
+                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.created_at, a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled, a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits, a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier, a.transforms, a.model_redirects, a.reasoning_envelope_enabled, a.request_capture_enabled, a.request_capture_mode, u.role AS owner_role FROM api_keys a JOIN users u ON u.id = a.user_id WHERE a.key_prefix = $1",
                 vec![prefix.into()],
             ))
             .await
@@ -1453,7 +1469,7 @@ impl UserStore {
             .db
             .read()
             .query_one(self.db.stmt(
-                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.key_hash, a.created_at, a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled, a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits, a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier, a.transforms, a.model_redirects, a.reasoning_envelope_enabled, a.request_capture_enabled, a.request_capture_mode, u.role AS owner_role FROM api_keys a JOIN users u ON u.id = a.user_id WHERE a.key = $1",
+                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.created_at, a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled, a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits, a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier, a.transforms, a.model_redirects, a.reasoning_envelope_enabled, a.request_capture_enabled, a.request_capture_mode, u.role AS owner_role FROM api_keys a JOIN users u ON u.id = a.user_id WHERE a.key = $1",
                 vec![key.into()],
             ))
             .await
@@ -1473,7 +1489,7 @@ impl UserStore {
             .db
             .read()
             .query_one(self.db.stmt(
-                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.key_hash,
+                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key,
                         a.created_at, a.expires_at, a.last_used_at, a.enabled,
                         a.sub_account_enabled, a.sub_account_balance_nano,
                         a.model_limits_enabled, a.model_limits, a.ip_whitelist,
@@ -1494,9 +1510,9 @@ impl UserStore {
                   FROM api_keys a
                   JOIN users u ON u.id = a.user_id
                   LEFT JOIN billing_plans p ON p.id = u.billing_plan_id AND p.enabled = 1
-                  WHERE a.key_hash = $1 AND a.key = $2
+                  WHERE a.key = $1
                   LIMIT 1",
-                vec![api_key_lookup_hash(key).into(), key.into()],
+                vec![key.into()],
             ))
             .await
             .map_err(|e| e.to_string())?;
@@ -1580,7 +1596,7 @@ impl UserStore {
             .db
             .read()
             .query_all(self.db.stmt(
-                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.key_hash, a.created_at,
+                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.created_at,
                         a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled,
                         a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits,
                         a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier,
@@ -1623,7 +1639,7 @@ impl UserStore {
             .db
             .read()
             .query_one(self.db.stmt(
-                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.key_hash, a.created_at,
+                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.created_at,
                         a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled,
                         a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits,
                         a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier,
@@ -2245,7 +2261,7 @@ impl UserStore {
             sanitize_api_key_transforms(transforms, is_admin);
         let model_redirects: Vec<ModelRedirectRule> =
             parse_persisted_json_array(&model_redirects_str, "model_redirects")?;
-        validate_model_redirects(&model_redirects)
+        let compiled_model_redirects = compile_model_redirects(&model_redirects)
             .map_err(|error| format!("invalid persisted model_redirects: {error}"))?;
         let reasoning_envelope_enabled = decode_required_bool(row, "reasoning_envelope_enabled")?;
         let request_capture_mode = decode_request_capture_mode(row)?;
@@ -2256,7 +2272,6 @@ impl UserStore {
             name: row.try_get("", "name").map_err(|e| e.to_string())?,
             key_prefix: row.try_get("", "key_prefix").map_err(|e| e.to_string())?,
             key: row.try_get("", "key").map_err(|e| e.to_string())?,
-            key_hash: row.try_get("", "key_hash").map_err(|e| e.to_string())?,
             created_at: DateTime::parse_from_rfc3339(
                 &row.try_get::<String>("", "created_at")
                     .map_err(|e| e.to_string())?,
@@ -2275,6 +2290,7 @@ impl UserStore {
             max_multiplier,
             transforms,
             model_redirects,
+            compiled_model_redirects,
             reasoning_envelope_enabled,
             request_capture_mode,
         })
@@ -2287,6 +2303,10 @@ impl UserStore {
         input: UpdateApiKeyInput,
         is_admin: bool,
     ) -> Result<ApiKey, String> {
+        if let Some(expires_at) = input.expires_at.as_deref() {
+            DateTime::parse_from_rfc3339(expires_at)
+                .map_err(|_| "expires_at must be a valid RFC3339 timestamp".to_string())?;
+        }
         if let Some(transforms) = &input.transforms {
             validate_api_key_transforms(transforms, is_admin)?;
         }
@@ -2613,7 +2633,7 @@ impl UserStore {
     pub async fn get_api_key_by_id(&self, id: &str) -> Result<Option<ApiKey>, String> {
         let row = self.db.read()
             .query_one(self.db.stmt(
-                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.key_hash, a.created_at, a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled, a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits, a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier, a.transforms, a.model_redirects, a.reasoning_envelope_enabled, a.request_capture_enabled, a.request_capture_mode, u.role AS owner_role FROM api_keys a JOIN users u ON u.id = a.user_id WHERE a.id = $1",
+                "SELECT a.id, a.user_id, a.name, a.key_prefix, a.key, a.created_at, a.expires_at, a.last_used_at, a.enabled, a.sub_account_enabled, a.sub_account_balance_nano, a.model_limits_enabled, a.model_limits, a.ip_whitelist, a.allowed_groups, a.token_group, a.max_multiplier, a.transforms, a.model_redirects, a.reasoning_envelope_enabled, a.request_capture_enabled, a.request_capture_mode, u.role AS owner_role FROM api_keys a JOIN users u ON u.id = a.user_id WHERE a.id = $1",
                 vec![id.into()],
             ))
             .await
@@ -3115,7 +3135,7 @@ impl UserStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SESSION_CLEANUP_INTERVAL_SECS, api_key_lookup_hash, canonicalize_ip_whitelist,
+        DEFAULT_SESSION_CLEANUP_INTERVAL_SECS, canonicalize_ip_whitelist,
         parse_allowed_groups_json, parse_api_key_batch_delete_limit, parse_positive_limit,
         parse_session_cleanup_interval_secs, sanitize_api_key_transforms,
         serialize_allowed_groups_json, validate_api_key_allowed_groups_subset,
@@ -3133,15 +3153,21 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
     use serde_json::json;
 
-    #[test]
-    fn api_key_lookup_hash_uses_complete_token() {
-        assert_ne!(
-            api_key_lookup_hash("sk-123456789-suffix-a"),
-            api_key_lookup_hash("sk-123456789-suffix-b")
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_password_helpers_hash_and_verify_passwords() {
+        let hash = UserStore::hash_password_async("correct-password")
+            .await
+            .expect("password hashes");
+
+        assert!(
+            UserStore::verify_password_async("correct-password", &hash)
+                .await
+                .expect("password verifies")
         );
-        assert_eq!(
-            api_key_lookup_hash("sk-stable"),
-            api_key_lookup_hash("sk-stable")
+        assert!(
+            !UserStore::verify_password_async("wrong-password", &hash)
+                .await
+                .expect("password mismatch is not an error")
         );
     }
 
@@ -3173,7 +3199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compatibility_migrations_cross_the_fixed_batch_boundary() {
+    async fn transform_compatibility_migration_crosses_the_fixed_batch_boundary() {
         let db = DbPool::connect("sqlite::memory:")
             .await
             .expect("db connects");
@@ -3186,7 +3212,7 @@ mod tests {
             .await
             .expect("store creates");
         let user = store
-            .create_user("hash-migration", "password", UserRole::User, &[])
+            .create_user("transform-migration", "password", UserRole::User, &[])
             .await
             .expect("user creates");
         for index in 0..305 {
@@ -3195,28 +3221,6 @@ mod tests {
                 .await
                 .expect("key creates");
         }
-        db.write()
-            .await
-            .execute(db.stmt("UPDATE api_keys SET key_hash = ''", vec![]))
-            .await
-            .expect("hashes clear");
-
-        store
-            .migrate_api_key_lookup_hashes()
-            .await
-            .expect("hashes migrate");
-        let rows = db
-            .read()
-            .query_all(db.stmt("SELECT key, key_hash FROM api_keys", vec![]))
-            .await
-            .expect("hashes query");
-        assert_eq!(rows.len(), 305);
-        for row in rows {
-            let key: String = row.try_get("", "key").expect("key decodes");
-            let hash: String = row.try_get("", "key_hash").expect("hash decodes");
-            assert_eq!(hash, api_key_lookup_hash(&key));
-        }
-
         let legacy = serde_json::to_string(&vec![TransformRuleConfig {
             transform: "remove_anthropic_billing_header".to_string(),
             enabled: true,
@@ -3711,6 +3715,7 @@ mod tests {
             .create_user("atomic-before", "password123", UserRole::User, &[])
             .await
             .unwrap();
+        let session = store.create_session(&user.id, 7).await.unwrap();
         db.write()
             .await
             .execute(db.stmt(
@@ -3728,6 +3733,7 @@ mod tests {
                 &user.id,
                 AdminUpdateUserInput {
                     username: Some("atomic-after".to_string()),
+                    password: Some("new-password123".to_string()),
                     balance_nano_usd: Some("50".to_string()),
                     ..AdminUpdateUserInput::default()
                 },
@@ -3739,6 +3745,185 @@ mod tests {
         let unchanged = store.get_user_by_id(&user.id).await.unwrap().unwrap();
         assert_eq!(unchanged.username, "atomic-before");
         assert_eq!(unchanged.balance_nano_usd, "0");
+        assert!(
+            UserStore::verify_password_async("password123", &unchanged.password_hash)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .get_session_by_token(&session.token)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn user_security_mutations_revoke_existing_sessions() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let (log_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let store = UserStore::new(db, log_broadcast)
+            .await
+            .expect("store creates");
+        let user = store
+            .create_user("session-revocation", "password123", UserRole::User, &[])
+            .await
+            .unwrap();
+
+        let password_session = store.create_session(&user.id, 7).await.unwrap();
+        store
+            .update_user(
+                &user.id,
+                None,
+                Some("password456"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_session_by_token(&password_session.token)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let role_session = store.create_session(&user.id, 7).await.unwrap();
+        store
+            .update_user(
+                &user.id,
+                None,
+                None,
+                Some(UserRole::Admin),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_session_by_token(&role_session.token)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let disabled_session = store.create_session(&user.id, 7).await.unwrap();
+        store
+            .update_user(
+                &user.id,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_session_by_token(&disabled_session.token)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_admin_security_mutations_revoke_existing_sessions() {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("db connects");
+        {
+            let write = db.write().await;
+            Migrator::up(&*write, None).await.expect("migrates");
+        }
+        let (log_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let store = UserStore::new(db, log_broadcast)
+            .await
+            .expect("store creates");
+        let user = store
+            .create_user("admin-revocation", "password123", UserRole::User, &[])
+            .await
+            .unwrap();
+
+        let password_session = store.create_session(&user.id, 7).await.unwrap();
+        store
+            .admin_update_user_atomic(
+                &user.id,
+                AdminUpdateUserInput {
+                    password: Some("password456".to_string()),
+                    ..AdminUpdateUserInput::default()
+                },
+                "admin-1",
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_session_by_token(&password_session.token)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let role_session = store.create_session(&user.id, 7).await.unwrap();
+        store
+            .admin_update_user_atomic(
+                &user.id,
+                AdminUpdateUserInput {
+                    role: Some(UserRole::Admin),
+                    ..AdminUpdateUserInput::default()
+                },
+                "admin-1",
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_session_by_token(&role_session.token)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let disabled_session = store.create_session(&user.id, 7).await.unwrap();
+        store
+            .admin_update_user_atomic(
+                &user.id,
+                AdminUpdateUserInput {
+                    enabled: Some(false),
+                    ..AdminUpdateUserInput::default()
+                },
+                "admin-1",
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_session_by_token(&disabled_session.token)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

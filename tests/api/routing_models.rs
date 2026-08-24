@@ -771,14 +771,16 @@ async fn forwarding_applies_api_key_model_redirects_before_model_limits_and_rout
 #[tokio::test]
 async fn forwarding_applies_global_model_redirects_before_model_limits_and_routing() {
     let ctx = setup().await;
+    let rules = vec![monoize::users::ModelRedirectRule {
+        pattern: "claude-.*".to_string(),
+        replace: "gpt-5-mini".to_string(),
+    }];
     ctx.state
         .monoize_runtime
         .write()
         .await
-        .global_model_redirects = vec![monoize::users::ModelRedirectRule {
-        pattern: "claude-.*".to_string(),
-        replace: "gpt-5-mini".to_string(),
-    }];
+        .set_global_model_redirects(rules)
+        .unwrap();
 
     let req = Request::builder()
         .method("POST")

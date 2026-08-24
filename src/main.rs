@@ -23,17 +23,6 @@ async fn run() -> Result<(), AppError> {
     let is_replica = state.node.is_replica();
     state.user_store.spawn_background_tasks_for_role(is_replica);
 
-    // Periodic rate limiter cleanup to bound memory growth
-    {
-        let limiter = state.auth_rate_limiter.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                limiter.cleanup();
-            }
-        });
-    }
-
     if !is_replica {
         // PRP11: retention/pending-log deletion is a primary responsibility.
         match state.user_store.cleanup_pending_request_logs().await {

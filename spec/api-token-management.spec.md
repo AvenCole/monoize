@@ -15,8 +15,7 @@ An API key row has:
 - `user_id: string`
 - `name: string`
 - `key_prefix: string` (first 12 characters of the full key; display only and never an authentication or cache identity)
-- `key_hash: string` (deterministic complete-token lookup hash; acceptance still requires full-token equality)
-- `key: string` (the full key, stored for display)
+- `key: string` (the full key, stored as plaintext and used for authentication)
 - `created_at: RFC3339 string`
 - `expires_at: RFC3339 string?`
 - `last_used_at: RFC3339 string?`
@@ -107,7 +106,11 @@ TM-CREATE-1. The generated full key MUST start with the literal prefix `sk-`.
 
 TM-CREATE-2. The server MUST compute `key_prefix` as the first 12 characters of the full key.
 
-TM-CREATE-3. The server MUST persist the deterministic complete-token lookup hash in `key_hash`. Runtime token validation semantics are defined in `api-key-authentication.spec.md`.
+TM-CREATE-3. The server MUST persist the full key as plaintext in `api_keys.key`. The `api_keys` table MUST NOT contain a hash, digest, or encrypted copy of the full key. Runtime token validation semantics are defined in `api-key-authentication.spec.md`.
+
+TM-CREATE-3a. The database MUST index `api_keys.key` for complete-token lookup.
+
+TM-CREATE-3b. Migration `m20260824_000039_api_keys_plaintext_only` MUST delete `idx_api_keys_key_hash` and the `api_keys.key_hash` column when they exist. It MUST create `idx_api_keys_key` on `api_keys.key`. Its rollback path MUST NOT restore `key_hash`.
 
 TM-CREATE-4. After successful key creation, there is no required cache invalidation side-effect because the new key does not exist in cache yet.
 

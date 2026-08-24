@@ -1,4 +1,5 @@
 use crate::app::AppState;
+use crate::captcha::CapVerifyError;
 use crate::dashboard_handlers::session_helpers::{
     get_current_user, is_reserved_internal_username, is_valid_username,
 };
@@ -13,16 +14,22 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+const NONEXISTENT_USER_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$bW9ub2l6ZS1mYWtlLXNhbHQ$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
     pub username: String,
     pub password: String,
+    #[serde(default)]
+    pub captcha_token: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
+    #[serde(default)]
+    pub captcha_token: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,19 +154,17 @@ pub struct UpdateMeRequest {
     pub email: Option<Option<String>>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
 pub async fn register(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<RegisterRequest>,
 ) -> AppResult<impl IntoResponse> {
-    let client_ip = extract_client_ip(&headers).unwrap_or_else(|| "unknown".to_string());
-    if !state.auth_rate_limiter.check(&client_ip) {
-        return Err(AppError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
-            "too many requests, please try again later",
-        ));
-    }
+    verify_captcha(&state, &body.captcha_token).await?;
 
     let user_store = &state.user_store;
     let settings_store = &state.settings_store;
@@ -236,17 +241,9 @@ pub async fn register(
 
 pub async fn login(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> AppResult<impl IntoResponse> {
-    let client_ip = extract_client_ip(&headers).unwrap_or_else(|| "unknown".to_string());
-    if !state.auth_rate_limiter.check(&client_ip) {
-        return Err(AppError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
-            "too many requests, please try again later",
-        ));
-    }
+    verify_captcha(&state, &body.captcha_token).await?;
 
     let user_store = &state.user_store;
     if is_reserved_internal_username(&body.username) {
@@ -260,31 +257,36 @@ pub async fn login(
     let user = user_store
         .get_user_by_username(&body.username)
         .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?
-        .ok_or_else(|| {
-            AppError::new(
-                StatusCode::UNAUTHORIZED,
-                "invalid_credentials",
-                "invalid username or password",
-            )
-        })?;
-
-    if !user.enabled {
-        return Err(AppError::new(
-            StatusCode::FORBIDDEN,
-            "account_disabled",
-            "your account has been disabled",
-        ));
-    }
-
-    let valid = crate::users::UserStore::verify_password(&body.password, &user.password_hash)
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+
+    let valid = verify_login_password(
+        &body.password,
+        user.as_ref().map(|user| user.password_hash.as_str()),
+    )
+    .await
+    .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+
+    let Some(user) = user else {
+        return Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "invalid username or password",
+        ));
+    };
 
     if !valid {
         return Err(AppError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_credentials",
             "invalid username or password",
+        ));
+    }
+
+    if !user.enabled {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "account_disabled",
+            "your account has been disabled",
         ));
     }
 
@@ -310,6 +312,17 @@ pub async fn login(
         user,
     });
     Ok(([(axum::http::header::SET_COOKIE, cookie)], body).into_response())
+}
+
+async fn verify_login_password(
+    password: &str,
+    password_hash: Option<&str>,
+) -> Result<bool, String> {
+    UserStore::verify_password_async(
+        password,
+        password_hash.unwrap_or(NONEXISTENT_USER_PASSWORD_HASH),
+    )
+    .await
 }
 
 pub async fn logout(
@@ -386,8 +399,98 @@ pub async fn update_me(
     Ok(Json(response))
 }
 
-fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
-    crate::client_ip::canonical_client_ip_from_headers(headers).map(|address| address.to_string())
+pub async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ChangePasswordRequest>,
+) -> AppResult<impl IntoResponse> {
+    let user = get_current_user(&headers, &state).await?;
+
+    if body.new_password.len() < 8 {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_password",
+            "password must be at least 8 characters",
+        ));
+    }
+
+    let current_password_is_valid =
+        UserStore::verify_password_async(&body.current_password, &user.password_hash)
+            .await
+            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    if !current_password_is_valid {
+        return Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_current_password",
+            "current password is incorrect",
+        ));
+    }
+
+    let session_ttl_days = state
+        .settings_store
+        .get_session_ttl_days()
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    let session = state
+        .user_store
+        .change_password_and_rotate_session(
+            &user.id,
+            &user.password_hash,
+            &body.new_password,
+            session_ttl_days,
+        )
+        .await
+        .map_err(|e| {
+            if e == "password changed concurrently" {
+                AppError::new(
+                    StatusCode::CONFLICT,
+                    "password_changed",
+                    "password changed during this request; retry with the current password",
+                )
+            } else {
+                AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e)
+            }
+        })?;
+
+    let cookie = build_session_cookie(&session.token, session_ttl_days);
+    let user = state
+        .user_store
+        .get_user_by_id(&user.id)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "not_found", "user not found"))?;
+    let user = user_response_from_store(&state.user_store, user)
+        .await
+        .map_err(map_user_response_error)?;
+    let body = Json(AuthResponse {
+        token: session.token,
+        user,
+    });
+    Ok(([(axum::http::header::SET_COOKIE, cookie)], body).into_response())
+}
+
+async fn verify_captcha(state: &AppState, token: &str) -> AppResult<()> {
+    state
+        .cap_verifier
+        .verify(token)
+        .await
+        .map_err(|error| match error {
+            CapVerifyError::Required => AppError::new(
+                StatusCode::BAD_REQUEST,
+                "captcha_required",
+                "complete the CAPTCHA before continuing",
+            ),
+            CapVerifyError::Invalid => AppError::new(
+                StatusCode::BAD_REQUEST,
+                "captcha_invalid",
+                "CAPTCHA verification failed; complete a new challenge",
+            ),
+            CapVerifyError::Unavailable => AppError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "captcha_unavailable",
+                "CAPTCHA verification is temporarily unavailable",
+            ),
+        })
 }
 
 fn build_session_cookie(token: &str, ttl_days: i64) -> String {
@@ -397,4 +500,18 @@ fn build_session_cookie(token: &str, ttl_days: i64) -> String {
 
 fn clear_session_cookie() -> String {
     "monoize_session=; HttpOnly; SameSite=Strict; Secure; Path=/; Max-Age=0".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn nonexistent_user_password_hash_supports_dummy_verification() {
+        assert!(
+            !verify_login_password("submitted-password", None)
+                .await
+                .expect("fixed password hash must be a valid Argon2 PHC string")
+        );
+    }
 }

@@ -15,8 +15,6 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub key: String,
     #[sea_orm(column_type = "Text")]
-    pub key_hash: String,
-    #[sea_orm(column_type = "Text")]
     pub created_at: String,
     #[sea_orm(column_type = "Text")]
     pub expires_at: Option<String>,

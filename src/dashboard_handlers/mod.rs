@@ -14,7 +14,7 @@ mod users;
 #[cfg(test)]
 mod tests;
 
-pub use admin::get_admin_overview;
+pub use admin::{get_admin_overview, get_metrics};
 pub use analytics_request_logs::{
     AnalyticsQuery, RequestLogsQuery, get_dashboard_analytics, list_my_request_logs,
     stream_request_logs,
@@ -26,8 +26,9 @@ pub use api_keys::{
     update_api_key,
 };
 pub use auth::{
-    AuthResponse, LoginRequest, RegisterRequest, UpdateMeRequest, UserBillingPlanResponse,
-    UserResponse, get_me, login, logout, register, update_me, user_response_from_store,
+    AuthResponse, ChangePasswordRequest, LoginRequest, RegisterRequest, UpdateMeRequest,
+    UserBillingPlanResponse, UserResponse, change_password, get_me, login, logout, register,
+    update_me, user_response_from_store,
 };
 pub use billing_plans::{
     BillingPlanResponse, CreateBillingPlanRequest, UpdateBillingPlanRequest, create_billing_plan,

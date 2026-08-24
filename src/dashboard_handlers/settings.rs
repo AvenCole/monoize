@@ -241,7 +241,8 @@ pub async fn update_settings(
         rt.active_success_threshold = updated.monoize_active_probe_success_threshold.max(1);
         rt.active_probe_model = updated.monoize_active_probe_model.clone();
         rt.global_transforms = updated.global_transforms.clone();
-        rt.global_model_redirects = updated.global_model_redirects.clone();
+        rt.set_global_model_redirects(updated.global_model_redirects.clone())
+            .expect("validated global model redirects compile");
         rt.reasoning_suffix_map = updated.reasoning_suffix_map.clone();
         rt.pricing_profile_model_patterns = updated.pricing_profile_model_patterns.clone();
         rt.codex_model_ids = updated.codex_model_ids.clone();
@@ -296,10 +297,14 @@ pub async fn get_dashboard_stats(
 
     let user_store = &state.user_store;
 
-    let user_count = user_store
-        .user_count()
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    let user_count =
+        if user.role.can_manage_users() {
+            Some(user_store.user_count().await.map_err(|e| {
+                AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e)
+            })?)
+        } else {
+            None
+        };
 
     let my_api_keys_count = user_store
         .count_user_api_keys(&user.id)
@@ -350,11 +355,12 @@ pub async fn get_config_overview(
 }
 
 pub async fn get_public_settings(State(state): State<AppState>) -> AppResult<impl IntoResponse> {
-    let settings = state
+    let mut settings = state
         .settings_store
         .get_public_settings()
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+    settings.cap_api_endpoint = state.cap_verifier.public_api_endpoint().map(str::to_string);
     Ok(Json(settings))
 }
 
@@ -370,4 +376,82 @@ fn redact_dsn(dsn: &str) -> String {
         return dsn.to_string();
     }
     "***".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_dashboard_stats;
+    use crate::app::{RuntimeConfig, load_state_with_runtime};
+    use crate::users::UserRole;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue};
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    use serde_json::Value;
+
+    async fn stats_for_session(
+        state: crate::app::AppState,
+        token: &str,
+    ) -> serde_json::Map<String, Value> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("header value"),
+        );
+        let response = get_dashboard_stats(State(state), headers)
+            .await
+            .expect("stats handler succeeds")
+            .into_response();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("stats body collects")
+            .to_bytes();
+        serde_json::from_slice::<Value>(&bytes)
+            .expect("stats body is JSON")
+            .as_object()
+            .expect("stats body is an object")
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn dashboard_stats_hides_global_user_count_from_non_admins() {
+        let state = load_state_with_runtime(RuntimeConfig {
+            listen: "127.0.0.1:0".to_string(),
+            metrics_path: "/metrics".to_string(),
+            database_dsn: "sqlite::memory:".to_string(),
+            request_log_spool_dir: None,
+            node: crate::node_config::NodeSettings::primary_default(),
+        })
+        .await
+        .expect("state loads");
+
+        let admin = state
+            .user_store
+            .create_user("stats_admin", "password123", UserRole::Admin, &[])
+            .await
+            .expect("admin created");
+        let admin_session = state
+            .user_store
+            .create_session(&admin.id, 7)
+            .await
+            .expect("admin session created");
+        let user = state
+            .user_store
+            .create_user("stats_reader", "password123", UserRole::User, &[])
+            .await
+            .expect("user created");
+        let user_session = state
+            .user_store
+            .create_session(&user.id, 7)
+            .await
+            .expect("user session created");
+
+        let admin_stats = stats_for_session(state.clone(), &admin_session.token).await;
+        assert!(admin_stats["user_count"].as_i64().is_some());
+
+        let user_stats = stats_for_session(state, &user_session.token).await;
+        assert_eq!(user_stats["user_count"], Value::Null);
+    }
 }

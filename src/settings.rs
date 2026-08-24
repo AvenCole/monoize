@@ -2,7 +2,7 @@ use crate::db::DbPool;
 use crate::entity::system_settings;
 use crate::monoize_routing::AffinityFailbackMode;
 use crate::transforms::{TransformRuleConfig, canonicalize_transform_rules};
-use crate::users::ModelRedirectRule;
+use crate::users::{ModelRedirectRule, validate_model_redirects};
 use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, sea_query::OnConflict};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ pub struct PublicSettings {
     pub site_name: String,
     pub site_description: String,
     pub api_base_url: String,
+    pub cap_api_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -475,6 +476,7 @@ impl SettingsStore {
             site_name: defaults.site_name,
             site_description: defaults.site_description,
             api_base_url: defaults.api_base_url,
+            cap_api_endpoint: None,
         };
         for row in rows {
             match row.key.as_str() {
@@ -564,7 +566,9 @@ impl SettingsStore {
                     }
                 }
                 "global_model_redirects" => {
-                    if let Ok(rules) = serde_json::from_str::<Vec<ModelRedirectRule>>(&row.value) {
+                    if let Ok(rules) = serde_json::from_str::<Vec<ModelRedirectRule>>(&row.value)
+                        && validate_model_redirects(&rules).is_ok()
+                    {
                         settings.global_model_redirects = rules;
                     }
                 }

@@ -93,7 +93,6 @@ ISM4.3. `api_keys` columns:
 - `name` TEXT NOT NULL
 - `key_prefix` TEXT NOT NULL
 - `key` TEXT NOT NULL
-- `key_hash` TEXT NOT NULL
 - `created_at` TEXT NOT NULL
 - `expires_at` TEXT NULL
 - `last_used_at` TEXT NULL
@@ -337,7 +336,7 @@ ISM5.2. Required indexes:
 - `idx_sessions_token` on `sessions(token)`
 - `idx_sessions_expires_at` on `sessions(expires_at)`
 - `idx_api_keys_user_id` on `api_keys(user_id)`
-- `idx_api_keys_key_hash` on `api_keys(key_hash)`
+- `idx_api_keys_key` on `api_keys(key)`
 - `idx_billing_ledger_user_id` on `billing_ledger(user_id)`
 - `idx_request_logs_user_created_at` on `request_logs(user_id, created_at_unix_ms DESC)`
 - `idx_request_logs_created_at` on `request_logs(created_at_unix_ms DESC)`

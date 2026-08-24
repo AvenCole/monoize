@@ -72,7 +72,6 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(ApiKeys::Name).text().not_null())
                     .col(ColumnDef::new(ApiKeys::KeyPrefix).text().not_null())
                     .col(ColumnDef::new(ApiKeys::Key).text().not_null())
-                    .col(ColumnDef::new(ApiKeys::KeyHash).text().not_null())
                     .col(ColumnDef::new(ApiKeys::CreatedAt).text().not_null())
                     .col(ColumnDef::new(ApiKeys::ExpiresAt).text())
                     .col(ColumnDef::new(ApiKeys::LastUsedAt).text())
@@ -682,9 +681,9 @@ impl MigrationTrait for Migration {
             .create_index(
                 Index::create()
                     .if_not_exists()
-                    .name("idx_api_keys_key_hash")
+                    .name("idx_api_keys_key")
                     .table(ApiKeys::Table)
-                    .col(ApiKeys::KeyHash)
+                    .col(ApiKeys::Key)
                     .to_owned(),
             )
             .await?;
@@ -914,7 +913,6 @@ enum ApiKeys {
     Name,
     KeyPrefix,
     Key,
-    KeyHash,
     CreatedAt,
     ExpiresAt,
     LastUsedAt,

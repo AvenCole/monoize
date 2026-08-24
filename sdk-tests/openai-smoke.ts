@@ -10,6 +10,8 @@ const monoizePort = Number(process.env.MONOIZE_PORT ?? 8085);
 
 const mockBase = `http://127.0.0.1:${mockPort}`;
 const monoizeBase = `http://127.0.0.1:${monoizePort}`;
+const capSecret = "sdk-test-cap-secret";
+const capToken = "sdk-test-cap-token";
 
 const tmpDir = join(sdkDir, ".tmp");
 const dbPath = join(tmpDir, `monoize-sdk-${monoizePort}.db`);
@@ -19,7 +21,26 @@ const env = {
   MOCK_API_KEY: process.env.MOCK_API_KEY ?? "mock-key",
   MONOIZE_DATABASE_DSN: `sqlite://${dbPath}`,
   MONOIZE_LISTEN: `127.0.0.1:${monoizePort}`,
+  MONOIZE_CAP_API_ENDPOINT: "",
+  MONOIZE_CAP_SECRET_KEY: capSecret,
 };
+
+function startTestCapServer() {
+  return Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (request.method !== "POST" || url.pathname !== "/site-key/siteverify") {
+        return new Response("not found", { status: 404 });
+      }
+      const body = asObject(await request.json());
+      return Response.json({
+        success: body?.secret === capSecret && body?.response === capToken,
+      });
+    },
+  });
+}
 
 type SpawnedProcess = ReturnType<typeof Bun.spawn>;
 
@@ -101,7 +122,7 @@ async function startMonoizeServer() {
     stderr: "inherit",
   });
   await Promise.race([
-    waitFor(`${monoizeBase}/metrics`, 30000),
+    waitFor(`${monoizeBase}/api/dashboard/settings/public`, 30000),
     child.exited.then((code) => {
       throw new Error(`Monoize exited before ready (code ${code})`);
     }),
@@ -116,7 +137,11 @@ async function bootstrapMonoizeRouting() {
   const registerResp = await fetch(`${monoizeBase}/api/dashboard/auth/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ username: adminUsername, password: adminPassword }),
+    body: JSON.stringify({
+      username: adminUsername,
+      password: adminPassword,
+      captcha_token: capToken,
+    }),
   });
   const registerBody = parseRegisterResponse(await registerResp.json());
   const sessionToken = registerBody?.token;
@@ -228,9 +253,12 @@ async function bootstrapMonoizeRouting() {
 }
 
 async function main() {
-  const mockProcess = await ensureMockServer();
+  const capServer = startTestCapServer();
+  env.MONOIZE_CAP_API_ENDPOINT = `http://127.0.0.1:${capServer.port}/site-key/`;
+  let mockProcess: SpawnedProcess | null = null;
   let monoizeProcess: SpawnedProcess | null = null;
   try {
+    mockProcess = await ensureMockServer();
     monoizeProcess = await startMonoizeServer();
     const forwardApiKey = await bootstrapMonoizeRouting();
     const client = new OpenAI({
@@ -256,6 +284,7 @@ async function main() {
       mockProcess.kill();
       await mockProcess.exited;
     }
+    capServer.stop(true);
     try {
       rmSync(dbPath, { force: true });
     } catch {

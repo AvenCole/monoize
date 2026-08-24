@@ -220,6 +220,16 @@ pub async fn update_user(
             "only super admin can modify super admin accounts",
         ));
     }
+    if target_user.role == UserRole::Admin
+        && current_user.id != target_user.id
+        && current_user.role != UserRole::SuperAdmin
+    {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "only super admin can modify other admin accounts",
+        ));
+    }
 
     let new_role = body.role.as_ref().and_then(|r| UserRole::from_str(r));
     if let Some(role) = new_role {

@@ -9,6 +9,16 @@ use chrono::{NaiveTime, Utc};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
+/// security-access-control.spec.md SAC-1..SAC-5: metrics expose runtime topology
+/// and therefore use the same authorization boundary as the admin dashboard.
+pub async fn get_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<impl axum::response::IntoResponse> {
+    require_admin(&headers, &state).await?;
+    Ok(state.metrics.render())
+}
+
 /// admin-dashboard.spec.md AD-1..AD-5: one admin-only aggregate snapshot of
 /// node/system status, replica state, user usage ranking, and channel health.
 pub async fn get_admin_overview(

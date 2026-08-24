@@ -8,7 +8,10 @@ use crate::monoize_routing::{
 };
 use crate::settings::normalize_pricing_model_key;
 use crate::urp;
-use crate::users::{ModelRedirectRule, RequestCaptureMode, UserRole};
+use crate::users::{
+    CompiledModelRedirectRule, ModelRedirectRule, RequestCaptureMode, UserRole,
+    compile_model_redirects,
+};
 use axum::http::StatusCode;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
@@ -181,11 +184,14 @@ fn build_test_routing_request(model: &str) -> UrpRequest {
     }
 }
 
-fn build_model_redirect_rule(pattern: &str, replace: &str) -> ModelRedirectRule {
-    ModelRedirectRule {
+fn build_model_redirect_rule(pattern: &str, replace: &str) -> CompiledModelRedirectRule {
+    compile_model_redirects(&[ModelRedirectRule {
         pattern: pattern.to_string(),
         replace: replace.to_string(),
-    }
+    }])
+    .expect("model redirect compiles")
+    .pop()
+    .expect("compiled rule exists")
 }
 
 #[test]
