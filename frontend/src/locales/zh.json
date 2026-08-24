@@ -824,7 +824,9 @@
 		"timeRangeTo": "止: yyyy-MM-dd HH:mm:ss",
 		"toggleFilters": "展开/收起筛选",
 		"visibleWindowTps": "生成窗口 TPS",
-		"sessionAffinity": "会话亲和"
+		"sessionAffinity": "会话亲和",
+		"uncachedInput": "未缓存输入",
+		"cachedInput": "缓存输入"
 	},
 	"billingPlans": {
 		"title": "订阅套餐",

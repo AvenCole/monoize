@@ -820,7 +820,9 @@
 		"timeRangeTo": "終了: yyyy-MM-dd HH:mm:ss",
 		"toggleFilters": "フィルターの表示/非表示",
 		"visibleWindowTps": "生成ウィンドウ TPS",
-		"sessionAffinity": "セッションアフィニティ"
+		"sessionAffinity": "セッションアフィニティ",
+		"uncachedInput": "非キャッシュ入力",
+		"cachedInput": "キャッシュ入力"
 	},
 	"billingPlans": {
 		"title": "課金プラン",

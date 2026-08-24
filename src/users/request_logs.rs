@@ -158,17 +158,19 @@ fn charge_aggregate_select(is_postgres: bool) -> String {
 }
 
 /// ORDER BY expression over the charge aggregate produced by
-/// `charge_aggregate_columns`. PostgreSQL orders by the numeric aggregate;
-/// SQLite orders by the fixed-limb columns from most to least significant,
-/// which is monotonic for the non-negative request-log charges this ranking
-/// consumes.
-fn charge_aggregate_order_expr(is_postgres: bool) -> String {
+/// `charge_aggregate_columns`, applied to the derived-table alias that owns
+/// the aggregate columns. PostgreSQL orders by the numeric aggregate; SQLite
+/// orders by the fixed-limb columns from most to least significant, which is
+/// monotonic for the non-negative request-log charges this ranking consumes.
+/// The alias indirection is required because PostgreSQL refuses to resolve
+/// SELECT-list aliases inside ORDER BY expressions.
+fn charge_aggregate_order_expr(is_postgres: bool, alias: &str) -> String {
     if is_postgres {
-        "CAST(total_charge_nano_usd AS NUMERIC) DESC".to_string()
+        format!("CAST({alias}.total_charge_nano_usd AS NUMERIC) DESC")
     } else {
         (0..5)
             .rev()
-            .map(|limb| format!("charge_limb_{limb} DESC"))
+            .map(|limb| format!("{alias}.charge_limb_{limb} DESC"))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -1737,17 +1739,19 @@ impl UserStore {
         }
         let limit = limit.clamp(1, 20);
         let charge_columns = charge_aggregate_columns(!is_sqlite);
-        let charge_order = charge_aggregate_order_expr(!is_sqlite);
+        let charge_order = charge_aggregate_order_expr(!is_sqlite, "ranked");
         let sql = format!(
-            "SELECT rl.user_id, u.username AS username, {charge_columns}, COUNT(*) AS call_count \
-             FROM request_logs rl \
-             LEFT JOIN users u ON u.id = rl.user_id \
-             WHERE rl.created_at_unix_ms >= $1 \
-               AND rl.created_at_unix_ms < $2 \
-               AND rl.created_at_unix_ms IS NOT NULL \
-               AND rl.user_id IS NOT NULL \
-             GROUP BY rl.user_id, u.username \
-             ORDER BY {charge_order}, call_count DESC, username ASC \
+            "SELECT * FROM ( \
+                SELECT rl.user_id, u.username AS username, {charge_columns}, COUNT(*) AS call_count \
+                FROM request_logs rl \
+                LEFT JOIN users u ON u.id = rl.user_id \
+                WHERE rl.created_at_unix_ms >= $1 \
+                  AND rl.created_at_unix_ms < $2 \
+                  AND rl.created_at_unix_ms IS NOT NULL \
+                  AND rl.user_id IS NOT NULL \
+                GROUP BY rl.user_id, u.username \
+             ) ranked \
+             ORDER BY {charge_order}, ranked.call_count DESC, ranked.username ASC \
              LIMIT $3"
         );
         let rows = self

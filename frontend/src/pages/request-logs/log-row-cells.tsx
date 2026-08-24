@@ -657,10 +657,19 @@ export function LogRowCells({
 					<Tooltip onOpenChange={inputTooltipOpenChange}>
 						<TooltipTrigger asChild>
 							<span className='inline-flex cursor-default flex-col items-end leading-4'>
-								<span>{formatTokenCount(inputTokensForDisplay)}</span>
+								<span>
+									{inputCached != null ? (
+										<>
+											{t('requestLogs.uncachedInput')}{' '}
+											{formatTokenCount(inputUncached)}
+										</>
+									) : (
+										formatTokenCount(inputTokensForDisplay)
+									)}
+								</span>
 								{inputCached ? (
 									<span className='text-[10px] text-success'>
-										{t('requestLogs.cachedTokens')} {formatTokenCount(inputCached)}
+										{t('requestLogs.cachedInput')} {formatTokenCount(inputCached)}
 									</span>
 								) : null}
 							</span>
