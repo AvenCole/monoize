@@ -21,6 +21,12 @@ variable is missing or invalid, startup MUST fail with code `smtp_config_invalid
 ER-C3. SMTP credentials MUST NOT appear in API responses or logs. SMTP connection
 attempts MUST have a finite timeout of 10 seconds.
 
+ER-C4. The administrator settings UI MUST expose the registration toggle and an
+email-registration section that states SMTP is configured through server
+environment variables. It MUST display the fixed verification expiry, resend
+cooldown, and maximum-attempt values. It MUST NOT provide a field that stores SMTP
+credentials in the database.
+
 ## 2. Registration initiation
 
 ER-R1. `POST /api/dashboard/auth/register` MUST accept JSON fields

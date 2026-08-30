@@ -46,6 +46,10 @@ title, and every visible dashboard brand label, including the first line of the
 top-left `site name + Console` lockup. Empty or whitespace-only site names MUST use
 the existing `Monoize` fallback.
 
+BR-U2a. The document favicon MUST probe `/api/dashboard/branding/logo` and use the
+persisted PNG when available. A missing, unavailable, or undecodable logo MUST
+restore `/monoize.svg` without replacing the built-in fallback mark.
+
 BR-U3. The settings page MUST provide upload, preview, and reset controls in the
 existing site-information category. Upload and reset mutations MUST update the
 visible preview without a manual page reload. All controls and errors MUST use the

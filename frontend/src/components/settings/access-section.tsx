@@ -50,6 +50,18 @@ export function AccessSection({ settings, onChange }: AccessSectionProps) {
           />
           <FieldDescription>{t("settings.defaultUserRoleDescription")}</FieldDescription>
         </Field>
+        <Field>
+          <FieldLabel>{t("settings.emailRegistration")}</FieldLabel>
+          <FieldDescription>{t("settings.emailRegistrationDescription")}</FieldDescription>
+          <div className="rounded-md border bg-muted/30 px-3 py-2 text-sm text-muted-foreground">
+            {t("settings.emailRegistrationSmtpHint")}
+          </div>
+          <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-3">
+            <span>{t("settings.emailVerificationExpiry")}: 15 min</span>
+            <span>{t("settings.emailVerificationResend")}: 60 s</span>
+            <span>{t("settings.emailVerificationAttempts")}: 5</span>
+          </div>
+        </Field>
       </SettingsGroup>
 
       <SettingsGroup label={t("settings.sessionSecurity")}>

@@ -3,6 +3,8 @@ import { SWRConfig } from "swr";
 import { AuthProvider } from "@/hooks/use-auth";
 import { ThemeProvider } from "@/hooks/use-theme";
 import { Toaster } from "@/components/ui/sonner";
+import { usePublicSettings } from "@/lib/swr";
+import { useEffect } from "react";
 import { LoginPage } from "@/pages/login";
 import { DashboardLayout } from "@/pages/layout";
 import { DashboardPage } from "@/pages/dashboard";
@@ -24,6 +26,29 @@ import { PaymentsPage } from "@/pages/payments";
 import "@/i18n";
 
 function App() {
+  const { data: publicSettings } = usePublicSettings();
+
+  useEffect(() => {
+    const icon = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+    if (!icon) return;
+    const fallback = "/monoize.svg";
+    const logo = "/api/dashboard/branding/logo";
+    icon.href = logo;
+    const restoreFallback = () => {
+      icon.href = fallback;
+    };
+    const probe = new Image();
+    probe.onload = () => {
+      icon.href = `${logo}?v=${Date.now()}`;
+    };
+    probe.onerror = restoreFallback;
+    probe.src = `${logo}?v=${Date.now()}`;
+    return () => {
+      probe.onload = null;
+      probe.onerror = null;
+    };
+  }, [publicSettings?.logo_url]);
+
   return (
     <ThemeProvider>
       <SWRConfig
