@@ -8,6 +8,8 @@ import {
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { Badge } from "@/components/ui/badge";
+import { KeyRound, Mail, ServerCog, ShieldCheck } from "lucide-react";
 import type { SystemSettings } from "@/lib/api";
 import { SettingsGroup } from "./settings-category-panel";
 
@@ -51,15 +53,65 @@ export function AccessSection({ settings, onChange }: AccessSectionProps) {
           <FieldDescription>{t("settings.defaultUserRoleDescription")}</FieldDescription>
         </Field>
         <Field>
-          <FieldLabel>{t("settings.emailRegistration")}</FieldLabel>
+          <FieldLabel className="flex items-center gap-2">
+            <Mail className="size-4 text-muted-foreground" aria-hidden="true" />
+            {t("settings.emailRegistration")}
+          </FieldLabel>
           <FieldDescription>{t("settings.emailRegistrationDescription")}</FieldDescription>
-          <div className="rounded-md border bg-muted/30 px-3 py-2 text-sm text-muted-foreground">
-            {t("settings.emailRegistrationSmtpHint")}
-          </div>
-          <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-3">
-            <span>{t("settings.emailVerificationExpiry")}: 15 min</span>
-            <span>{t("settings.emailVerificationResend")}: 60 s</span>
-            <span>{t("settings.emailVerificationAttempts")}: 5</span>
+          <div className="overflow-hidden rounded-lg border bg-muted/20">
+            <div className="flex flex-wrap items-start justify-between gap-3 border-b px-4 py-3">
+              <div className="flex min-w-0 items-start gap-3">
+                <div className="flex size-9 shrink-0 items-center justify-center rounded-md border bg-background text-muted-foreground">
+                  <ServerCog className="size-4" aria-hidden="true" />
+                </div>
+                <div className="min-w-0 space-y-1">
+                  <p className="text-sm font-medium">{t("settings.emailSmtpTitle")}</p>
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    {t("settings.emailSmtpDescription")}
+                  </p>
+                </div>
+              </div>
+              <Badge variant="secondary" className="gap-1.5">
+                <ServerCog className="size-3.5" aria-hidden="true" />
+                {t("settings.emailSmtpManaged")}
+              </Badge>
+            </div>
+            <div className="space-y-3 px-4 py-3">
+              <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+                <KeyRound className="size-3.5" aria-hidden="true" />
+                {t("settings.emailSmtpVariables")}
+              </div>
+              <div className="flex flex-wrap gap-2" aria-label={t("settings.emailSmtpVariables")}>
+                {[
+                  "MONOIZE_SMTP_HOST",
+                  "MONOIZE_SMTP_PORT",
+                  "MONOIZE_SMTP_USERNAME",
+                  "MONOIZE_SMTP_PASSWORD",
+                  "MONOIZE_SMTP_FROM",
+                  "MONOIZE_SMTP_FROM_NAME",
+                ].map((variable) => (
+                  <code key={variable} className="rounded border bg-background px-2 py-1 text-[11px] text-foreground/80">
+                    {variable}
+                  </code>
+                ))}
+              </div>
+              <p className="text-xs leading-5 text-muted-foreground">
+                {t("settings.emailRegistrationSmtpHint")}
+              </p>
+            </div>
+            <div className="grid gap-px border-t bg-border sm:grid-cols-3">
+              {[
+                ["settings.emailVerificationExpiry", "15 min"],
+                ["settings.emailVerificationResend", "60 s"],
+                ["settings.emailVerificationAttempts", "5"],
+              ].map(([label, value]) => (
+                <div key={label} className="flex items-center gap-2 bg-muted/20 px-4 py-3 text-xs">
+                  <ShieldCheck className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+                  <span className="text-muted-foreground">{t(label)}</span>
+                  <span className="ml-auto font-medium text-foreground">{value}</span>
+                </div>
+              ))}
+            </div>
           </div>
         </Field>
       </SettingsGroup>

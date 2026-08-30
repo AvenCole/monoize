@@ -27,6 +27,12 @@ environment variables. It MUST display the fixed verification expiry, resend
 cooldown, and maximum-attempt values. It MUST NOT provide a field that stores SMTP
 credentials in the database.
 
+ER-C4a. The email-registration section MUST render a visual SMTP configuration
+status panel with a clear server-managed status, the required environment variable
+names, and the fixed verification policy values. The panel MUST NOT render editable
+password or credential fields, and it MUST remain understandable when SMTP is
+unavailable.
+
 ## 2. Registration initiation
 
 ER-R1. `POST /api/dashboard/auth/register` MUST accept JSON fields

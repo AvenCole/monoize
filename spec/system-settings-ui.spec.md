@@ -158,6 +158,11 @@ SSU-23a. Branding logo controls are separate multipart mutations defined by
 `branding-settings.spec.md`; they MUST NOT be encoded into the JSON payload of
 `PUT /api/dashboard/settings`.
 
+SSU-23b. The access-control registration section MUST present SMTP setup as a
+server-managed visual panel. It MUST show the SMTP environment variable names and
+the fixed verification policy values without adding credential fields to the
+settings JSON form.
+
 SSU-24. At viewport widths of 320px and above, the page MUST NOT create page-level
 horizontal overflow. The only horizontal scroll container on the page is the rail's
 internal scroll area (SSU-5). This restates ST6e for the redesigned layout.
