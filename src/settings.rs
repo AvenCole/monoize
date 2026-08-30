@@ -15,13 +15,6 @@ pub struct PublicSettings {
     pub site_name: String,
     pub site_description: String,
     pub api_base_url: String,
-    pub smtp_host: String,
-    pub smtp_port: u16,
-    pub smtp_username: String,
-    pub smtp_password: String,
-    pub smtp_from_email: String,
-    pub smtp_from_name: String,
-    pub smtp_use_tls: bool,
     pub cap_api_endpoint: Option<String>,
 }
 
@@ -35,6 +28,13 @@ pub struct SystemSettings {
     pub site_name: String,
     pub site_description: String,
     pub api_base_url: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_username: String,
+    pub smtp_password: String,
+    pub smtp_from_email: String,
+    pub smtp_from_name: String,
+    pub smtp_use_tls: bool,
     #[serde(default)]
     pub global_transforms: Vec<TransformRuleConfig>,
     #[serde(default)]

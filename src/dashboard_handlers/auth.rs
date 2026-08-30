@@ -198,7 +198,7 @@ pub async fn register(
         .begin_email_registration(username, &email, &body.password)
         .await
         .map_err(map_email_registration_error)?;
-    send_registration_code(email_service, &dispatch).await?;
+    send_registration_code(&email_service, &dispatch).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(registration_accepted_response(&dispatch)),
@@ -226,7 +226,7 @@ pub async fn resend_registration_code(
         .resend_email_registration(body.registration_id.trim())
         .await
         .map_err(map_email_registration_error)?;
-    send_registration_code(email_service, &dispatch).await?;
+    send_registration_code(&email_service, &dispatch).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(registration_accepted_response(&dispatch)),
