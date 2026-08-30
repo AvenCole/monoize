@@ -38,7 +38,11 @@ The server listens on `0.0.0.0:8080` by default. Set `MONOIZE_LISTEN` to change 
 ## Create the first account
 
 1. Open `http://localhost:8080` in a browser.
-2. Register an account. The first registered account becomes `super_admin`. This happens even when public registration is disabled.
+2. Configure the SMTP variables listed in [Configuration](/en/docs/configuration). Email registration is unavailable when `MONOIZE_SMTP_HOST` is unset.
+3. Select **Sign up**, enter a username, password, and email address, then request a verification code.
+4. Enter the six-digit code from the email. The first verified account becomes `super_admin`, even when public registration is disabled.
+
+Administrators can open **Settings > Site** to upload a PNG, JPEG, or WebP logo. The logo appears on the login page, sidebar, and browser tab. Use **Reset logo** to remove it.
 
 ## Configure a route
 

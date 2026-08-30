@@ -20,7 +20,11 @@ CAP-C6. Updating `captcha_enabled` through the authenticated system settings API
 
 ## 2. Authentication request contract
 
-CAP-A1. `POST /api/dashboard/auth/login` and `POST /api/dashboard/auth/register` MUST accept an optional `captcha_token: string` in the JSON request body.
+CAP-A1. `POST /api/dashboard/auth/login`, `POST /api/dashboard/auth/register`, and
+`POST /api/dashboard/auth/register/resend-code` MUST accept an optional
+`captcha_token: string` in the JSON request body. The final
+`POST /api/dashboard/auth/register/verify` request uses the mailbox code and does not
+accept or require CAPTCHA.
 
 CAP-A2. Each authentication request MUST read only the `captcha_enabled` settings row before CAPTCHA and account processing. A missing row MUST resolve to `true`. A malformed row or database error MUST return HTTP `500` without querying or mutating user or session state.
 
@@ -78,6 +82,10 @@ CAP-U5. After a failed login or registration request, the client MUST clear the 
 CAP-U6. Widget solve and widget error messages MUST use the active dashboard locale. Supported dashboard locales MUST remain English, Simplified Chinese, Traditional Chinese, and Japanese.
 
 CAP-U7. The system settings page MUST expose `captcha_enabled` as a switch in the session and security section. Its default state MUST be enabled. Its description MUST state that disabling it removes bot and credential-stuffing protection from dashboard login and registration.
+
+CAP-A6. A registration initiation or resend request that passes CAPTCHA MUST only
+create or update a pending registration. It MUST NOT create a user or session until
+the email verification contract in `email-registration.spec.md` succeeds.
 
 CAP-U8. The rendered widget control MUST occupy 100% of the login form width and match the submit button width. It MUST have a height of 48 CSS pixels and an 8 CSS pixel border radius. Its background, border, text, checkbox, spinner, and focus colors MUST derive from the dashboard semantic color variables. Changing the dashboard between light and dark themes MUST update these colors without reloading or recreating the widget.
 

@@ -47,7 +47,7 @@
 		"accessDenied": "アクセス拒否",
 		"needAdminPrivileges": "このページを閲覧するには管理者権限が必要です",
 		"captchaError": "人間確認に失敗しました。もう一度お試しください。",
-		"captchaUnavailable": "人間確認が設定されていないか、一時的に利用できません。"
+		"captchaUnavailable": "人間確認が設定されていないか、一時的に利用できません。", "email": "メールアドレス", "enterEmail": "メールアドレスを入力", "verificationCode": "確認コード", "enterVerificationCode": "6桁のコードを入力", "verifyEmail": "メールを確認", "verificationSent": "確認コードをメールで送信しました。", "verificationResent": "新しいコードを送信しました。", "resendCode": "コードを再送信", "verificationFailed": "確認に失敗しました。"
 	},
 	"nav": {
 		"dashboard": "ダッシュボード",
@@ -366,7 +366,7 @@
 		"siteInformation": "サイト情報",
 		"siteInfoDescription": "Monoize インスタンスの基本情報",
 		"siteName": "サイト名",
-		"siteDescription": "サイト説明",
+		"siteDescription": "サイト説明", "siteLogo": "サイトロゴ", "removeLogo": "ロゴを削除", "logoTooLarge": "ロゴは1 MB以下にしてください。", "logoUploadFailed": "ロゴのアップロードに失敗しました。",
 		"apiBaseUrl": "API ベース URL",
 		"apiBaseUrlPlaceholder": "例：https://api.example.com",
 		"apiBaseUrlDescription": "下流クライアントがこのプロキシに接続するための API ベース URL。ダッシュボードに表示されます",

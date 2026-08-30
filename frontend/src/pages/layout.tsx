@@ -36,10 +36,11 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
-import { MonoizeLogo } from "@/components/MonoizeLogo";
+import { BrandLogo } from "@/components/BrandLogo";
+import { usePublicSettings } from "@/lib/swr";
 import { UserCenterMenu } from "@/components/user-center-menu";
 import { springs } from "@/components/ui/motion";
 
@@ -130,6 +131,8 @@ function Sidebar({
 }) {
   const { user } = useAuth();
   const { t } = useTranslation();
+  const { data: publicSettings } = usePublicSettings();
+  const siteName = publicSettings?.site_name?.trim() || "Monoize";
   const isAdmin = user?.role === "super_admin" || user?.role === "admin";
 
   const navItems = [
@@ -174,7 +177,7 @@ function Sidebar({
                 onClick={onExpand}
               >
                 <span className="relative flex size-8 items-center justify-center rounded-lg bg-foreground text-background shadow-sm">
-                  <MonoizeLogo className="absolute inset-0 !size-full transition-opacity duration-150 group-hover:opacity-0 group-focus-visible:opacity-0" />
+                  <BrandLogo className="absolute inset-0 !size-full object-contain transition-opacity duration-150 group-hover:opacity-0 group-focus-visible:opacity-0" />
                   <PanelLeftOpen
                     data-icon="inline-start"
                     className="opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-visible:opacity-100"
@@ -198,10 +201,10 @@ function Sidebar({
                 transition={springs.snappy}
                 className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-foreground text-background shadow-sm"
               >
-                <MonoizeLogo className="size-full" />
+                <BrandLogo className="size-full object-contain" />
               </motion.div>
               <div className="flex min-w-0 flex-col leading-none">
-                <span className="truncate font-display text-sm font-semibold tracking-tight">Monoize</span>
+                <span className="truncate font-display text-sm font-semibold tracking-tight">{siteName}</span>
                 <span className="mt-0.5 truncate text-xs text-muted-foreground">Console</span>
               </div>
             </Link>
@@ -277,8 +280,14 @@ function Sidebar({
 export function DashboardLayout() {
   const { user, loading } = useAuth();
   const { t } = useTranslation();
+  const { data: publicSettings } = usePublicSettings();
+  const siteName = publicSettings?.site_name ?? "Monoize";
   const [open, setOpen] = useState(false);
   const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState(false);
+
+  useEffect(() => {
+    document.title = siteName.trim() || "Monoize";
+  }, [siteName]);
 
   if (loading) {
     return (

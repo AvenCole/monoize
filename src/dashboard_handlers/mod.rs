@@ -3,6 +3,7 @@ mod analytics_request_logs;
 mod api_keys;
 mod auth;
 mod billing_plans;
+mod branding;
 mod captcha;
 mod custom_transforms;
 mod groups;
@@ -27,9 +28,10 @@ pub use api_keys::{
     update_api_key,
 };
 pub use auth::{
-    AuthResponse, ChangePasswordRequest, LoginRequest, RegisterRequest, UpdateMeRequest,
-    UserResponse, change_password, get_me, login, logout, register, update_me,
-    user_response_from_store,
+    AuthResponse, ChangePasswordRequest, LoginRequest, RegisterRequest,
+    RegistrationAcceptedResponse, ResendRegistrationCodeRequest, UpdateMeRequest, UserResponse,
+    VerifyRegistrationRequest, change_password, get_me, login, logout, register,
+    resend_registration_code, update_me, user_response_from_store, verify_registration,
 };
 pub use billing_plans::{
     AssignBillingPlanRequest, BillingPlanResponse, CreateBillingPlanRequest,
@@ -38,6 +40,7 @@ pub use billing_plans::{
     list_billing_plan_marketplace, list_billing_plans, purchase_billing_plan,
     revoke_user_billing_plan_subscription, update_billing_plan,
 };
+pub use branding::{LogoMutationResponse, delete_logo, get_logo, upload_logo};
 pub use captcha::{create_captcha_challenge, redeem_captcha_challenge};
 pub use custom_transforms::{
     CreateCustomTransformRequest, UpdateCustomTransformRequest, create_custom_transform,

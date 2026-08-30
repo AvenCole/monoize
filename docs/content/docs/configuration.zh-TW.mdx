@@ -19,6 +19,22 @@ description: Monoize 程序的環境變數。
 | `MONOIZE_TRUSTED_PROXY_CIDRS` | `127.0.0.0/8,::1/128` | 受信任的反向代理網段；明確設為空值即停用信任 |
 | `MONOIZE_UPSTREAM_PROXY_URL` | 未設定 | 上游呼叫的對外 HTTP(S) 代理；Channel 可用 `proxy_url` 個別覆寫 |
 
+## 電子郵件註冊
+
+啟用電子郵件註冊前設定所有 SMTP 變數。伺服器預設使用 STARTTLS，並拒絕未加密的 SMTP。
+
+| 變數 | 預設值 | 用途 |
+| --- | --- | --- |
+| `MONOIZE_SMTP_HOST` | 未設定 | SMTP 主機；未設定時停用電子郵件註冊 |
+| `MONOIZE_SMTP_PORT` | 必填 | SMTP 連接埠 |
+| `MONOIZE_SMTP_USERNAME` | 必填 | SMTP 使用者名稱 |
+| `MONOIZE_SMTP_PASSWORD` | 必填 | SMTP 密碼 |
+| `MONOIZE_SMTP_FROM` | 必填 | 寄件者電子郵件 |
+| `MONOIZE_SMTP_FROM_NAME` | 未設定 | 可選的寄件者顯示名稱 |
+| `MONOIZE_SMTP_SECURITY` | `starttls` | `starttls` 或 `tls` |
+
+註冊請求會在使用者輸入電子郵件中的六位驗證碼前保持待驗證狀態。驗證碼 15 分鐘後過期，60 秒後可重新傳送。第一個完成驗證的帳號成為 `super_admin`。
+
 ## 資料庫
 
 Monoize 支援 SQLite 和 PostgreSQL。業務資料表只支援一個 Monoize 程序作為寫入者。

@@ -19,6 +19,22 @@ description: Monoize 进程的环境变量。
 | `MONOIZE_TRUSTED_PROXY_CIDRS` | `127.0.0.0/8,::1/128` | 受信任的反向代理网段；显式设为空值即禁用信任 |
 | `MONOIZE_UPSTREAM_PROXY_URL` | 未设置 | 上游调用的出站 HTTP(S) 代理；Channel 可用 `proxy_url` 单独覆盖 |
 
+## 邮箱注册
+
+启用邮箱注册前设置全部 SMTP 变量。服务器默认使用 STARTTLS，并拒绝未加密的 SMTP。
+
+| 变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `MONOIZE_SMTP_HOST` | 未设置 | SMTP 主机；未设置时禁用邮箱注册 |
+| `MONOIZE_SMTP_PORT` | 必填 | SMTP 端口 |
+| `MONOIZE_SMTP_USERNAME` | 必填 | SMTP 用户名 |
+| `MONOIZE_SMTP_PASSWORD` | 必填 | SMTP 密码 |
+| `MONOIZE_SMTP_FROM` | 必填 | 发件人邮箱 |
+| `MONOIZE_SMTP_FROM_NAME` | 未设置 | 可选的发件人显示名称 |
+| `MONOIZE_SMTP_SECURITY` | `starttls` | `starttls` 或 `tls` |
+
+注册请求会在用户输入邮件中的六位验证码前保持待验证状态。验证码 15 分钟后过期，60 秒后可重新发送。第一个完成验证的账号成为 `super_admin`。
+
 ## 数据库
 
 Monoize 支持 SQLite 和 PostgreSQL。业务表只支持一个 Monoize 进程作为写入者。

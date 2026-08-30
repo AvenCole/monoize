@@ -5,7 +5,8 @@ use crate::dashboard_handlers::session_helpers::{
 };
 use crate::error::{AppError, AppResult};
 use crate::users::{
-    RegisterUserError, User, UserRole, UserStore, UserTodayUsage, format_nano_to_usd,
+    EmailRegistrationError, RegistrationDispatch, User, UserRole, UserStore, UserTodayUsage,
+    format_nano_to_usd,
 };
 use axum::Json;
 use axum::extract::State;
@@ -20,8 +21,30 @@ const NONEXISTENT_USER_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$bW9
 pub struct RegisterRequest {
     pub username: String,
     pub password: String,
+    pub email: String,
     #[serde(default)]
     pub captcha_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResendRegistrationCodeRequest {
+    pub registration_id: String,
+    #[serde(default)]
+    pub captcha_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyRegistrationRequest {
+    pub registration_id: String,
+    pub code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegistrationAcceptedResponse {
+    pub registration_id: String,
+    pub email: String,
+    pub expires_at: String,
+    pub resend_after: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,9 +151,16 @@ pub async fn register(
     verify_captcha(&state, &body.captcha_token).await?;
 
     let user_store = &state.user_store;
-    let settings_store = &state.settings_store;
+    let username = body.username.trim();
+    let email = normalize_registration_email(&body.email).ok_or_else(|| {
+        AppError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_email",
+            "email must contain a valid address",
+        )
+    })?;
 
-    if !is_valid_username(&body.username) {
+    if !is_valid_username(username) {
         return Err(AppError::new(
             StatusCode::BAD_REQUEST,
             "invalid_username",
@@ -138,7 +168,7 @@ pub async fn register(
         ));
     }
 
-    if is_reserved_internal_username(&body.username) {
+    if is_reserved_internal_username(username) {
         return Err(AppError::new(
             StatusCode::BAD_REQUEST,
             "reserved_username",
@@ -154,50 +184,89 @@ pub async fn register(
         ));
     }
 
-    let registration_enabled = settings_store
-        .is_registration_enabled()
+    let email_service = state.email_service.as_ref().ok_or_else(|| {
+        AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "email_not_configured",
+            "email registration is not configured",
+        )
+    })?;
+    let dispatch = user_store
+        .begin_email_registration(username, &email, &body.password)
         .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+        .map_err(map_email_registration_error)?;
+    send_registration_code(email_service, &dispatch).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(registration_accepted_response(&dispatch)),
+    )
+        .into_response())
+}
 
-    let user = user_store
-        .register_user_atomic(&body.username, &body.password, registration_enabled)
+pub async fn resend_registration_code(
+    State(state): State<AppState>,
+    Json(body): Json<ResendRegistrationCodeRequest>,
+) -> AppResult<impl IntoResponse> {
+    verify_captcha(&state, &body.captcha_token).await?;
+    let email_service = state.email_service.as_ref().ok_or_else(|| {
+        AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "email_not_configured",
+            "email registration is not configured",
+        )
+    })?;
+    let dispatch = state
+        .user_store
+        .resend_email_registration(body.registration_id.trim())
         .await
-        .map_err(|error| match error {
-            RegisterUserError::RegistrationDisabled => AppError::new(
-                StatusCode::FORBIDDEN,
-                "registration_disabled",
-                "user registration is currently disabled",
-            ),
-            RegisterUserError::UsernameExists => AppError::new(
-                StatusCode::CONFLICT,
-                "username_exists",
-                "username already exists",
-            ),
-            RegisterUserError::Storage(error) => {
-                AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error)
-            }
-        })?;
+        .map_err(map_email_registration_error)?;
+    send_registration_code(email_service, &dispatch).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(registration_accepted_response(&dispatch)),
+    )
+        .into_response())
+}
 
+pub async fn verify_registration(
+    State(state): State<AppState>,
+    Json(body): Json<VerifyRegistrationRequest>,
+) -> AppResult<impl IntoResponse> {
+    let code = body.code.trim();
+    if code.len() != 6 || !code.bytes().all(|value| value.is_ascii_digit()) {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "verification_invalid",
+            "verification code must contain six digits",
+        ));
+    }
+    let user = state
+        .user_store
+        .verify_email_registration(body.registration_id.trim(), code)
+        .await
+        .map_err(map_email_registration_error)?;
     let session_ttl_days = state
         .settings_store
         .get_session_ttl_days()
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
-    let session = user_store
+    let session = state
+        .user_store
         .create_session(&user.id, session_ttl_days)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
-
     let cookie = build_session_cookie(&session.token, session_ttl_days);
-    let user = user_response_from_store(user_store, user)
+    let user = user_response_from_store(&state.user_store, user)
         .await
         .map_err(map_user_response_error)?;
-    let body = Json(AuthResponse {
-        token: session.token,
-        user,
-    });
-    Ok(([(axum::http::header::SET_COOKIE, cookie)], body).into_response())
+    Ok((
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(AuthResponse {
+            token: session.token,
+            user,
+        }),
+    )
+        .into_response())
 }
 
 pub async fn login(
@@ -462,6 +531,96 @@ async fn verify_captcha(state: &AppState, token: &str) -> AppResult<()> {
                 "CAPTCHA verification is temporarily unavailable",
             ),
         })
+}
+
+fn normalize_registration_email(raw: &str) -> Option<String> {
+    let email = raw.trim().to_ascii_lowercase();
+    if email.is_empty() || email.len() > 320 || email.chars().any(char::is_control) {
+        return None;
+    }
+    let mut parts = email.split('@');
+    let local = parts.next().unwrap_or_default();
+    let host = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || local.is_empty()
+        || host.is_empty()
+        || host.starts_with('.')
+        || host.ends_with('.')
+        || !host.contains('.')
+    {
+        return None;
+    }
+    Some(email)
+}
+
+fn registration_accepted_response(dispatch: &RegistrationDispatch) -> RegistrationAcceptedResponse {
+    RegistrationAcceptedResponse {
+        registration_id: dispatch.registration_id.clone(),
+        email: dispatch.email.clone(),
+        expires_at: dispatch.expires_at.to_rfc3339(),
+        resend_after: dispatch.resend_after.to_rfc3339(),
+    }
+}
+
+async fn send_registration_code(
+    service: &crate::email::EmailService,
+    dispatch: &RegistrationDispatch,
+) -> AppResult<()> {
+    service
+        .send_verification_code(&dispatch.email, &dispatch.username, &dispatch.code)
+        .await
+        .map_err(|error| {
+            AppError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "email_send_failed",
+                "verification email could not be delivered",
+            )
+            .with_internal_message(error)
+        })
+}
+
+fn map_email_registration_error(error: EmailRegistrationError) -> AppError {
+    match error {
+        EmailRegistrationError::RegistrationDisabled => AppError::new(
+            StatusCode::FORBIDDEN,
+            "registration_disabled",
+            "user registration is currently disabled",
+        ),
+        EmailRegistrationError::UsernameExists => AppError::new(
+            StatusCode::CONFLICT,
+            "username_exists",
+            "username already exists",
+        ),
+        EmailRegistrationError::EmailExists => {
+            AppError::new(StatusCode::CONFLICT, "email_exists", "email already exists")
+        }
+        EmailRegistrationError::VerificationCooldown { retry_after } => {
+            let seconds = (retry_after - chrono::Utc::now()).num_seconds().max(1);
+            AppError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "verification_cooldown",
+                format!("request another code in {seconds} seconds"),
+            )
+        }
+        EmailRegistrationError::VerificationExpired => AppError::new(
+            StatusCode::GONE,
+            "verification_expired",
+            "the verification request has expired",
+        ),
+        EmailRegistrationError::VerificationInvalid => AppError::new(
+            StatusCode::BAD_REQUEST,
+            "verification_invalid",
+            "verification code is incorrect",
+        ),
+        EmailRegistrationError::VerificationAttemptsExceeded => AppError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "verification_attempts_exceeded",
+            "too many incorrect verification attempts",
+        ),
+        EmailRegistrationError::Storage(error) => {
+            AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error)
+        }
+    }
 }
 
 fn build_session_cookie(token: &str, ttl_days: i64) -> String {

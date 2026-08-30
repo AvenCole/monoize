@@ -6,7 +6,10 @@ import {
   FieldLabel,
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 import type { SystemSettings } from "@/lib/api";
+import { api } from "@/lib/api";
+import { useState } from "react";
 
 interface SiteSectionProps {
   settings: SystemSettings;
@@ -16,6 +19,10 @@ interface SiteSectionProps {
 /** Site identity fields: name, description, downstream API base URL. */
 export function SiteSection({ settings, onChange }: SiteSectionProps) {
   const { t } = useTranslation();
+  const [uploading, setUploading] = useState(false);
+  const [logoError, setLogoError] = useState("");
+  const [logoConfigured, setLogoConfigured] = useState(true);
+  const [logoVersion, setLogoVersion] = useState(0);
 
   return (
     <div className="grid gap-6 sm:grid-cols-2">
@@ -34,6 +41,15 @@ export function SiteSection({ settings, onChange }: SiteSectionProps) {
           value={settings.site_description}
           onChange={(e) => onChange({ site_description: e.target.value })}
         />
+      </Field>
+      <Field className="sm:col-span-2">
+        <FieldLabel htmlFor="site_logo">{t("settings.siteLogo")}</FieldLabel>
+        <div className="flex items-center gap-3">
+          {logoConfigured ? <img src={`/api/dashboard/branding/logo?v=${logoVersion}`} alt={settings.site_name || "Monoize"} className="size-12 rounded-md border object-contain" onError={() => setLogoConfigured(false)} /> : <div className="flex size-12 items-center justify-center rounded-md border text-xs text-muted-foreground">Monoize</div>}
+          <Input id="site_logo" type="file" accept="image/png,image/jpeg,image/webp" disabled={uploading} onChange={async (e) => { const file = e.target.files?.[0]; if (!file) return; if (file.size > 1024 * 1024) { setLogoError(t("settings.logoTooLarge")); return; } setUploading(true); setLogoError(""); try { await api.uploadLogo(file); setLogoConfigured(true); setLogoVersion((version) => version + 1); e.target.value = ""; } catch (err) { setLogoError(err instanceof Error ? err.message : t("settings.logoUploadFailed")); } finally { setUploading(false); } }} />
+          <Button type="button" variant="ghost" className="text-destructive" disabled={uploading} onClick={async () => { setUploading(true); setLogoError(""); try { await api.deleteLogo(); setLogoConfigured(false); } catch (err) { setLogoError(err instanceof Error ? err.message : t("settings.logoUploadFailed")); } finally { setUploading(false); } }}>{t("settings.removeLogo")}</Button>
+        </div>
+        {logoError && <FieldDescription className="text-destructive">{logoError}</FieldDescription>}
       </Field>
       <Field className="sm:col-span-2">
         <FieldLabel htmlFor="api_base_url">{t("settings.apiBaseUrl")}</FieldLabel>

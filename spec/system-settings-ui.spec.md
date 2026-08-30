@@ -20,7 +20,7 @@ these stable ids, in this order:
 
 | # | id | title key | fields |
 |---|----|-----------|--------|
-| 01 | `site` | `settings.siteInformation` | `site_name`, `site_description`, `api_base_url`, `recharge_public_origin` |
+| 01 | `site` | `settings.siteInformation` | `site_name`, `site_description`, `api_base_url`, `recharge_public_origin`, branding logo controls |
 | 02 | `access` | `settings.accessControl` | `registration_enabled`, `default_user_role`, `captcha_enabled`, `session_ttl_days`, `api_key_max_per_user` |
 | 03 | `codex` | `settings.codexModels` | `codex_model_ids` |
 | 04 | `suffix` | `settings.reasoningSuffixMap` | `reasoning_suffix_map` |
@@ -153,6 +153,10 @@ the rail/panel chrome (`settings.categoryRailLabel`, `settings.accessControl`,
 `settings.groupPassiveBreaker`, `settings.groupRequestCapture`,
 `settings.groupRuntimeBehavior`) MUST exist in all four locales (`en`, `zh`, `zh-TW`,
 `ja`).
+
+SSU-23a. Branding logo controls are separate multipart mutations defined by
+`branding-settings.spec.md`; they MUST NOT be encoded into the JSON payload of
+`PUT /api/dashboard/settings`.
 
 SSU-24. At viewport widths of 320px and above, the page MUST NOT create page-level
 horizontal overflow. The only horizontal scroll container on the page is the rail's

@@ -47,7 +47,8 @@
 		"accessDenied": "Access Denied",
 		"needAdminPrivileges": "You need admin privileges to view this page",
 		"captchaError": "Human verification failed. Try again.",
-		"captchaUnavailable": "Human verification is not configured or is unavailable."
+		"captchaUnavailable": "Human verification is not configured or is unavailable.",
+		"email": "Email", "enterEmail": "Enter your email", "verificationCode": "Verification code", "enterVerificationCode": "Enter the 6-digit code", "verifyEmail": "Verify email", "verificationSent": "Check your email for a verification code.", "verificationResent": "A new code was sent.", "resendCode": "Resend code", "verificationFailed": "Verification failed."
 	},
 	"nav": {
 		"dashboard": "Dashboard",
@@ -369,7 +370,7 @@
 		"siteInformation": "Site Information",
 		"siteInfoDescription": "Basic information about your Monoize instance",
 		"siteName": "Site Name",
-		"siteDescription": "Site Description",
+		"siteDescription": "Site Description", "siteLogo": "Site Logo", "removeLogo": "Remove logo", "logoTooLarge": "Logo must be 1 MB or smaller.", "logoUploadFailed": "Logo upload failed.",
 		"apiBaseUrl": "API Base URL",
 		"apiBaseUrlPlaceholder": "e.g., https://api.example.com",
 		"apiBaseUrlDescription": "The API base URL for downstream clients to connect to this proxy, displayed on the dashboard",

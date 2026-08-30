@@ -8,7 +8,8 @@ interface AuthContextType {
   user: User | null;
   loading: boolean;
   login: (username: string, password: string, captchaToken: string) => Promise<void>;
-  register: (username: string, password: string, captchaToken: string) => Promise<void>;
+  register: (username: string, password: string, email: string, captchaToken: string) => Promise<import("@/lib/api").RegistrationPendingResponse>;
+  verifyRegistration: (registrationId: string, code: string) => Promise<void>;
   changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshUser: () => Promise<void>;
@@ -47,8 +48,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(response.user);
   };
 
-  const register = async (username: string, password: string, captchaToken: string) => {
-    const response = await api.register(username, password, captchaToken);
+  const register = async (username: string, password: string, email: string, captchaToken: string) => {
+    return api.register(username, password, email, captchaToken);
+  };
+
+  const verifyRegistration = async (registrationId: string, code: string) => {
+    const response = await api.verifyRegistration(registrationId, code);
     await clearCache();
     setUser(response.user);
   };
@@ -70,7 +75,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, login, register, changePassword, logout, refreshUser }}
+      value={{ user, loading, login, register, verifyRegistration, changePassword, logout, refreshUser }}
     >
       {children}
     </AuthContext.Provider>

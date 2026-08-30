@@ -1,9 +1,11 @@
+mod email_registration;
 mod groups;
 mod plans;
 mod request_logs;
 mod store;
 mod utils;
 
+pub use email_registration::{EmailRegistrationError, RegistrationDispatch};
 pub use groups::{CreateGroupInput, Group, GroupStoreError, ReorderGroupsInput, UpdateGroupInput};
 pub use plans::{
     BillingPlan, BillingPlanInput, BillingPlanPrice, BillingPlanPriceInput,

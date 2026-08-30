@@ -47,7 +47,7 @@
 		"accessDenied": "访问被拒绝",
 		"needAdminPrivileges": "您需要管理员权限才能查看此页面",
 		"captchaError": "人机验证失败，请重试。",
-		"captchaUnavailable": "人机验证未配置或暂时不可用。"
+		"captchaUnavailable": "人机验证未配置或暂时不可用。", "email": "邮箱", "enterEmail": "输入邮箱", "verificationCode": "验证码", "enterVerificationCode": "输入 6 位验证码", "verifyEmail": "验证邮箱", "verificationSent": "验证码已发送，请检查邮箱。", "verificationResent": "验证码已重新发送。", "resendCode": "重新发送", "verificationFailed": "验证失败。"
 	},
 	"nav": {
 		"dashboard": "仪表盘",
@@ -369,7 +369,7 @@
 		"siteInformation": "站点信息",
 		"siteInfoDescription": "关于您的 Monoize 实例的基本信息",
 		"siteName": "站点名称",
-		"siteDescription": "站点描述",
+		"siteDescription": "站点描述", "siteLogo": "站点 Logo", "removeLogo": "移除 Logo", "logoTooLarge": "Logo 不能超过 1 MB。", "logoUploadFailed": "Logo 上传失败。",
 		"apiBaseUrl": "API 基址",
 		"apiBaseUrlPlaceholder": "例如：https://api.example.com",
 		"apiBaseUrlDescription": "下游客户端连接此代理使用的 API 基址，将在仪表盘首页展示",

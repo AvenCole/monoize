@@ -60,3 +60,4 @@ rquickjs = "0.12.2"
 md-5 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }

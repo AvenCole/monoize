@@ -19,6 +19,22 @@ description: Monoize プロセスの環境変数。
 | `MONOIZE_TRUSTED_PROXY_CIDRS` | `127.0.0.0/8,::1/128` | 信頼するリバースプロキシのネットワーク。明示的に空にすると信頼を無効化 |
 | `MONOIZE_UPSTREAM_PROXY_URL` | 未設定 | 上流呼び出し用の送信 HTTP(S) プロキシ。Channel の `proxy_url` で個別に上書き可能 |
 
+## メール登録
+
+メール登録を有効にする前に、すべての SMTP 変数を設定します。サーバーは既定で STARTTLS を使用し、暗号化されていない SMTP を拒否します。
+
+| 変数 | 既定値 | 用途 |
+| --- | --- | --- |
+| `MONOIZE_SMTP_HOST` | 未設定 | SMTP ホスト。未設定の場合はメール登録を無効化 |
+| `MONOIZE_SMTP_PORT` | 必須 | SMTP ポート |
+| `MONOIZE_SMTP_USERNAME` | 必須 | SMTP ユーザー名 |
+| `MONOIZE_SMTP_PASSWORD` | 必須 | SMTP パスワード |
+| `MONOIZE_SMTP_FROM` | 必須 | 送信元メールアドレス |
+| `MONOIZE_SMTP_FROM_NAME` | 未設定 | 任意の送信者表示名 |
+| `MONOIZE_SMTP_SECURITY` | `starttls` | `starttls` または `tls` |
+
+登録リクエストは、メールの 6 桁コードを入力するまで保留されます。コードは 15 分で期限切れになり、60 秒後に再送信できます。最初に検証を完了したアカウントが `super_admin` になります。
+
 ## データベース
 
 Monoize は SQLite と PostgreSQL に対応します。業務テーブルへの書き込みは 1 つの Monoize プロセスのみがサポートされます。

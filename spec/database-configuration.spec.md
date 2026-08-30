@@ -136,6 +136,7 @@ DBT5. On startup, the server MUST also create utility tables:
 - `system_settings`
 - `state_records`
 - `file_bytes`
+- `pending_registrations`
 
 ## 8. Ownership
 
@@ -215,5 +216,11 @@ DB24a. `system_settings` MUST persist `codex_model_ids` as a JSON array of strin
 DB24b. `system_settings` MUST persist `global_model_redirects` as a JSON array
 of `ModelRedirectRule` objects defined by `spec/api-key-model-redirects.spec.md`.
 A missing, invalid, or non-array value MUST resolve to `[]`.
+
+DB24c. `users.email` MUST have a unique case-insensitive, trimmed index for non-empty
+values. The `pending_registrations` table and its indexes are defined by
+`email-registration.spec.md`. Logo bytes are stored in `file_bytes` under the fixed
+tenant and file id defined by `branding-settings.spec.md`; no separate logo table is
+permitted.
 
 DB25. `monoize_channels` MUST persist nullable `affinity_enabled_override`, `affinity_idle_ttl_seconds_override`, `affinity_failback_mode_override`, and `affinity_failback_delay_seconds_override` columns.

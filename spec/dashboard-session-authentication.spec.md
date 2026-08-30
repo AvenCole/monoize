@@ -6,7 +6,9 @@ This specification defines browser storage and transport of dashboard sessions.
 
 ## 1. Session cookie
 
-DSA1. Successful login and registration MUST set `monoize_session` with attributes `HttpOnly`, `Secure`, `SameSite=Strict`, and `Path=/`.
+DSA1. Successful login and successful final email-registration verification MUST set
+`monoize_session` with attributes `HttpOnly`, `Secure`, `SameSite=Strict`, and
+`Path=/`. Registration initiation and code resend MUST NOT set a session cookie.
 
 DSA2. Dashboard browser requests MUST send cookies with `credentials: "include"`.
 

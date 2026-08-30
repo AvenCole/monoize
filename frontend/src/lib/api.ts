@@ -524,6 +524,19 @@ export interface PublicSystemSettings {
   site_description: string;
   api_base_url: string;
   cap_api_endpoint: string | null;
+  logo_url?: string | null;
+}
+
+export interface RegistrationPendingResponse {
+  registration_id: string;
+  email: string;
+  expires_at: string;
+  resend_after: string;
+}
+
+export interface LogoResponse {
+  configured: boolean;
+  url?: string;
 }
 
 export interface DashboardStats {
@@ -1102,7 +1115,7 @@ class ApiClient {
     options: RequestInit = {},
   ): Promise<T> {
     const headers: Record<string, string> = {
-      "Content-Type": "application/json",
+      ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
       ...(options.headers as Record<string, string>),
     };
 
@@ -1112,7 +1125,7 @@ class ApiClient {
       credentials: "include",
     });
 
-    const data = await response.json();
+    const data = response.status === 204 ? undefined : await response.json();
 
     if (!response.ok) {
       if (response.status === 401 && data.error?.code === "unauthorized") {
@@ -1131,11 +1144,26 @@ class ApiClient {
   async register(
     username: string,
     password: string,
+    email: string,
     captchaToken: string,
-  ): Promise<AuthResponse> {
+  ): Promise<RegistrationPendingResponse> {
     return this.request("/auth/register", {
       method: "POST",
-      body: JSON.stringify({ username, password, captcha_token: captchaToken }),
+      body: JSON.stringify({ username, password, email, captcha_token: captchaToken }),
+    });
+  }
+
+  async resendRegistrationCode(registrationId: string, captchaToken: string): Promise<RegistrationPendingResponse> {
+    return this.request("/auth/register/resend-code", {
+      method: "POST",
+      body: JSON.stringify({ registration_id: registrationId, captcha_token: captchaToken }),
+    });
+  }
+
+  async verifyRegistration(registrationId: string, code: string): Promise<AuthResponse> {
+    return this.request("/auth/register/verify", {
+      method: "POST",
+      body: JSON.stringify({ registration_id: registrationId, code }),
     });
   }
 
@@ -1362,6 +1390,16 @@ class ApiClient {
 
   async getPublicSettings(): Promise<PublicSystemSettings> {
     return this.request("/settings/public");
+  }
+
+  async uploadLogo(file: File): Promise<LogoResponse> {
+    const form = new FormData();
+    form.append("logo", file);
+    return this.request("/branding/logo", { method: "POST", body: form });
+  }
+
+  async deleteLogo(): Promise<LogoResponse> {
+    return this.request("/branding/logo", { method: "DELETE" });
   }
 
   // Dashboard

@@ -53,7 +53,11 @@ U5. Internal reserved users (`username` prefix `_monoize_`) MUST be excluded fro
 
 U6. Monoize active-probe subsystem MUST ensure an internal user `_monoize_active_probe` exists before each probe attempt and MUST force this user to `balance_unlimited = true`.
 
-U7. `email` is an optional field (`TEXT NULL` in SQLite). When set, it MUST be a non-empty string. The server MUST NOT validate email format beyond non-emptiness; the field is used solely for Gravatar URL generation.
+U7. `email` remains nullable (`TEXT NULL` in SQLite) for existing profile and admin
+updates. Public registration MUST use the normalized, verified email contract in
+`email-registration.spec.md`; non-empty email values are globally unique after trim
+and lowercase comparison. Existing profile/admin writes MUST preserve null/empty
+clearing behavior.
 
 U8. Any authenticated user MAY update their own `email` field via `PUT /api/dashboard/auth/me` with optional body field `email: string | null`. Setting `email` to `null` or empty string MUST clear the stored value.
 
@@ -61,7 +65,7 @@ U9. Admin users MAY also update a user's `email` via `PUT /api/dashboard/users/{
 
 U10. Dashboard frontend MUST generate Gravatar URLs from user email using the MD5 hash of the lowercase-trimmed email, per the Gravatar protocol (`https://www.gravatar.com/avatar/{md5}?d=identicon&s={size}`). If the user has no email set, the frontend MUST fall back to displaying the first character of the username as the avatar.
 
-U11. Public registration MUST read the `registration_enabled` setting and call one atomic `UserStore` registration operation. One process-local async critical section shared by every `UserStore` clone MUST contain the non-internal user count, first-user role decision, duplicate-username check, and user insert. If the count is zero, that operation MUST create exactly one concurrent caller as `super_admin` even when registration is disabled. Every later caller MUST be created as `user` only when registration is enabled; otherwise it MUST perform no insert and report `registration_disabled`. A present but malformed persisted `registration_enabled` value MUST abort registration with a storage error before the atomic operation and MUST NOT be interpreted as enabled.
+U11. Public registration MUST first create a pending registration through the email-verification contract in `email-registration.spec.md`; that operation MUST NOT insert a `users` row or create a session. The final verification operation MUST use one process-local async critical section shared by every `UserStore` clone and one database transaction to recheck the non-internal user count, first-user role decision, duplicate username/email constraints, and user insert. If the count is zero, exactly one concurrent verified registration MUST be created as `super_admin` even when registration is disabled. Every later verified registration MUST be created as `user` only when registration is enabled; otherwise it MUST perform no insert and report `registration_disabled`. A present but malformed persisted `registration_enabled` value MUST abort both pending-registration and final-verification operations with a storage error and MUST NOT be interpreted as enabled.
 
 U12. Username and password syntax validation MUST finish before the atomic registration operation. The operation MUST report a duplicate username separately from storage failure so the endpoint preserves HTTP `409 username_exists`.
 

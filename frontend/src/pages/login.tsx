@@ -2,7 +2,7 @@ import { useCallback, useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { Languages, Sun, Moon } from "lucide-react";
-import { MonoizeLogo } from "@/components/MonoizeLogo";
+import { BrandLogo } from "@/components/BrandLogo";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -12,6 +12,7 @@ import { CapCaptcha } from "@/components/CapCaptcha";
 import { useAuth } from "@/hooks/use-auth";
 import { useTheme } from "@/hooks/use-theme";
 import { usePublicSettings } from "@/lib/swr";
+import { api } from "@/lib/api";
 import { toggleLanguage } from "@/i18n";
 import { motion, AnimatePresence } from "framer-motion";
 import { AnimatedButton } from "@/components/ui/motion";
@@ -37,6 +38,9 @@ export function LoginPage() {
   const [isLogin, setIsLogin] = useState(true);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [email, setEmail] = useState("");
+  const [verificationCode, setVerificationCode] = useState("");
+  const [registrationId, setRegistrationId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [captchaToken, setCaptchaToken] = useState("");
@@ -48,10 +52,9 @@ export function LoginPage() {
     error: publicSettingsError,
     isLoading: publicSettingsLoading,
   } = usePublicSettings();
-  const registrationEnabled = publicSettings?.registration_enabled ?? true;
   const siteName = publicSettings?.site_name ?? "Monoize Dashboard";
 
-  const { login, register, user } = useAuth();
+  const { login, register, verifyRegistration, user } = useAuth();
   const navigate = useNavigate();
 
   const handleCaptchaError = useCallback(() => {
@@ -69,6 +72,10 @@ export function LoginPage() {
     }
   }, [user, navigate]);
 
+  useEffect(() => {
+    document.title = siteName.trim() || "Monoize Dashboard";
+  }, [siteName]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
@@ -77,8 +84,14 @@ export function LoginPage() {
     try {
       if (isLogin) {
         await login(username, password, captchaToken);
+      } else if (!registrationId) {
+        const pending = await register(username, password, email, captchaToken);
+        setRegistrationId(pending.registration_id);
+        setError(t("auth.verificationSent"));
+        resetCaptcha();
+        return;
       } else {
-        await register(username, password, captchaToken);
+        await verifyRegistration(registrationId, verificationCode);
       }
       navigate("/dashboard");
     } catch (err) {
@@ -147,7 +160,7 @@ export function LoginPage() {
               variants={itemVariants}
               className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border bg-background p-2 text-foreground"
             >
-              <MonoizeLogo className="h-full w-full" />
+              <BrandLogo className="h-full w-full object-contain" alt={siteName} />
             </motion.div>
             <motion.div variants={itemVariants}>
               <CardTitle className="text-2xl">{siteName}</CardTitle>
@@ -180,6 +193,19 @@ export function LoginPage() {
                   className="transition-all"
                 />
               </motion.div>
+              {!isLogin && !registrationId && (
+                <motion.div variants={itemVariants} className="space-y-2">
+                  <Label htmlFor="email">{t("auth.email")}</Label>
+                  <Input id="email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder={t("auth.enterEmail")} required />
+                </motion.div>
+              )}
+              {!isLogin && registrationId && (
+                <motion.div variants={itemVariants} className="space-y-2">
+                  <Label htmlFor="verification_code">{t("auth.verificationCode")}</Label>
+                  <Input id="verification_code" inputMode="numeric" autoComplete="one-time-code" value={verificationCode} onChange={(e) => setVerificationCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder={t("auth.enterVerificationCode")} required minLength={6} maxLength={6} />
+                  <button type="button" className="text-sm text-primary underline-offset-4 hover:underline" disabled={loading} onClick={async () => { try { setLoading(true); const pending = await api.resendRegistrationCode(registrationId, captchaToken); setError(t("auth.verificationResent", { seconds: Math.max(0, Math.ceil((new Date(pending.resend_after).getTime() - Date.now()) / 1000)) })); resetCaptcha(); } catch (err) { setError(err instanceof Error ? err.message : t("auth.verificationFailed")); } finally { setLoading(false); } }}>{t("auth.resendCode")}</button>
+                </motion.div>
+              )}
               <motion.div variants={itemVariants} className="space-y-2">
                 <Label htmlFor="password">{t("auth.password")}</Label>
                 <Input
@@ -234,17 +260,16 @@ export function LoginPage() {
                       loading ||
                       publicSettingsLoading ||
                       !publicSettings ||
-                      (publicSettings.captcha_enabled &&
+                      (publicSettings.captcha_enabled && !registrationId &&
                         (!publicSettings.cap_api_endpoint || !captchaToken))
                     }
                   >
-                    {loading ? t("common.loading") : isLogin ? t("auth.signIn") : t("auth.signUp")}
+                    {loading ? t("common.loading") : isLogin ? t("auth.signIn") : registrationId ? t("auth.verifyEmail") : t("auth.signUp")}
                   </Button>
                 </AnimatedButton>
               </motion.div>
             </motion.form>
-            {registrationEnabled && (
-              <motion.div
+            <motion.div
                 variants={itemVariants}
                 className="mt-4 text-center text-sm text-muted-foreground"
               >
@@ -263,6 +288,8 @@ export function LoginPage() {
                           type="button"
                           onClick={() => {
                             setIsLogin(false);
+                            setRegistrationId(null);
+                            setVerificationCode("");
                             setError("");
                             resetCaptcha();
                           }}
@@ -278,6 +305,8 @@ export function LoginPage() {
                           type="button"
                           onClick={() => {
                             setIsLogin(true);
+                            setRegistrationId(null);
+                            setVerificationCode("");
                             setError("");
                             resetCaptcha();
                           }}
@@ -290,7 +319,6 @@ export function LoginPage() {
                   </motion.div>
                 </AnimatePresence>
               </motion.div>
-            )}
           </CardContent>
         </Card>
       </motion.div>

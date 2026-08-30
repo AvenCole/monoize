@@ -3,6 +3,7 @@ use crate::captcha::CapVerifier;
 use crate::client_ip::TrustedProxyConfig;
 use crate::custom_transforms::CustomTransformStore;
 use crate::db::DbPool;
+use crate::email::EmailService;
 use crate::error::{AppError, AppResult};
 use crate::exact_decimal::Multiplier;
 use crate::handlers::routing::health_key;
@@ -196,6 +197,7 @@ pub struct AppState {
     pub model_price_store: crate::model_price_store::ModelPriceStore,
     pub transform_registry: Arc<TransformRegistry>,
     pub cap_verifier: CapVerifier,
+    pub email_service: Option<Arc<EmailService>>,
     pub custom_transform_store: CustomTransformStore,
     pub log_broadcast: tokio::sync::broadcast::Sender<Vec<InsertRequestLog>>,
     pub pending_request_logs: Arc<DashMap<String, InsertRequestLog>>,
@@ -313,6 +315,15 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
             error,
         )
     })?;
+    let email_service = EmailService::from_env()
+        .map_err(|error| {
+            AppError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "smtp_config_invalid",
+                error,
+            )
+        })?
+        .map(Arc::new);
 
     let http_clients =
         HttpClients::new(runtime.node.upstream_proxy_url.as_deref()).map_err(|err| {
@@ -964,6 +975,7 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
         model_price_store,
         transform_registry,
         cap_verifier,
+        email_service,
         custom_transform_store,
         log_broadcast,
         pending_request_logs,
@@ -1618,9 +1630,24 @@ fn build_dashboard_api_router() -> Router<AppState> {
             post(crate::dashboard_handlers::register),
         )
         .route(
+            "/dashboard/auth/register/resend-code",
+            post(crate::dashboard_handlers::resend_registration_code),
+        )
+        .route(
+            "/dashboard/auth/register/verify",
+            post(crate::dashboard_handlers::verify_registration),
+        )
+        .route(
             "/dashboard/auth/login",
             post(crate::dashboard_handlers::login),
         )
+        .route(
+            "/dashboard/branding/logo",
+            get(crate::dashboard_handlers::get_logo)
+                .post(crate::dashboard_handlers::upload_logo)
+                .delete(crate::dashboard_handlers::delete_logo),
+        )
+        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
         .route(
             "/dashboard/captcha/challenge",
             post(crate::dashboard_handlers::create_captcha_challenge),

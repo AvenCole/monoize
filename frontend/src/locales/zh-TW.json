@@ -47,7 +47,7 @@
 		"accessDenied": "存取被拒絕",
 		"needAdminPrivileges": "您需要管理員權限才能檢視此頁面",
 		"captchaError": "人機驗證失敗，請重試。",
-		"captchaUnavailable": "人機驗證尚未設定或暫時無法使用。"
+		"captchaUnavailable": "人機驗證尚未設定或暫時無法使用。", "email": "電子郵件", "enterEmail": "輸入電子郵件", "verificationCode": "驗證碼", "enterVerificationCode": "輸入 6 位驗證碼", "verifyEmail": "驗證電子郵件", "verificationSent": "驗證碼已寄出，請檢查信箱。", "verificationResent": "驗證碼已重新寄出。", "resendCode": "重新寄送", "verificationFailed": "驗證失敗。"
 	},
 	"nav": {
 		"dashboard": "儀表板",
@@ -366,7 +366,7 @@
 		"siteInformation": "網站資訊",
 		"siteInfoDescription": "關於您的 Monoize 執行個體的基本資訊",
 		"siteName": "網站名稱",
-		"siteDescription": "網站描述",
+		"siteDescription": "網站描述", "siteLogo": "網站 Logo", "removeLogo": "移除 Logo", "logoTooLarge": "Logo 不得超過 1 MB。", "logoUploadFailed": "Logo 上傳失敗。",
 		"apiBaseUrl": "API 基底 URL",
 		"apiBaseUrlPlaceholder": "例如：https://api.example.com",
 		"apiBaseUrlDescription": "下游用戶端連線至此代理使用的 API 基底 URL，將顯示於儀表板首頁",

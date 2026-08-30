@@ -595,6 +595,15 @@ impl UserStore {
         let store = self.clone();
         tokio::spawn(async move {
             loop {
+                tokio::time::sleep(std::time::Duration::from_secs(900)).await;
+                if let Err(error) = store.cleanup_expired_email_registrations().await {
+                    tracing::warn!(%error, "failed to cleanup expired email registrations");
+                }
+            }
+        });
+        let store = self.clone();
+        tokio::spawn(async move {
+            loop {
                 tokio::time::sleep(std::time::Duration::from_secs(
                     super::request_logs::REQUEST_LOG_RETENTION_INTERVAL_SECS,
                 ))
