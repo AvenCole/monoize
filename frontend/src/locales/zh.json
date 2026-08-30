@@ -382,6 +382,7 @@
 		"emailSmtpDescription": "验证邮件使用服务器提供的 SMTP 设置发送。",
 		"emailSmtpManaged": "服务器管理",
 		"emailSmtpVariables": "所需环境变量",
+		"smtpUsername": "SMTP 用户名", "smtpPassword": "SMTP 密码", "smtpPasswordConfigured": "密码已保存，留空以保持不变", "smtpFromEmail": "发件人邮箱", "smtpFromName": "发件人名称",
 		"emailRegistrationDescription": "创建账户前必须完成邮箱验证。",
 		"emailRegistrationSmtpHint": "请在服务器设置 MONOIZE_SMTP_HOST、PORT、USERNAME、PASSWORD、FROM 和可选的 FROM_NAME。SMTP 凭据不会存储在仪表盘中。",
 		"emailVerificationExpiry": "验证码有效期",

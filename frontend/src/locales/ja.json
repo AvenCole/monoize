@@ -379,6 +379,7 @@
 		"emailSmtpDescription": "確認メールはサーバーが提供する SMTP 設定で送信されます。",
 		"emailSmtpManaged": "サーバー管理",
 		"emailSmtpVariables": "必要な環境変数",
+		"smtpUsername": "SMTP ユーザー名", "smtpPassword": "SMTP パスワード", "smtpPasswordConfigured": "パスワードは保存済みです。空欄で維持します", "smtpFromEmail": "送信元メールアドレス", "smtpFromName": "送信者名",
 		"emailRegistrationDescription": "アカウント作成前にメールアドレスの検証を必須にします。",
 		"emailRegistrationSmtpHint": "サーバーで MONOIZE_SMTP_HOST、PORT、USERNAME、PASSWORD、FROM、任意の FROM_NAME を設定します。SMTP 認証情報はダッシュボードに保存されません。",
 		"emailVerificationExpiry": "コードの有効期限",

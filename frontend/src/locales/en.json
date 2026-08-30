@@ -383,6 +383,7 @@
 		"emailSmtpDescription": "Verification mail uses the SMTP settings provided by the server.",
 		"emailSmtpManaged": "Server managed",
 		"emailSmtpVariables": "Required environment variables",
+		"smtpUsername": "SMTP username", "smtpPassword": "SMTP password", "smtpPasswordConfigured": "Password is saved; leave empty to keep it", "smtpFromEmail": "Sender email", "smtpFromName": "Sender name",
 		"emailRegistrationDescription": "Require a verified email address before creating a new account.",
 		"emailRegistrationSmtpHint": "Configure MONOIZE_SMTP_HOST, PORT, USERNAME, PASSWORD, FROM, and optional FROM_NAME on the server. SMTP credentials are never stored in the dashboard.",
 		"emailVerificationExpiry": "Code expiry",

@@ -98,6 +98,14 @@ export function AccessSection({ settings, onChange }: AccessSectionProps) {
               <p className="text-xs leading-5 text-muted-foreground">
                 {t("settings.emailRegistrationSmtpHint")}
               </p>
+              <div className="grid gap-3 pt-1 sm:grid-cols-2">
+                <Input value={settings.smtp_host} placeholder="smtp.example.com" onChange={(event) => onChange({ smtp_host: event.target.value })} />
+                <Input type="number" min="1" max="65535" value={settings.smtp_port} onChange={(event) => onChange({ smtp_port: Number(event.target.value) || 587 })} />
+                <Input value={settings.smtp_username} placeholder={t("settings.smtpUsername")} onChange={(event) => onChange({ smtp_username: event.target.value })} />
+                <Input type="password" autoComplete="new-password" placeholder={settings.smtp_password === "__set__" ? t("settings.smtpPasswordConfigured") : t("settings.smtpPassword")} onChange={(event) => onChange({ smtp_password: event.target.value })} />
+                <Input type="email" value={settings.smtp_from_email} placeholder={t("settings.smtpFromEmail")} onChange={(event) => onChange({ smtp_from_email: event.target.value })} />
+                <Input value={settings.smtp_from_name} placeholder={t("settings.smtpFromName")} onChange={(event) => onChange({ smtp_from_name: event.target.value })} />
+              </div>
             </div>
             <div className="grid gap-px border-t bg-border sm:grid-cols-3">
               {[

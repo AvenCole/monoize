@@ -184,13 +184,16 @@ pub async fn register(
         ));
     }
 
-    let email_service = state.email_service.as_ref().ok_or_else(|| {
-        AppError::new(
+    let email_service = state.email_service.clone();
+    if !email_service.is_configured().await.map_err(|error| {
+        AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error)
+    })? {
+        return Err(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "email_not_configured",
             "email registration is not configured",
-        )
-    })?;
+        ));
+    }
     let dispatch = user_store
         .begin_email_registration(username, &email, &body.password)
         .await
@@ -208,13 +211,16 @@ pub async fn resend_registration_code(
     Json(body): Json<ResendRegistrationCodeRequest>,
 ) -> AppResult<impl IntoResponse> {
     verify_captcha(&state, &body.captcha_token).await?;
-    let email_service = state.email_service.as_ref().ok_or_else(|| {
-        AppError::new(
+    let email_service = state.email_service.clone();
+    if !email_service.is_configured().await.map_err(|error| {
+        AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error)
+    })? {
+        return Err(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "email_not_configured",
             "email registration is not configured",
-        )
-    })?;
+        ));
+    }
     let dispatch = state
         .user_store
         .resend_email_registration(body.registration_id.trim())

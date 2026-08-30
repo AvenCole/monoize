@@ -15,6 +15,13 @@ pub struct PublicSettings {
     pub site_name: String,
     pub site_description: String,
     pub api_base_url: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_username: String,
+    pub smtp_password: String,
+    pub smtp_from_email: String,
+    pub smtp_from_name: String,
+    pub smtp_use_tls: bool,
     pub cap_api_endpoint: Option<String>,
 }
 
@@ -289,6 +296,13 @@ impl Default for SystemSettings {
             site_name: "Monoize Dashboard".to_string(),
             site_description: "Unified Responses Proxy".to_string(),
             api_base_url: String::new(),
+            smtp_host: String::new(),
+            smtp_port: 587,
+            smtp_username: String::new(),
+            smtp_password: String::new(),
+            smtp_from_email: String::new(),
+            smtp_from_name: String::new(),
+            smtp_use_tls: true,
             global_transforms: Vec::new(),
             global_model_redirects: Vec::new(),
             reasoning_suffix_map: default_reasoning_suffix_map(),
@@ -737,6 +751,13 @@ impl SettingsStore {
                 "api_base_url" => {
                     settings.api_base_url = row.value;
                 }
+                "smtp_host" => settings.smtp_host = row.value,
+                "smtp_port" => settings.smtp_port = row.value.parse().unwrap_or(587),
+                "smtp_username" => settings.smtp_username = row.value,
+                "smtp_password" => settings.smtp_password = row.value,
+                "smtp_from_email" => settings.smtp_from_email = row.value,
+                "smtp_from_name" => settings.smtp_from_name = row.value,
+                "smtp_use_tls" => settings.smtp_use_tls = row.value.parse().unwrap_or(true),
                 "global_transforms" => {
                     if let Ok(mut transforms) =
                         serde_json::from_str::<Vec<TransformRuleConfig>>(&row.value)
@@ -919,6 +940,13 @@ impl SettingsStore {
             ("site_name", settings.site_name.clone()),
             ("site_description", settings.site_description.clone()),
             ("api_base_url", settings.api_base_url.clone()),
+            ("smtp_host", settings.smtp_host.clone()),
+            ("smtp_port", settings.smtp_port.to_string()),
+            ("smtp_username", settings.smtp_username.clone()),
+            ("smtp_password", settings.smtp_password.clone()),
+            ("smtp_from_email", settings.smtp_from_email.clone()),
+            ("smtp_from_name", settings.smtp_from_name.clone()),
+            ("smtp_use_tls", settings.smtp_use_tls.to_string()),
             (
                 "global_transforms",
                 serde_json::to_string(&settings.global_transforms).map_err(|e| e.to_string())?,

@@ -7,25 +7,24 @@ email address. Existing username-and-password login remains the authentication m
 
 ## 1. SMTP configuration
 
-ER-C1. Email registration MUST require `MONOIZE_SMTP_HOST`,
-`MONOIZE_SMTP_PORT`, `MONOIZE_SMTP_USERNAME`, `MONOIZE_SMTP_PASSWORD`, and
-`MONOIZE_SMTP_FROM` when the registration flow sends a message. The optional
-`MONOIZE_SMTP_FROM_NAME` sets the display name. `MONOIZE_SMTP_SECURITY` MUST be
-`starttls` or `tls` and MUST default to `starttls`. The server MUST reject an
-unencrypted SMTP mode.
+ER-C1. Email registration MUST use a complete SMTP configuration supplied by the
+administrator settings UI or by `MONOIZE_SMTP_HOST`, `MONOIZE_SMTP_PORT`,
+`MONOIZE_SMTP_USERNAME`, `MONOIZE_SMTP_PASSWORD`, and `MONOIZE_SMTP_FROM` when
+the UI configuration is absent. The optional sender name sets the display name.
+The dashboard SMTP TLS switch selects implicit TLS or STARTTLS.
 
 ER-C2. If `MONOIZE_SMTP_HOST` is absent or empty, email registration MUST be
 unavailable and existing login MUST remain available. If any other required SMTP
 variable is missing or invalid, startup MUST fail with code `smtp_config_invalid`.
 
-ER-C3. SMTP credentials MUST NOT appear in API responses or logs. SMTP connection
-attempts MUST have a finite timeout of 10 seconds.
+ER-C3. SMTP passwords MUST NOT appear in API responses or logs. Settings reads MUST
+return `"__set__"` when a password exists; an update containing `"__set__"` MUST
+preserve that password. SMTP connection attempts MUST have a finite timeout of 10
+seconds.
 
-ER-C4. The administrator settings UI MUST expose the registration toggle and an
-email-registration section that states SMTP is configured through server
-environment variables. It MUST display the fixed verification expiry, resend
-cooldown, and maximum-attempt values. It MUST NOT provide a field that stores SMTP
-credentials in the database.
+ER-C4. The administrator settings UI MUST expose the registration toggle, SMTP host,
+port, username, password, sender email, sender name, and TLS controls. It MUST
+display the fixed verification expiry, resend cooldown, and maximum-attempt values.
 
 ER-C4a. The email-registration section MUST render a visual SMTP configuration
 status panel with a clear server-managed status, the required environment variable

@@ -197,7 +197,7 @@ pub struct AppState {
     pub model_price_store: crate::model_price_store::ModelPriceStore,
     pub transform_registry: Arc<TransformRegistry>,
     pub cap_verifier: CapVerifier,
-    pub email_service: Option<Arc<EmailService>>,
+    pub email_service: Arc<EmailService>,
     pub custom_transform_store: CustomTransformStore,
     pub log_broadcast: tokio::sync::broadcast::Sender<Vec<InsertRequestLog>>,
     pub pending_request_logs: Arc<DashMap<String, InsertRequestLog>>,
@@ -315,16 +315,6 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
             error,
         )
     })?;
-    let email_service = EmailService::from_env()
-        .map_err(|error| {
-            AppError::new(
-                axum::http::StatusCode::BAD_REQUEST,
-                "smtp_config_invalid",
-                error,
-            )
-        })?
-        .map(Arc::new);
-
     let http_clients =
         HttpClients::new(runtime.node.upstream_proxy_url.as_deref()).map_err(|err| {
             AppError::new(
@@ -409,6 +399,16 @@ pub async fn load_state_with_runtime(runtime: RuntimeConfig) -> AppResult<AppSta
             err,
         )
     })?;
+    let email_service = Arc::new(EmailService::new(
+        settings_store.clone(),
+        EmailService::environment_config().map_err(|error| {
+            AppError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "smtp_config_invalid",
+                error,
+            )
+        })?,
+    ));
     let monoize_store = if is_replica {
         MonoizeRoutingStore::new_read_only(db.clone()).await
     } else {

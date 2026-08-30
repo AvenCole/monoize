@@ -23,6 +23,13 @@ pub struct UpdateSettingsRequest {
     pub site_name: Option<String>,
     pub site_description: Option<String>,
     pub api_base_url: Option<String>,
+    pub smtp_host: Option<String>,
+    pub smtp_port: Option<u16>,
+    pub smtp_username: Option<String>,
+    pub smtp_password: Option<String>,
+    pub smtp_from_email: Option<String>,
+    pub smtp_from_name: Option<String>,
+    pub smtp_use_tls: Option<bool>,
     pub global_transforms: Option<Vec<TransformRuleConfig>>,
     pub global_model_redirects: Option<Vec<ModelRedirectRule>>,
     pub reasoning_suffix_map: Option<std::collections::HashMap<String, String>>,
@@ -67,6 +74,12 @@ fn mask_price_sync_token(settings: &mut crate::settings::SystemSettings) {
     }
 }
 
+fn mask_smtp_password(settings: &mut crate::settings::SystemSettings) {
+    if !settings.smtp_password.is_empty() {
+        settings.smtp_password = "__set__".to_string();
+    }
+}
+
 pub async fn get_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -80,6 +93,7 @@ pub async fn get_settings(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
     mask_price_sync_token(&mut settings);
+    mask_smtp_password(&mut settings);
 
     Ok(Json(settings))
 }
@@ -154,6 +168,29 @@ pub async fn update_settings(
     }
     if let Some(v) = body.api_base_url {
         settings.api_base_url = v;
+    }
+    if let Some(v) = body.smtp_host {
+        settings.smtp_host = v.trim().to_string();
+    }
+    if let Some(v) = body.smtp_port {
+        settings.smtp_port = v;
+    }
+    if let Some(v) = body.smtp_username {
+        settings.smtp_username = v.trim().to_string();
+    }
+    if let Some(v) = body.smtp_password
+        && v != "__set__"
+    {
+        settings.smtp_password = v;
+    }
+    if let Some(v) = body.smtp_from_email {
+        settings.smtp_from_email = v.trim().to_string();
+    }
+    if let Some(v) = body.smtp_from_name {
+        settings.smtp_from_name = v.trim().to_string();
+    }
+    if let Some(v) = body.smtp_use_tls {
+        settings.smtp_use_tls = v;
     }
     if let Some(v) = body.global_transforms {
         settings.global_transforms = v;
@@ -354,6 +391,7 @@ pub async fn update_settings(
 
     let mut updated = updated;
     mask_price_sync_token(&mut updated);
+    mask_smtp_password(&mut updated);
     Ok(Json(updated))
 }
 
