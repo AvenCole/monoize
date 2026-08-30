@@ -182,6 +182,7 @@ impl EmailService {
         Self::transport(&config)?
             .test_connection()
             .await
+            .map(|_| ())
             .map_err(|error| format!("SMTP connection failed: {error}"))
     }
 
