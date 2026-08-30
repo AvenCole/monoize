@@ -1754,6 +1754,10 @@ fn build_dashboard_api_router() -> Router<AppState> {
             put(crate::dashboard_handlers::update_settings),
         )
         .route(
+            "/dashboard/settings/smtp/test",
+            post(crate::dashboard_handlers::test_smtp_connection),
+        )
+        .route(
             "/dashboard/settings/public",
             get(crate::dashboard_handlers::get_public_settings),
         )

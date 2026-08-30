@@ -1399,6 +1399,10 @@ class ApiClient {
     return this.request("/settings/public");
   }
 
+  async testSmtpConnection(): Promise<{ message: string }> {
+    return this.request("/settings/smtp/test", { method: "POST" });
+  }
+
   async uploadLogo(file: File): Promise<LogoResponse> {
     const form = new FormData();
     form.append("logo", file);

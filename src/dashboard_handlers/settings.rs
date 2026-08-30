@@ -395,6 +395,32 @@ pub async fn update_settings(
     Ok(Json(updated))
 }
 
+pub async fn test_smtp_connection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<impl IntoResponse> {
+    require_admin(&headers, &state).await?;
+    let settings = state.settings_store.get_all().await.map_err(|error| {
+        AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error)
+    })?;
+    let config = crate::email::SmtpConfig::from_fields(
+        settings.smtp_host,
+        settings.smtp_port,
+        settings.smtp_username,
+        settings.smtp_password,
+        settings.smtp_from_email,
+        settings.smtp_from_name,
+        settings.smtp_use_tls,
+    )
+    .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, "smtp_config_invalid", error))?;
+    state
+        .email_service
+        .test_config(config)
+        .await
+        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, "smtp_connection_failed", error))?;
+    Ok(Json(json!({ "message": "SMTP connection succeeded" })))
+}
+
 pub async fn get_dashboard_stats(
     State(state): State<AppState>,
     headers: HeaderMap,

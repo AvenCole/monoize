@@ -380,6 +380,7 @@
 		"emailSmtpManaged": "伺服器管理",
 		"emailSmtpVariables": "必要環境變數",
 		"smtpUsername": "SMTP 使用者名稱", "smtpPassword": "SMTP 密碼", "smtpPasswordConfigured": "密碼已儲存，保留空白以維持不變", "smtpFromEmail": "寄件者電子郵件", "smtpFromName": "寄件者名稱",
+		"smtpTestConnection": "測試連線", "smtpTesting": "測試中…", "smtpTestHint": "請先儲存設定再測試。", "smtpTestSuccess": "連線成功", "smtpTestFailed": "連線失敗",
 		"emailRegistrationDescription": "建立帳戶前必須完成電子郵件驗證。",
 		"emailRegistrationSmtpHint": "請在伺服器設定 MONOIZE_SMTP_HOST、PORT、USERNAME、PASSWORD、FROM 和可選的 FROM_NAME。SMTP 憑證不會儲存在儀表板中。",
 		"emailVerificationExpiry": "驗證碼有效期",

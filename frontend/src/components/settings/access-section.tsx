@@ -7,10 +7,13 @@ import {
   FieldLabel,
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
-import { KeyRound, Mail, ServerCog, ShieldCheck } from "lucide-react";
+import { CheckCircle2, KeyRound, Loader2, Mail, PlugZap, ServerCog, ShieldCheck, XCircle } from "lucide-react";
 import type { SystemSettings } from "@/lib/api";
+import { api } from "@/lib/api";
+import { useState } from "react";
 import { SettingsGroup } from "./settings-category-panel";
 
 interface AccessSectionProps {
@@ -24,6 +27,21 @@ interface AccessSectionProps {
  */
 export function AccessSection({ settings, onChange }: AccessSectionProps) {
   const { t } = useTranslation();
+  const [testingSmtp, setTestingSmtp] = useState(false);
+  const [smtpTestResult, setSmtpTestResult] = useState<"success" | "error" | null>(null);
+
+  const handleTestSmtp = async () => {
+    setTestingSmtp(true);
+    setSmtpTestResult(null);
+    try {
+      await api.testSmtpConnection();
+      setSmtpTestResult("success");
+    } catch {
+      setSmtpTestResult("error");
+    } finally {
+      setTestingSmtp(false);
+    }
+  };
 
   return (
     <div className="grid gap-8 lg:grid-cols-2 lg:gap-12">
@@ -105,6 +123,18 @@ export function AccessSection({ settings, onChange }: AccessSectionProps) {
                 <Input type="password" autoComplete="new-password" placeholder={settings.smtp_password === "__set__" ? t("settings.smtpPasswordConfigured") : t("settings.smtpPassword")} onChange={(event) => onChange({ smtp_password: event.target.value })} />
                 <Input type="email" value={settings.smtp_from_email} placeholder={t("settings.smtpFromEmail")} onChange={(event) => onChange({ smtp_from_email: event.target.value })} />
                 <Input value={settings.smtp_from_name} placeholder={t("settings.smtpFromName")} onChange={(event) => onChange({ smtp_from_name: event.target.value })} />
+              </div>
+              <div className="flex flex-wrap items-center gap-3 border-t pt-3">
+                <Button type="button" size="sm" variant="outline" disabled={testingSmtp} onClick={() => void handleTestSmtp()}>
+                  {testingSmtp ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <PlugZap className="size-4" aria-hidden="true" />}
+                  {testingSmtp ? t("settings.smtpTesting") : t("settings.smtpTestConnection")}
+                </Button>
+                <span className="text-xs text-muted-foreground">{t("settings.smtpTestHint")}</span>
+                {smtpTestResult === "success" ? (
+                  <span className="flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400"><CheckCircle2 className="size-3.5" aria-hidden="true" />{t("settings.smtpTestSuccess")}</span>
+                ) : smtpTestResult === "error" ? (
+                  <span className="flex items-center gap-1 text-xs text-destructive"><XCircle className="size-3.5" aria-hidden="true" />{t("settings.smtpTestFailed")}</span>
+                ) : null}
               </div>
             </div>
             <div className="grid gap-px border-t bg-border sm:grid-cols-3">

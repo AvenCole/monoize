@@ -32,6 +32,11 @@ names, and the fixed verification policy values. The panel MUST NOT render edita
 password or credential fields, and it MUST remain understandable when SMTP is
 unavailable.
 
+ER-C4b. The administrator MUST be able to invoke a protected SMTP connection test
+from the settings UI. The test MUST use the saved SMTP configuration, return a
+success or failure result without exposing credentials, and render that result
+without a page reload.
+
 ## 2. Registration initiation
 
 ER-R1. `POST /api/dashboard/auth/register` MUST accept JSON fields

@@ -69,7 +69,7 @@ pub use providers::{
 };
 pub use settings::{
     UpdateSettingsRequest, get_config_overview, get_dashboard_stats, get_public_settings,
-    get_settings, update_settings,
+    get_settings, test_smtp_connection, update_settings,
 };
 pub use users::{
     CreateUserRequest, UpdateUserRequest, create_user, delete_user, get_user, list_users,
